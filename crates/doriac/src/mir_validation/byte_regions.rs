@@ -4,9 +4,9 @@ use super::*;
 
 const INT: mir::Type = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
 
-pub(super) fn kind(ty: mir::Type) -> Option<mir::ByteRegionKind> {
+pub(super) fn kind(ty: mir::Type) -> Option<mir::RegionType> {
     match ty {
-        mir::Type::ByteRegion(kind) | mir::Type::NullableByteRegion(kind) => Some(kind),
+        mir::Type::Region(kind) | mir::Type::NullableRegion(kind) => Some(kind),
         _ => None,
     }
 }
@@ -14,9 +14,9 @@ pub(super) fn kind(ty: mir::Type) -> Option<mir::ByteRegionKind> {
 pub(super) fn validate_expression(
     program: &mir::Program,
     function: &mir::Function,
-    value: &mir::ByteRegionExpression,
+    value: &mir::RegionExpression,
 ) -> Result<(), BackendError> {
-    use mir::ByteRegionExpression as E;
+    use mir::RegionExpression as E;
     match value {
         E::CollectionIndex {
             kind,
@@ -30,7 +30,7 @@ pub(super) fn validate_expression(
             function,
             *collection,
             index,
-            mir::Type::ByteRegion(*kind),
+            mir::Type::Region(*kind),
             *positional,
             *remove,
         ),
@@ -42,21 +42,36 @@ pub(super) fn validate_expression(
             ..
         } => {
             validate_rvalue(program, function, source)?;
-            let source_kind = match source.ty() {
+            // Each source gives one view: `Bytes` and a string give bytes,
+            // a `T[]` gives its elements, and a region gives its own view.
+            let (source_kind, view) = match source.ty() {
                 mir::Type::Collection(id)
                     if collection_in(program, id)?.kind == mir::CollectionKind::Bytes =>
                 {
-                    None
+                    (None, None)
                 }
-                mir::Type::ByteRegion(kind) => Some(kind),
+                mir::Type::Collection(id)
+                    if collection_in(program, id)?.kind == mir::CollectionKind::TypedArray =>
+                {
+                    (None, Some(id))
+                }
+                mir::Type::Region(kind) => (Some(kind), kind.array),
                 // `string->byteRegion`: the string's own UTF-8 bytes, readonly.
-                mir::Type::String => Some(mir::ByteRegionKind::Readonly),
+                mir::Type::String => (
+                    Some(mir::RegionType::bytes(mir::ByteRegionKind::Readonly)),
+                    None,
+                ),
                 _ => {
                     return Err(malformed_mir(
-                        "byte region source is not Bytes, a string or a non-null byte region",
+                        "region source is not Bytes, a typed array, a string or a non-null region",
                     ));
                 }
             };
+            if view != kind.array {
+                return Err(malformed_mir(
+                    "a region views the elements its source holds",
+                ));
+            }
             if source.ty().has_move_ownership() && !source.borrows_move_value() {
                 return Err(malformed_mir(
                     "byte region formation must borrow its source",
@@ -75,6 +90,40 @@ pub(super) fn validate_expression(
                     return Err(malformed_mir("byte region offset and length must be int"));
                 }
                 validate_rvalue(program, function, bound)?;
+            }
+            Ok(())
+        }
+        // A region over foreign memory borrows its owner, a place of any
+        // type, with the region's access (Decision 0148 section 10).
+        E::Foreign {
+            kind,
+            owner,
+            data,
+            length,
+        } => {
+            validate_rvalue(program, function, owner)?;
+            if owner.ty().has_move_ownership() && !owner.borrows_move_value() {
+                return Err(malformed_mir(
+                    "a region over foreign memory must borrow its owner",
+                ));
+            }
+            if kind.is_writable() {
+                require_writable(program, function, owner)?;
+            }
+            if local_in(function, *data)?.ty
+                != mir::Type::Scalar(mir::ScalarType::Inline(
+                    crate::inline_value::InlineValueType::Pointer,
+                ))
+                || local_in(function, *length)?.ty != INT
+            {
+                return Err(malformed_mir(
+                    "a region over foreign memory has a pointer and an int length",
+                ));
+            }
+            if crate::native_abi::region_stride(program, *kind).is_none() {
+                return Err(malformed_mir(
+                    "a region over foreign memory views elements the targets build",
+                ));
             }
             Ok(())
         }
@@ -121,9 +170,9 @@ pub(super) fn validate_expression(
 pub(super) fn validate_nullable_expression(
     program: &mir::Program,
     function: &mir::Function,
-    value: &mir::NullableByteRegionExpression,
+    value: &mir::NullableRegionExpression,
 ) -> Result<(), BackendError> {
-    use mir::NullableByteRegionExpression as E;
+    use mir::NullableRegionExpression as E;
     match value {
         E::CollectionIndex {
             kind,
@@ -137,7 +186,7 @@ pub(super) fn validate_nullable_expression(
             function,
             *collection,
             index,
-            mir::Type::NullableByteRegion(*kind),
+            mir::Type::NullableRegion(*kind),
             *positional,
             *remove,
         ),
@@ -152,7 +201,7 @@ pub(super) fn validate_nullable_expression(
             function,
             *collection,
             key,
-            mir::Type::ByteRegion(*kind),
+            mir::Type::Region(*kind),
             *access,
         ),
         E::Null { .. } => Ok(()),
@@ -208,16 +257,16 @@ fn validate_collection_projection(
 
 fn validate_local(
     function: &mir::Function,
-    kind: mir::ByteRegionKind,
+    kind: mir::RegionType,
     local: mir::LocalId,
     transfer: bool,
     nullable: bool,
 ) -> Result<(), BackendError> {
     let definition = local_in(function, local)?;
     let expected = if nullable {
-        mir::Type::NullableByteRegion(kind)
+        mir::Type::NullableRegion(kind)
     } else {
-        mir::Type::ByteRegion(kind)
+        mir::Type::Region(kind)
     };
     if definition.ty != expected {
         return Err(malformed_mir(
@@ -235,7 +284,7 @@ fn validate_local(
 fn validate_call(
     program: &mir::Program,
     caller: &mir::Function,
-    kind: mir::ByteRegionKind,
+    kind: mir::RegionType,
     callee: mir::FunctionId,
     args: &[mir::Rvalue],
     borrow: Option<mir::ReturnBorrow>,
@@ -243,9 +292,9 @@ fn validate_call(
 ) -> Result<(), BackendError> {
     let callee = function_in(program, callee)?;
     let ty = if nullable {
-        mir::Type::NullableByteRegion(kind)
+        mir::Type::NullableRegion(kind)
     } else {
-        mir::Type::ByteRegion(kind)
+        mir::Type::Region(kind)
     };
     if callee.return_type != mir::ReturnType::Value(ty)
         || borrow != callee.return_borrow
@@ -313,6 +362,43 @@ pub(super) fn validate_assignment(
     Ok(())
 }
 
+/// The element type of the region local `local`: `uint8` for a byte
+/// region, the element of a typed array region the targets build.
+pub(super) fn element(
+    program: &mir::Program,
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Result<mir::Type, BackendError> {
+    match local_in(function, local)?.ty {
+        mir::Type::Region(region) if region.array.is_none() => Ok(mir::Type::Scalar(
+            mir::ScalarType::Integer(IntegerType::UInt8),
+        )),
+        mir::Type::Region(region) => crate::native_abi::array_region_element(program, region)
+            .map(|(element, _)| element)
+            .ok_or_else(|| malformed_mir("a typed array region views elements the targets build")),
+        _ => Err(malformed_mir(
+            "a region element access names a present region",
+        )),
+    }
+}
+
+/// A read of element `index` of the region local `region` as `expected`,
+/// which every scalar family's operand shares (Decision 0148 section 8).
+pub(super) fn validate_element_read(
+    program: &mir::Program,
+    function: &mir::Function,
+    region: mir::LocalId,
+    index: &mir::Rvalue,
+    expected: mir::Type,
+) -> Result<(), BackendError> {
+    if element(program, function, region)? != expected {
+        return Err(malformed_mir(
+            "a region element read has the region's element type",
+        ));
+    }
+    validate_index(program, function, region, index, false)
+}
+
 pub(super) fn validate_index(
     program: &mir::Program,
     function: &mir::Function,
@@ -321,7 +407,7 @@ pub(super) fn validate_index(
     writing: bool,
 ) -> Result<(), BackendError> {
     let definition = local_in(function, local)?;
-    let mir::Type::ByteRegion(kind) = definition.ty else {
+    let mir::Type::Region(kind) = definition.ty else {
         return Err(malformed_mir(
             "byte region index requires a non-null region",
         ));
@@ -338,10 +424,10 @@ pub(super) fn validate_index(
 }
 
 pub(super) fn collect_expression<'a>(
-    value: &'a mir::ByteRegionExpression,
+    value: &'a mir::RegionExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    use mir::ByteRegionExpression as E;
+    use mir::RegionExpression as E;
     match value {
         E::CollectionIndex {
             collection,
@@ -364,6 +450,17 @@ pub(super) fn collect_expression<'a>(
             collect_rvalue_class_local_accesses(length, accesses);
             accesses.retained_acquisition(source, kind.is_writable());
         }
+        E::Foreign {
+            kind,
+            owner,
+            data,
+            length,
+        } => {
+            collect_rvalue_class_local_accesses(owner, accesses);
+            accesses.resource_read(*data);
+            accesses.resource_read(*length);
+            accesses.retained_acquisition(owner, kind.is_writable());
+        }
         E::Local {
             local, transfer, ..
         } => {
@@ -384,7 +481,7 @@ pub(super) fn collect_expression<'a>(
         }
         E::AssumePresent { value, .. } => {
             collect_nullable_expression(value, accesses);
-            if let mir::NullableByteRegionExpression::Local { local, .. } = value.as_ref() {
+            if let mir::NullableRegionExpression::Local { local, .. } = value.as_ref() {
                 accesses.assume_nullable_present(*local);
             }
         }
@@ -401,25 +498,25 @@ pub(super) fn collect_expression<'a>(
 }
 
 pub(super) fn nullable_present(
-    value: &mir::NullableByteRegionExpression,
+    value: &mir::NullableRegionExpression,
     present: &HashSet<mir::LocalId>,
 ) -> bool {
     nullable_presence(value, present) == Some(true)
 }
 
 fn nullable_presence(
-    value: &mir::NullableByteRegionExpression,
+    value: &mir::NullableRegionExpression,
     present: &HashSet<mir::LocalId>,
 ) -> Option<bool> {
     match value {
-        mir::NullableByteRegionExpression::Present(_) => Some(true),
-        mir::NullableByteRegionExpression::Local { local, .. } => {
+        mir::NullableRegionExpression::Present(_) => Some(true),
+        mir::NullableRegionExpression::Local { local, .. } => {
             present.contains(local).then_some(true)
         }
-        mir::NullableByteRegionExpression::Null { .. } => Some(false),
-        mir::NullableByteRegionExpression::Call { .. }
-        | mir::NullableByteRegionExpression::CollectionIndex { .. }
-        | mir::NullableByteRegionExpression::CollectionGet { .. } => None,
+        mir::NullableRegionExpression::Null { .. } => Some(false),
+        mir::NullableRegionExpression::Call { .. }
+        | mir::NullableRegionExpression::CollectionIndex { .. }
+        | mir::NullableRegionExpression::CollectionGet { .. } => None,
     }
 }
 
@@ -441,55 +538,58 @@ pub(super) fn value_parents(
         return Ok(parents[local.0].clone());
     }
     match value {
-        mir::Rvalue::ByteRegion(value) => match value {
-            mir::ByteRegionExpression::CollectionIndex { collection, .. } => {
+        mir::Rvalue::Region(value) => match value {
+            mir::RegionExpression::CollectionIndex { collection, .. } => {
                 Ok(parents[collection.0].clone())
             }
-            mir::ByteRegionExpression::Region { kind, source, .. } => {
-                reborrow_parents(program, function, source, kind.is_writable(), parents)
-            }
-            mir::ByteRegionExpression::Local { local, .. } => Ok(parents[local.0].clone()),
-            mir::ByteRegionExpression::Call {
+            mir::RegionExpression::Region { kind, source, .. }
+            | mir::RegionExpression::Foreign {
+                kind,
+                owner: source,
+                ..
+            } => reborrow_parents(program, function, source, kind.is_writable(), parents),
+            mir::RegionExpression::Local { local, .. } => Ok(parents[local.0].clone()),
+            mir::RegionExpression::Call {
                 function: callee,
                 args,
                 ..
             } => call_parents(program, function, *callee, args, parents),
-            mir::ByteRegionExpression::AssumePresent { value, .. } => value_parents(
+            mir::RegionExpression::AssumePresent { value, .. } => value_parents(
                 program,
                 function,
-                &mir::Rvalue::NullableByteRegion((**value).clone()),
+                &mir::Rvalue::NullableRegion((**value).clone()),
                 parents,
             ),
-            mir::ByteRegionExpression::Coalesce { left, right, .. } => {
+            mir::RegionExpression::Coalesce { left, right, .. } => {
                 let mut result = value_parents(
                     program,
                     function,
-                    &mir::Rvalue::NullableByteRegion((**left).clone()),
+                    &mir::Rvalue::NullableRegion((**left).clone()),
                     parents,
                 )?;
                 result.extend(value_parents(
                     program,
                     function,
-                    &mir::Rvalue::ByteRegion((**right).clone()),
+                    &mir::Rvalue::Region((**right).clone()),
                     parents,
                 )?);
                 Ok(result)
             }
         },
-        mir::Rvalue::NullableByteRegion(value) => match value {
-            mir::NullableByteRegionExpression::CollectionIndex { collection, .. }
-            | mir::NullableByteRegionExpression::CollectionGet { collection, .. } => {
+        mir::Rvalue::NullableRegion(value) => match value {
+            mir::NullableRegionExpression::CollectionIndex { collection, .. }
+            | mir::NullableRegionExpression::CollectionGet { collection, .. } => {
                 Ok(parents[collection.0].clone())
             }
-            mir::NullableByteRegionExpression::Null { .. } => Ok(HashSet::new()),
-            mir::NullableByteRegionExpression::Local { local, .. } => Ok(parents[local.0].clone()),
-            mir::NullableByteRegionExpression::Present(value) => value_parents(
+            mir::NullableRegionExpression::Null { .. } => Ok(HashSet::new()),
+            mir::NullableRegionExpression::Local { local, .. } => Ok(parents[local.0].clone()),
+            mir::NullableRegionExpression::Present(value) => value_parents(
                 program,
                 function,
-                &mir::Rvalue::ByteRegion(value.clone()),
+                &mir::Rvalue::Region(value.clone()),
                 parents,
             ),
-            mir::NullableByteRegionExpression::Call {
+            mir::NullableRegionExpression::Call {
                 function: callee,
                 args,
                 ..
@@ -558,14 +658,14 @@ pub(super) fn reborrow_parents(
 
 pub(super) fn place(value: &mir::Rvalue) -> Option<mir::LocalId> {
     value.direct_place_local().or_else(|| match value {
-        mir::Rvalue::ByteRegion(mir::ByteRegionExpression::AssumePresent { value, .. }) => {
+        mir::Rvalue::Region(mir::RegionExpression::AssumePresent { value, .. }) => {
             match value.as_ref() {
-                mir::NullableByteRegionExpression::Local { local, .. } => Some(*local),
+                mir::NullableRegionExpression::Local { local, .. } => Some(*local),
                 _ => None,
             }
         }
-        mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Present(value)) => {
-            place(&mir::Rvalue::ByteRegion(value.clone()))
+        mir::Rvalue::NullableRegion(mir::NullableRegionExpression::Present(value)) => {
+            place(&mir::Rvalue::Region(value.clone()))
         }
         _ => None,
     })
@@ -576,15 +676,16 @@ pub(super) fn escaping(
     value: &mir::Rvalue,
 ) -> Result<Vec<mir::LocalId>, BackendError> {
     match value {
-        mir::Rvalue::ByteRegion(value) => match value {
-            mir::ByteRegionExpression::CollectionIndex { collection, .. } => Ok(vec![*collection]),
-            mir::ByteRegionExpression::Local {
+        mir::Rvalue::Region(value) => match value {
+            mir::RegionExpression::CollectionIndex { collection, .. } => Ok(vec![*collection]),
+            mir::RegionExpression::Local {
                 local, transfer, ..
             } => Ok(if *transfer { Vec::new() } else { vec![*local] }),
-            mir::ByteRegionExpression::Region { source, .. } => {
+            mir::RegionExpression::Region { source, .. }
+            | mir::RegionExpression::Foreign { owner: source, .. } => {
                 escaping_class_local_borrows(program, source)
             }
-            mir::ByteRegionExpression::Call {
+            mir::RegionExpression::Call {
                 function,
                 args,
                 return_borrow,
@@ -596,32 +697,29 @@ pub(super) fn escaping(
                 })
                 .transpose()
                 .map(Option::unwrap_or_default),
-            mir::ByteRegionExpression::AssumePresent { value, .. } => {
-                escaping(program, &mir::Rvalue::NullableByteRegion((**value).clone()))
+            mir::RegionExpression::AssumePresent { value, .. } => {
+                escaping(program, &mir::Rvalue::NullableRegion((**value).clone()))
             }
-            mir::ByteRegionExpression::Coalesce { left, right, .. } => {
+            mir::RegionExpression::Coalesce { left, right, .. } => {
                 let mut sources =
-                    escaping(program, &mir::Rvalue::NullableByteRegion((**left).clone()))?;
-                sources.extend(escaping(
-                    program,
-                    &mir::Rvalue::ByteRegion((**right).clone()),
-                )?);
+                    escaping(program, &mir::Rvalue::NullableRegion((**left).clone()))?;
+                sources.extend(escaping(program, &mir::Rvalue::Region((**right).clone()))?);
                 Ok(sources)
             }
         },
-        mir::Rvalue::NullableByteRegion(value) => match value {
-            mir::NullableByteRegionExpression::CollectionIndex { collection, .. }
-            | mir::NullableByteRegionExpression::CollectionGet { collection, .. } => {
+        mir::Rvalue::NullableRegion(value) => match value {
+            mir::NullableRegionExpression::CollectionIndex { collection, .. }
+            | mir::NullableRegionExpression::CollectionGet { collection, .. } => {
                 Ok(vec![*collection])
             }
-            mir::NullableByteRegionExpression::Null { .. } => Ok(Vec::new()),
-            mir::NullableByteRegionExpression::Present(value) => {
-                escaping(program, &mir::Rvalue::ByteRegion(value.clone()))
+            mir::NullableRegionExpression::Null { .. } => Ok(Vec::new()),
+            mir::NullableRegionExpression::Present(value) => {
+                escaping(program, &mir::Rvalue::Region(value.clone()))
             }
-            mir::NullableByteRegionExpression::Local {
+            mir::NullableRegionExpression::Local {
                 local, transfer, ..
             } => Ok(if *transfer { Vec::new() } else { vec![*local] }),
-            mir::NullableByteRegionExpression::Call {
+            mir::NullableRegionExpression::Call {
                 function,
                 args,
                 return_borrow,
@@ -708,7 +806,7 @@ pub(super) fn inferred_borrow(
                         || malformed_mir("byte region cannot borrow a hidden closure environment"),
                     )?)
                 },
-                writable: kind(value.ty()).is_some_and(mir::ByteRegionKind::is_writable),
+                writable: kind(value.ty()).is_some_and(mir::RegionType::is_writable),
             }));
         }
         // The local's actual provenance is checked by the independent retained
@@ -716,7 +814,14 @@ pub(super) fn inferred_borrow(
         return return_contract(function);
     }
     match value {
-        mir::Rvalue::ByteRegion(mir::ByteRegionExpression::Region { kind, source, .. }) => Ok(
+        mir::Rvalue::Region(
+            mir::RegionExpression::Region { kind, source, .. }
+            | mir::RegionExpression::Foreign {
+                kind,
+                owner: source,
+                ..
+            },
+        ) => Ok(
             infer_rvalue_return_borrow(program, function, source)?.map(|borrow| {
                 mir::ReturnBorrow {
                     kind: mir::ReturnBorrowKind::Retained,
@@ -725,13 +830,13 @@ pub(super) fn inferred_borrow(
                 }
             }),
         ),
-        mir::Rvalue::ByteRegion(mir::ByteRegionExpression::Call {
+        mir::Rvalue::Region(mir::RegionExpression::Call {
             function: callee,
             args,
             return_borrow: Some(borrow),
             ..
         })
-        | mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Call {
+        | mir::Rvalue::NullableRegion(mir::NullableRegionExpression::Call {
             function: callee,
             args,
             return_borrow: Some(borrow),
@@ -774,10 +879,10 @@ pub(super) fn call_parents(
 }
 
 pub(super) fn collect_nullable_expression<'a>(
-    value: &'a mir::NullableByteRegionExpression,
+    value: &'a mir::NullableRegionExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    use mir::NullableByteRegionExpression as E;
+    use mir::NullableRegionExpression as E;
     match value {
         E::CollectionIndex {
             collection,

@@ -43,10 +43,12 @@ fn copy_scalar_defaults_are_folded_by_callable_and_parameter_identity() {
         .any(|value| matches!(value, ConstValue::Integer(value) if value.ty == IntegerType::Int64 && value.signed_value() == 4)));
 }
 
+/// A writable parameter lends the caller's storage, so it takes no default
+/// (E0818). A promoted constructor parameter copies its argument into a
+/// writable property and keeps its default (Decision 0083).
 #[test]
-fn writable_copy_scalar_defaults_are_supported() {
-    doriac::check_source(
-        "writable-copy-default.doria",
+fn writable_copy_scalar_defaults_apply_only_to_promoted_parameters() {
+    let rejected = diagnostics(
         r#"
 function choose(writable int $value = 1): int
 {
@@ -58,15 +60,41 @@ function main(): int
     return choose();
 }
 "#,
+    );
+    let default = rejected
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0818")
+        .expect("a writable function parameter with a default reports E0818");
+    assert_eq!(
+        default.message,
+        "writable parameter `$value` cannot have a default value"
+    );
+
+    doriac::check_source(
+        "writable-promoted-default.doria",
+        r#"
+class Counter
+{
+    function __construct(writable int $value = 1)
+    {
+    }
+}
+
+function main(): int
+{
+    let $counter = new Counter();
+    return $counter->value;
+}
+"#,
     )
-    .expect("writable Copy-scalar defaults should be accepted");
+    .expect("a promoted writable Copy-scalar parameter keeps its default");
 }
 
 #[test]
 fn deferred_default_categories_have_stable_semantic_diagnostics() {
     let writable_string = default_diagnostic(
         r#"
-function label(writable string $value = "guest"): string { return $value; }
+class Label { function __construct(writable string $value = "guest") {} }
 "#,
     );
     assert_eq!(

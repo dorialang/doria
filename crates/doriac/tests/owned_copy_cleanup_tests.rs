@@ -374,10 +374,10 @@ function probe(?Packet $input, bool $gate): int {{
     }}
     return 0;
 }}
-function main(): void {{}}
 "#
         );
-        let mut program = doriac::lower_source_to_mir("enum-presence.doria", source).unwrap();
+        let mut program =
+            doriac::lower_library_source_to_mir("enum-presence.doria", source).unwrap();
         let probe = program
             .functions
             .iter_mut()

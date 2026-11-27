@@ -790,6 +790,10 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
         function_types: Vec::new(),
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
+        foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
+        c_entries: Vec::new(),
+        companion: Default::default(),
         functions: vec![
             Function {
                 id: FunctionId(0),
@@ -814,6 +818,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                     terminator: Terminator::ReturnVoid,
                 }],
                 entry_block: BlockId(0),
+                unsafe_regions: Vec::new(),
                 closure: None,
             },
             Function {
@@ -846,6 +851,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                     ))),
                 }],
                 entry_block: BlockId(0),
+                unsafe_regions: Vec::new(),
                 closure: None,
             },
         ],

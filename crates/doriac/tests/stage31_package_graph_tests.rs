@@ -59,6 +59,8 @@ fn package(identity: &str, sources: Vec<Source>, dependencies: Vec<Dependency>) 
         }],
         sources,
         dependencies,
+        native_libraries: Vec::new(),
+        unsafe_policy: None,
     }
 }
 
@@ -77,6 +79,7 @@ fn plan(packages: Vec<Package>, entry: &str) -> BuildPlanDocument {
                 kind: TargetKind::Binary,
                 entry_source: Some(entry.to_string()),
                 active_scopes: vec![SourceScope::Main],
+                windows_subsystem: None,
             },
             packages,
             compiler: CompilerOptions {
@@ -533,6 +536,8 @@ fn top_level_internal_declarations_preserve_modifier_spans() {
             doriac::ast::Item::Trait(value) => value.access_span,
             doriac::ast::Item::Function(value) => value.access_span,
             doriac::ast::Item::Constant(value) => value.access_span,
+            doriac::ast::Item::ExternBlock(value) => value.access_span,
+            doriac::ast::Item::ForeignAggregate(value) => value.access_span,
             doriac::ast::Item::Statement(_) => panic!("expected declarations"),
         };
         let span = span.expect("internal span");
@@ -627,6 +632,8 @@ fn multi_source_graph_preserves_writable_nullable_property_receivers() {
             ),
         ],
         dependencies: Vec::new(),
+        native_libraries: Vec::new(),
+        unsafe_policy: None,
     };
     let document = plan(vec![application], entry);
     let mut provider = InMemorySourceProvider::new();

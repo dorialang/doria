@@ -299,6 +299,7 @@ impl Checker<'_> {
             }
             ResolvedType::Nullable(inner)
             | ResolvedType::TypedArray(inner)
+            | ResolvedType::ArrayRegion(_, inner)
             | ResolvedType::List(inner)
             | ResolvedType::Set(inner)
             | ResolvedType::SortedSet(inner)
@@ -414,7 +415,8 @@ impl Checker<'_> {
             ResolvedType::Mixed | ResolvedType::Error | ResolvedType::Unsupported => {
                 effects.unknown = true
             }
-            ResolvedType::Void
+            ResolvedType::Foreign(_)
+            | ResolvedType::Void
             | ResolvedType::Integer(_)
             | ResolvedType::Float(_)
             | ResolvedType::String

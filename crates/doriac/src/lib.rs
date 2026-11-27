@@ -19,6 +19,7 @@ pub mod backend;
 pub mod build_plan;
 pub mod builtins;
 pub mod byte_intrinsics;
+pub mod c_layout;
 mod checked_effects;
 mod generic_inference;
 pub use checked_effects::{CheckedEffectClass, CheckedEffectProfile};
@@ -32,6 +33,7 @@ pub mod collection_diagnostics;
 pub mod compilation_graph;
 pub mod compiler_known_concurrency;
 pub mod compiler_known_contracts;
+pub mod compiler_known_ffi;
 pub mod compiler_known_io;
 pub mod compiler_known_stream;
 pub mod compiler_known_term;
@@ -45,6 +47,9 @@ pub mod dataflow;
 pub mod diagnostic_entries;
 pub mod diagnostics;
 pub mod enums;
+pub mod foreign;
+pub mod foreign_handles;
+pub mod foreign_strings;
 pub mod format_string;
 pub mod hir;
 pub mod incremental;
@@ -60,6 +65,9 @@ pub mod names;
 mod narrowing;
 pub mod native_abi;
 pub mod native_closure_abi;
+pub mod native_companion;
+pub mod native_link;
+pub mod native_loader;
 pub mod native_process;
 mod native_shared;
 pub mod numeric;
@@ -67,6 +75,7 @@ pub mod ownership;
 pub mod parser;
 pub mod performance;
 mod php_closure;
+pub mod pointer_intrinsics;
 pub mod property_hooks;
 pub mod return_analysis;
 pub mod runtime_artifact;
@@ -83,6 +92,8 @@ pub mod syntax;
 pub mod testing;
 pub mod trait_composition;
 pub mod types;
+pub mod unsafe_code;
+pub mod unsafe_policy;
 
 pub const TOOLCHAIN_VERSION: &str = env!("DORIA_TOOLCHAIN_VERSION");
 pub const BUILD_COMMIT: &str = env!("DORIA_BUILD_COMMIT");
@@ -175,6 +186,8 @@ pub fn analyze_source_for_ide_with_source_context(
     let source = SourceFile::new(path, text);
     let context = source_context.compilation.clone();
     let authored = parse_source_file(&source)?;
+    // Tooling reads the authored tree as name resolution reads it.
+    let authored = read_call_candidates(&source, authored, &context, None)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolution = names::resolve_program_for_ide(&authored, &context);
@@ -241,7 +254,8 @@ pub fn compile_source_to_php(
 ) -> DiagnosticResult<String> {
     match compile_source(path, text, BackendTarget::Php)? {
         backend::BackendOutput::Text { contents, .. }
-        | backend::BackendOutput::TextWithRuntime { contents, .. } => Ok(contents),
+        | backend::BackendOutput::TextWithRuntime { contents, .. }
+        | backend::BackendOutput::TextWithCompanion { contents, .. } => Ok(contents),
         _ => Err(vec![Diagnostic::new(
             "B0002",
             "PHP backend did not return text output",
@@ -427,6 +441,7 @@ pub(crate) fn complete_standalone_hir(
     compiler_known_concurrency::append_hir_source(&mut hir);
     compiler_known_term::append_hir_source(&mut hir);
     compiler_known_text::append_hir_source(&mut hir);
+    compiler_known_ffi::append_hir_source(&mut hir);
     hir.source_path = source.path;
     hir.source_text = source.text;
     hir
@@ -437,6 +452,27 @@ pub fn lower_source_to_mir(
     text: impl Into<String>,
 ) -> DiagnosticResult<mir::Program> {
     lower_hir_to_mir(&lower_source(path, text)?)
+}
+
+/// Lowers one source without an entry point to validated MIR as a library
+/// (Decision 0148 section 17): each declaration with a body is a root and is
+/// emitted, and the program has no process entry. A source that declares
+/// `main` is a program; `lower_source_to_mir` lowers it.
+pub fn lower_library_source_to_mir(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<mir::Program> {
+    let mut hir = lower_source(path, text)?;
+    if !hir.semantic_info.reachable.is_library() {
+        return Err(vec![Diagnostic::new(
+            "I2401",
+            "a library source declares no `main` entry point",
+            Span::default(),
+        )]);
+    }
+    hir.selected_target.kind = build_plan::TargetKind::Library;
+    hir.selected_target.entry_source = None;
+    lower_hir_to_mir(&hir)
 }
 
 /// Lowers checked HIR to validated MIR.
@@ -631,6 +667,7 @@ pub fn lower_compilation_graph(
     compiler_known_concurrency::append_hir_source(&mut hir);
     compiler_known_term::append_hir_source(&mut hir);
     compiler_known_text::append_hir_source(&mut hir);
+    compiler_known_ffi::append_hir_source(&mut hir);
     Ok(hir)
 }
 
@@ -733,7 +770,10 @@ pub(crate) fn compilation_graph_options(
             unreachable!("validated native plan has a profile")
         }
     };
-    Ok(options)
+    Ok(CompileOptions {
+        linking: compilation_graph::native_linking(graph),
+        ..options
+    })
 }
 
 pub fn compile_build_plan_file(
@@ -796,6 +836,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_concurrency::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -808,6 +849,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_term::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -820,6 +862,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_time::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -832,11 +875,25 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_stream::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
         compiler_known_text::SOURCE_ID,
         compiler_known_text::SOURCE_TEXT,
+    );
+    source_texts.insert(
+        compiler_known_ffi::SOURCE_ID,
+        compiler_known_ffi::source_text(),
+    );
+    contexts.insert(
+        compiler_known_ffi::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_ffi::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
+        },
     );
     contexts.insert(
         compiler_known_text::SOURCE_ID,
@@ -844,6 +901,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_text::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -856,6 +914,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_contracts::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     if !ast_uses_compiler_known_source(program) {
@@ -868,6 +927,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_io::SYNTHETIC_SOURCE_IDENTITY.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
 }
@@ -905,6 +965,9 @@ pub(crate) fn augment_compiler_known(
     if compiler_known_term::resolved_facts_use_term(facts) {
         program = compiler_known_term::augment_program(&program);
     }
+    if compiler_known_ffi::resolved_facts_use_ffi(facts) {
+        program = compiler_known_ffi::augment_program(&program);
+    }
     if reads_graphemes {
         program = compiler_known_text::augment_program(&program);
     }
@@ -926,6 +989,8 @@ fn ast_uses_compiler_known_source(program: &ast::Program) -> bool {
         ast::Item::Trait(value) => value.span.source == synthetic,
         ast::Item::Function(value) => value.span.source == synthetic,
         ast::Item::Constant(value) => value.span.source == synthetic,
+        ast::Item::ExternBlock(value) => value.span.source == synthetic,
+        ast::Item::ForeignAggregate(value) => value.span.source == synthetic,
         ast::Item::Statement(_) => false,
     })
 }
@@ -943,6 +1008,7 @@ pub(crate) fn prepare_parsed_source(
     context: CompilationContext,
     authored: Program,
 ) -> DiagnosticResult<PreparedSource> {
+    let authored = read_call_candidates(source, authored, &context, None)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let resolution = names::resolve_program_for_ide(&authored, &context);
@@ -976,9 +1042,60 @@ pub(crate) fn prepare_parsed_source(
     })
 }
 
+/// Parses `source`, reading each `callee<A, B>(...)` whose type arguments
+/// are all plain names as type arguments. When that leaves the source
+/// unparsed, it is read again with those calls as comparisons, the meaning
+/// they had before type arguments at a call existed (Decision 0105,
+/// Amendment: Type Arguments At The Call); [`read_call_candidates`] then
+/// applies name resolution's choice.
 pub fn parse_source_file(source: &SourceFile) -> DiagnosticResult<Program> {
-    let tokens = lexer::Lexer::new(source).lex()?;
-    parser::Parser::new(tokens).parse_program()
+    let (parsed, candidates) =
+        parse_source_file_with_call_readings(source, std::collections::HashMap::new())?;
+    match parsed {
+        Ok(program) => Ok(program),
+        Err(diagnostics) if candidates.is_empty() => Err(diagnostics),
+        Err(diagnostics) => {
+            let comparisons = candidates
+                .iter()
+                .map(|candidate| (candidate.open_span, ast::CallReading::Comparison))
+                .collect();
+            parse_source_file_with_call_readings(source, comparisons)?
+                .0
+                .map_err(|_| diagnostics)
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_source_file_with_call_readings(
+    source: &SourceFile,
+    readings: std::collections::HashMap<source::Span, ast::CallReading>,
+) -> DiagnosticResult<(DiagnosticResult<Program>, Vec<ast::CallCandidate>)> {
+    let (tokens, comments) = lexer::Lexer::new(source).lex_with_comments();
+    Ok(parser::Parser::new(tokens?)
+        .with_documentation(parser::documentation_comments(source, &comments))
+        .with_call_readings(readings)
+        .parse_program_with_candidates())
+}
+
+/// `program` with each call candidate read as name resolution reads it: the
+/// same tree when it already does, and otherwise `source` parsed again with
+/// those readings. Two parses at most, whatever the candidates' nesting.
+pub(crate) fn read_call_candidates(
+    source: &SourceFile,
+    program: Program,
+    context: &CompilationContext,
+    environment: Option<&names::NameResolutionEnvironment>,
+) -> DiagnosticResult<Program> {
+    let readings = names::call_readings(&program, context, environment);
+    if program
+        .call_candidates
+        .iter()
+        .all(|candidate| readings.get(&candidate.open_span) == Some(&candidate.read_as))
+    {
+        return Ok(program);
+    }
+    parse_source_file_with_call_readings(source, readings)?.0
 }
 
 pub fn render_diagnostics(

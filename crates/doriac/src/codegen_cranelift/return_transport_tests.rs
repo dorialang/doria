@@ -134,7 +134,7 @@ fn values_wider_than_the_budget_return_through_the_result_slot() {
     // Unchecked ?ByteRegion from a free function and a method, and ?Deadline.
     assert!(wide
         .iter()
-        .any(|ty| matches!(ty, mir::Type::NullableByteRegion(_))));
+        .any(|ty| matches!(ty, mir::Type::NullableRegion(_))));
     assert!(wide
         .iter()
         .any(|ty| matches!(ty, mir::Type::NullableScalar(mir::ScalarType::Inline(_)))));
@@ -179,7 +179,7 @@ fn lower_for_every_tier_one_target(name: &str, program: &mir::Program) {
     for target in TIER_ONE_TARGETS {
         let isa = cranelift_codegen::isa::lookup_by_name(target)
             .unwrap_or_else(|error| panic!("{target} is not compiled in: {error:?}"));
-        lower_validated_mir_to_object_for_isa(program, isa, None)
+        lower_validated_mir_to_object_for_isa(program, isa, None, None)
             .unwrap_or_else(|error| panic!("{name} does not lower for {target}: {error:?}"));
     }
 }

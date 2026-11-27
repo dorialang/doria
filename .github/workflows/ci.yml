@@ -76,10 +76,12 @@ jobs:
           ini-values: ffi.enable=1
           coverage: none
 
-      - name: Install native leak checker
+      # The Stage 40 zlib package links the system zlib (Decision 0148
+      # acceptance 3).
+      - name: Install native leak checker and zlib
         run: |
           sudo apt-get update
-          sudo apt-get install --yes valgrind
+          sudo apt-get install --yes valgrind zlib1g-dev pkg-config
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -447,7 +449,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --yes llvm-18-dev libffi-dev valgrind
+          sudo apt-get install --yes llvm-18-dev libffi-dev valgrind zlib1g-dev pkg-config
           echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
 
       - name: Install LLVM 18.1.8 on macOS
@@ -585,6 +587,40 @@ jobs:
           --test indexed_access_span_tests
           --test performance_report_tests
           --test native_testing_slice1_tests
+
+      # Decision 0148 acceptance 3: zlib on every host. Linux installs it
+      # with the LLVM packages and macOS links the system libz; Windows
+      # takes vcpkg's import library with its DLL and its static library,
+      # which links against the dynamic Universal CRT (section 20). The
+      # examples/ffi/zlib package links the import library and DLL from
+      # native/windows, as its Baton.toml maps them, so the parity manifest
+      # runs it from there.
+      - name: Provision zlib on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkg = (Get-Command vcpkg -ErrorAction Stop).Source
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            & $vcpkg install "zlib:x64-windows" "zlib:x64-windows-static-md"
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw "failed to install zlib after $attempt attempts" }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+          "VCPKG_INSTALLATION_ROOT=$(Split-Path $vcpkg)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $installed = Join-Path (Split-Path $vcpkg) "installed\x64-windows"
+          $package = "examples\ffi\zlib\native\windows"
+          New-Item -ItemType Directory -Force -Path "$package\lib", "$package\bin" | Out-Null
+          Copy-Item (Join-Path $installed "lib\zlib.lib") "$package\lib\zlib.lib" -ErrorAction Stop
+          Copy-Item (Join-Path $installed "bin\zlib1.dll") "$package\bin\zlib1.dll" -ErrorAction Stop
+
+      - name: Run Stage 40 unsafe code and FFI suites
+        run: >-
+          cargo test -p doriac --features llvm-backend --locked --verbose --no-fail-fast
+          --test stage40_grammar_tests
+          --test stage40_checking_tests
+          --test stage40_execution_tests
+          --test stage40_linking_tests
 
       - name: Run complete interpreter, Cranelift, and LLVM parity manifest
         run: cargo test -p doriac --test native_mir_parity_tests --features llvm-backend --locked --verbose

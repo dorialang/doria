@@ -122,7 +122,9 @@ impl SourceTypes {
 
     pub(crate) fn carries(&self, ty: &ResolvedType) -> bool {
         match ty {
-            ResolvedType::ByteRegion(_) | ResolvedType::Function(_) => true,
+            ResolvedType::ByteRegion(_)
+            | ResolvedType::ArrayRegion(..)
+            | ResolvedType::Function(_) => true,
             ResolvedType::Nullable(inner)
             | ResolvedType::TypedArray(inner)
             | ResolvedType::List(inner)
@@ -362,6 +364,7 @@ impl Analysis {
                                 ),
                                 take: parameter.take,
                                 writable: parameter.writable,
+                                lends: parameter.writable,
                                 borrow: false,
                             })
                             .collect(),
@@ -1086,6 +1089,88 @@ impl Checker<'_> {
                 self.specialize_copy_parameter_return(expr, args, &mut signature);
                 return Some((signature, None, args));
             }
+            // Handles (Decision 0148 section 11): `Handle::create` takes its
+            // value, `reclaim` gives an owned value back, and `borrow` lends
+            // a value its handle argument holds.
+            Expr::StaticCall {
+                qualifier,
+                method,
+                args,
+                ..
+            } if crate::foreign_handles::static_call(qualifier, method).is_some() => {
+                let (_, operation) = crate::foreign_handles::static_call(qualifier, method)
+                    .expect("the handle operation was matched");
+                let create = operation == crate::foreign_handles::HandleOperation::Create;
+                return Some((
+                    Signature {
+                        params: vec![Parameter {
+                            name: if create { "value" } else { "handle" }.to_string(),
+                            move_type: create,
+                            class_type: create,
+                            generic: false,
+                            take: create,
+                            writable: false,
+                            lends: false,
+                            borrow: false,
+                        }],
+                        returns_move_type: !create,
+                        return_borrow: (operation
+                            == crate::foreign_handles::HandleOperation::Borrow)
+                            .then_some(ReturnBorrow {
+                                source: BorrowSource::Parameter(0),
+                                writable: false,
+                                kind: crate::types::ReturnBorrowKind::Value,
+                                lifetime: crate::types::RetainedLifetime::LastUse,
+                            }),
+                        ..Signature::default()
+                    },
+                    None,
+                    args,
+                ));
+            }
+            // A region over foreign memory borrows its owner, with writable
+            // access for a writable region (Decision 0148 section 10).
+            Expr::StaticCall {
+                qualifier,
+                method,
+                args,
+                ..
+            } if crate::byte_intrinsics::RegionCompanion::from_pointer_call(qualifier, method)
+                .is_some() =>
+            {
+                let region =
+                    crate::byte_intrinsics::RegionCompanion::from_pointer_call(qualifier, method)
+                        .expect("the region companion was matched");
+                let writable = region.kind.is_writable();
+                return Some((
+                    Signature {
+                        params: crate::byte_intrinsics::FROM_POINTER_PARAMETERS
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| Parameter {
+                                name: (*name).to_string(),
+                                move_type: false,
+                                class_type: false,
+                                generic: false,
+                                take: false,
+                                writable: index == 0 && writable,
+                                lends: false,
+                                borrow: false,
+                            })
+                            .collect(),
+                        returns_move_type: writable,
+                        return_borrow: Some(ReturnBorrow {
+                            source: BorrowSource::Parameter(0),
+                            writable,
+                            kind: crate::types::ReturnBorrowKind::Retained,
+                            lifetime: crate::types::RetainedLifetime::LastUse,
+                        }),
+                        ..Signature::default()
+                    },
+                    None,
+                    args,
+                ));
+            }
             Expr::FunctionCall { args, .. } | Expr::StaticCall { args, .. } => (None, args),
             Expr::MethodCall {
                 object,
@@ -1093,6 +1178,20 @@ impl Checker<'_> {
                 args,
                 ..
             } => {
+                // `$reference->toHandle()` consumes the reference's strong
+                // claim (Decision 0148 section 11).
+                if let Some(ResolvedType::SharedHandle(kind, _)) = self.resolved_type(object) {
+                    if crate::foreign_handles::instance_operation(*kind, method).is_some() {
+                        return Some((
+                            Signature {
+                                receiver: Some(UseMode::Give),
+                                ..Signature::default()
+                            },
+                            Some(object),
+                            args,
+                        ));
+                    }
+                }
                 if let Some(intrinsic) = self
                     .resolved_type(object)
                     .and_then(|ty| {
@@ -1116,6 +1215,7 @@ impl Checker<'_> {
                                     generic: false,
                                     take: false,
                                     writable: false,
+                                    lends: false,
                                     borrow: false,
                                 })
                                 .collect(),
@@ -1462,13 +1562,40 @@ impl Checker<'_> {
             Expr::MethodCall { object, method, .. } => self
                 .resolved_type(object)
                 .and_then(|ty| crate::types::ByteRegionKind::method_result(ty, method))
-                .map(|kind| (object, kind)),
+                .map(|kind| (object.as_ref(), kind)),
             Expr::PropertyAccess {
                 object, property, ..
             } => self
                 .resolved_type(object)
                 .and_then(|ty| crate::types::ByteRegionKind::property_result(ty, property))
-                .map(|kind| (object, kind)),
+                // A fixed-length array field of a foreign struct or union
+                // is a region over the containing value (Decision 0148
+                // section 6).
+                .or_else(|| {
+                    let receiver = self.resolved_type(object)?;
+                    let is_aggregate = matches!(
+                        receiver,
+                        ResolvedType::Foreign(foreign)
+                            if matches!(foreign.as_ref(), crate::foreign::ForeignType::Aggregate(_))
+                    );
+                    match self.resolved_type(expr)? {
+                        ResolvedType::ArrayRegion(kind, _) if is_aggregate => Some(*kind),
+                        _ => None,
+                    }
+                })
+                .map(|kind| (object.as_ref(), kind)),
+            // A region over foreign memory views its owner (Decision 0148
+            // section 10).
+            Expr::StaticCall {
+                qualifier,
+                method,
+                args,
+                ..
+            } => crate::byte_intrinsics::RegionCompanion::from_pointer_call(qualifier, method)
+                .and_then(|region| {
+                    let (_, owner) = crate::byte_intrinsics::from_pointer_argument(args, 0)?;
+                    Some((&owner.value, region.kind))
+                }),
             _ => None,
         };
         if let Some((object, kind)) = viewed {

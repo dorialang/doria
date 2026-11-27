@@ -99,11 +99,11 @@ function main(): void {
     {
         if let Statement::AssignLocal {
             target,
-            value: Rvalue::ByteRegion(mir::ByteRegionExpression::CollectionIndex { kind, .. }),
+            value: Rvalue::Region(mir::RegionExpression::CollectionIndex { kind, .. }),
         } = statement
         {
             if *target == selected {
-                *kind = ByteRegionKind::Writable;
+                *kind = mir::RegionType::bytes(ByteRegionKind::Writable);
                 changed = true;
             }
         }
@@ -122,7 +122,7 @@ fn region_returns_preserve_view_loans_not_owned_container_contents() {
     ] {
         for expression in ["$view", "$call($view)"] {
             let mut program = lower(&format!(
-                "function forward(function(take {ty}): {ty} $call, take {ty} $view): {ty} {{ return {expression}; }} function main(): void {{}}"
+                "function forward(function(take {ty}): {ty} $call, take {ty} $view): {ty} {{ return {expression}; }} function main(): void {{ let $reach = function(function(take {ty}): {ty} $call, take {ty} $view): {ty} {{ return forward($call, $view); }}; }}"
             ));
             doriac::mir_validation::validate_program(&program).unwrap();
             let function = program
@@ -192,7 +192,13 @@ function finite(writable Link $link): void {
     $link->next->next->right[0] = 1;
     echo $view[0];
 }
-function main(): void {}
+function main(): void {
+    let $reach = function(writable Link $link): void {
+        finite($link);
+        { let $recursive = recursive($link, false); }
+        { let $mutual = mutual($link, false); }
+    };
+}
 "#,
     );
     doriac::mir_validation::validate_program(&program).unwrap();
@@ -270,7 +276,9 @@ function walk(Link $link, bool $keep): void {
     let $step = identity($link);
     while ($keep) {}
 }
-function main(): void {}
+function main(): void {
+    let $reach = function(Link $link): void { walk($link, false); };
+}
 "#,
     );
     let class = program
@@ -514,7 +522,9 @@ function touch(writable Cell $left, writable Cell $right): void {{}}
 function observe(Cell $left, writable Cell $right): void {{}}
 function identity(Cell $cell): Cell {{ return $cell; }}
 function route(writable Tree $tree): void {{ {body} }}
-function main(): void {{}}
+function main(): void {{
+    let $reach = function(writable Tree $tree): void {{ route($tree); }};
+}}
 "#
         ));
         doriac::mir_validation::validate_program(&program)
@@ -645,7 +655,7 @@ function main(): void {
         snapshot,
         vec![
             Statement::EndBorrow { local: child },
-            Statement::AssignByteRegionIndex {
+            Statement::AssignRegionIndex {
                 region: parent,
                 index: integer(IntegerType::Int64, 0),
                 value: integer(IntegerType::UInt8, 9),
@@ -726,7 +736,7 @@ fn resource_reads_follow_nested_transfer_order() {
             let operand = if ty == "Bytes" {
                 mir::Operand::CollectionLength(value)
             } else {
-                mir::Operand::ByteRegionLength(value)
+                mir::Operand::RegionLength(value)
             };
             let read = mir::IntegerExpression::Use {
                 ty: IntegerType::Int64,
@@ -763,7 +773,12 @@ function consume(take WritableByteRegion $view): int { return $view->length; }
 function consumeWithByte(take WritableByteRegion $view, uint8 $byte): int { return $view->length; }
 function getView(writable Bytes $bytes): WritableByteRegion { return $bytes->getWritableRegion(0, 2); }
 function evaluate(writable Bytes $bytes): int { return $bytes->length; }
-function main(): void {}
+function main(): void {
+    writable Bytes $bytes = Bytes::allocate(2);
+    let $consumed = consume(getView($bytes));
+    let $withByte = consumeWithByte(getView($bytes), UInt8::from(1));
+    let $length = evaluate($bytes);
+}
 "#,
     );
     let consume = original
@@ -803,16 +818,16 @@ function main(): void {}
                 assume_non_null: false,
             });
             let region = if use_helper {
-                Rvalue::ByteRegion(mir::ByteRegionExpression::Call {
-                    kind: ByteRegionKind::Writable,
+                Rvalue::Region(mir::RegionExpression::Call {
+                    kind: mir::RegionType::bytes(ByteRegionKind::Writable),
                     function: helper.id,
                     args: vec![source],
                     span,
                     return_borrow: helper.return_borrow,
                 })
             } else {
-                Rvalue::ByteRegion(mir::ByteRegionExpression::Region {
-                    kind: ByteRegionKind::Writable,
+                Rvalue::Region(mir::RegionExpression::Region {
+                    kind: mir::RegionType::bytes(ByteRegionKind::Writable),
                     source: Box::new(source),
                     offset: Box::new(integer(IntegerType::Int64, 0)),
                     length: Box::new(integer(IntegerType::Int64, 2)),
@@ -964,7 +979,7 @@ fn missing_copy_region_scope_end_keeps_the_source_frozen() {
             target: used,
             value: Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
                 ty: IntegerType::UInt8,
-                operand: mir::Operand::ByteRegionIndex {
+                operand: mir::Operand::RegionIndex {
                     region: copy,
                     index: Box::new(integer(IntegerType::Int64, 0)),
                     index_span: doriac::source::Span::new(0, 0),
@@ -1002,6 +1017,7 @@ fn writable_region_excludes_source_reads_and_mutation() {
                 writable: false,
                 owned: false,
                 synthetic: true,
+                binding: None,
             });
             Statement::AssignLocal {
                 target,
@@ -1035,7 +1051,7 @@ function main(): void {
     let assignment = function.blocks.iter_mut().flat_map(|block| &mut block.statements)
         .find(|statement| matches!(statement, Statement::AssignLocal { target, .. } if *target == moved)).unwrap();
     let Statement::AssignLocal {
-        value: Rvalue::ByteRegion(mir::ByteRegionExpression::Local { transfer, .. }),
+        value: Rvalue::Region(mir::RegionExpression::Local { transfer, .. }),
         ..
     } = assignment
     else {
@@ -1070,7 +1086,7 @@ function main(): void {
     insert_after_assignment(
         function,
         child,
-        vec![Statement::AssignByteRegionIndex {
+        vec![Statement::AssignRegionIndex {
             region: view,
             index: integer(IntegerType::Int64, 0),
             value: integer(IntegerType::UInt8, 5),
@@ -1117,7 +1133,10 @@ fn readonly_region_carrier_cannot_claim_move_ownership() {
     let copy = local(function, "copy");
     assert_eq!(
         function.locals[copy.0].ty,
-        Type::ByteRegion(ByteRegionKind::Readonly)
+        Type::Region(doriac::mir::RegionType {
+            access: ByteRegionKind::Readonly,
+            array: None
+        })
     );
     function.locals[copy.0].owned = true;
     reject(&program, "Copy byte region cannot own a descriptor");
@@ -1141,7 +1160,10 @@ function main(): void {
     let mut erased = 0;
     for signature in &mut program.function_types {
         if signature.return_type
-            == mir::ReturnType::Value(Type::ByteRegion(ByteRegionKind::Readonly))
+            == mir::ReturnType::Value(Type::Region(doriac::mir::RegionType {
+                access: ByteRegionKind::Readonly,
+                array: None,
+            }))
         {
             assert_eq!(
                 signature.return_borrow.unwrap().kind,
@@ -1166,12 +1188,21 @@ function main(): void {
 function apply(function(ByteRegion): ByteRegion $call, ByteRegion $view): ByteRegion {
     return $call($view);
 }
-function main(): void {}
+function main(): void {
+    // An `int` result keeps this function value's own type out of the
+    // region signatures the test erases.
+    let $reach = function(function(ByteRegion): ByteRegion $call, ByteRegion $view): int {
+        return apply($call, $view)->length;
+    };
+}
 "#,
     );
     for signature in &mut opaque.function_types {
         if signature.return_type
-            == mir::ReturnType::Value(Type::ByteRegion(ByteRegionKind::Readonly))
+            == mir::ReturnType::Value(Type::Region(doriac::mir::RegionType {
+                access: ByteRegionKind::Readonly,
+                array: None,
+            }))
         {
             signature.return_borrow = None;
         }
@@ -1193,7 +1224,7 @@ fn consuming_receiver_cannot_be_forged_as_any_retained_return_source() {
         ),
     ] {
         let original = lower(&format!(
-            "class Packet {{ consuming function finish(Bytes $source): {result} {{ {body} }} }} function main(): void {{}}"
+            "class Packet {{ consuming function finish(Bytes $source): {result} {{ {body} }} }} function main(): void {{ let $source = Bytes::allocate(1); let $packet = new Packet(); let $finished = $packet->finish($source); }}"
         ));
         for inherited in [false, true] {
             let mut program = original.clone();

@@ -106,12 +106,17 @@ impl Plan {
 
     fn field_type(&self, ty: mir::Type) -> Option<ResolvedType> {
         match ty {
-            mir::Type::ByteRegion(kind) => return Some(ResolvedType::ByteRegion(kind)),
-            mir::Type::NullableByteRegion(kind) => {
+            // PHP output builds byte regions; it rejects typed array
+            // regions before emission.
+            mir::Type::Region(kind) if kind.array.is_none() => {
+                return Some(ResolvedType::ByteRegion(kind.access))
+            }
+            mir::Type::NullableRegion(kind) if kind.array.is_none() => {
                 return Some(ResolvedType::Nullable(Box::new(ResolvedType::ByteRegion(
-                    kind,
+                    kind.access,
                 ))))
             }
+            mir::Type::Region(_) | mir::Type::NullableRegion(_) => return None,
             _ => {}
         }
         let (ty, nullable) = match ty {
@@ -571,7 +576,10 @@ impl Plan {
                                     cell: requires_parameter_cell(
                                         &ty,
                                         parameter.take,
-                                        parameter.writable,
+                                        crate::php_closure::signature_parameter_lends_place(
+                                            &program.semantic_info,
+                                            parameter,
+                                        ),
                                         &program.semantic_info.enums,
                                     ) || requirement.return_borrow.is_some_and(|borrow| {
                                         returns_borrow
@@ -627,7 +635,14 @@ impl Plan {
             let ResolvedType::Class(class) = &conformance.implementing_type else {
                 continue;
             };
-            if !plan.classes.contains_key(class) {
+            // Only a class reachable code constructs or names has its
+            // interface implementations emitted (Decision 0148 section 17).
+            if !plan.classes.contains_key(class)
+                || !program
+                    .semantic_info
+                    .reachable
+                    .reaches_implementations(&class.name)
+            {
                 continue;
             }
             let witnesses = program
@@ -1496,6 +1511,7 @@ impl Plan {
         scopes.mixed_box_plans = self.semantic.mixed_box_plans.clone();
         scopes.matches = self.semantic.matches.clone();
         scopes.whens = self.semantic.whens.clone();
+        scopes.constant_conditions = Rc::new(self.semantic.constant_conditions.clone());
         let substitute = |ty: &ResolvedType| substitute_resolved_type(ty, &callable.substitutions);
         for types in [
             &mut scopes.expression_types,
@@ -1708,7 +1724,7 @@ impl Plan {
                 parameter.cell |= requires_parameter_cell(
                     &ty,
                     checked.take,
-                    checked.writable,
+                    crate::php_closure::signature_parameter_lends_place(&self.semantic, checked),
                     &self.semantic.enums,
                 );
             }

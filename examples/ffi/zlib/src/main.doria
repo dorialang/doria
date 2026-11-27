@@ -1,0 +1,258 @@
+use Doria\Std\Ffi\{CChar, CSize, CString, CUnsignedLong, Library, Opaque, Pointer, WritablePointer};
+use Doria\Std\Io\{ByteRegion, IoError, WritableByteRegion};
+
+const int32 Z_OK = 0;
+const int32 Z_STREAM_END = 1;
+const int32 Z_FINISH = 4;
+const int32 Z_BEST_COMPRESSION = 9;
+const string ZLIB_VERSION = "1.2.11";
+
+/** zlib's `z_stream`; `uLong` is 32-bit on Windows and 64-bit elsewhere. */
+internal extern "C" struct ZStream
+{
+    ?Pointer<uint8> $nextIn = null;
+    uint32 $availableIn = 0;
+    CUnsignedLong $totalIn;
+    ?WritablePointer<uint8> $nextOut = null;
+    uint32 $availableOut = 0;
+    CUnsignedLong $totalOut;
+    ?Pointer<CChar> $message = null;
+    ?WritablePointer<Opaque> $state = null;
+    ?extern "C" function(?WritablePointer<Opaque>, uint32, uint32): ?WritablePointer<Opaque> $allocate = null;
+    ?extern "C" function(?WritablePointer<Opaque>, ?WritablePointer<Opaque>): void $free = null;
+    ?WritablePointer<Opaque> $opaque = null;
+    int32 $dataType = 0;
+    CUnsignedLong $adler;
+    CUnsignedLong $reserved;
+}
+
+/** @safety Each pointer addresses the number of bytes its length names. */
+#[Library("zlib")]
+internal extern "C"
+{
+    function compressBound(CUnsignedLong $sourceLength): CUnsignedLong;
+
+    function compress2(WritablePointer<uint8> $destination, WritablePointer<CUnsignedLong> $destinationLength,
+        Pointer<uint8> $source, CUnsignedLong $sourceLength, int32 $level): int32;
+
+    function uncompress(WritablePointer<uint8> $destination, WritablePointer<CUnsignedLong> $destinationLength,
+        Pointer<uint8> $source, CUnsignedLong $sourceLength): int32;
+
+    function deflateInit_(WritablePointer<ZStream> $stream, int32 $level, Pointer<CChar> $version,
+        int32 $streamSize): int32;
+
+    function deflate(WritablePointer<ZStream> $stream, int32 $flush): int32;
+
+    function deflateEnd(WritablePointer<ZStream> $stream): int32;
+}
+
+/** @safety Memory from `calloc` or `malloc` is released once with `free`. */
+internal extern "C"
+{
+    function calloc(CSize $count, CSize $size): ?WritablePointer<Opaque>;
+
+    function malloc(CSize $size): ?WritablePointer<Opaque>;
+
+    function free(?WritablePointer<Opaque> $memory): void;
+}
+
+/** What zlib's allocator callbacks have done, reached through `opaque`. */
+internal class AllocationCounter
+{
+    function __construct(writable int $allocations, writable int $releases) {}
+}
+
+/** zlib's `zalloc`: `calloc`, counted on the counter `opaque` holds. */
+extern "C" function allocateForZlib(?WritablePointer<Opaque> $opaque, uint32 $items, uint32 $size): ?WritablePointer<Opaque>
+{
+    unsafe {
+        if ($opaque != null) {
+            let $counter = WritableSharedReference::borrow<AllocationCounter>($opaque);
+            let writable $access = $counter->acquireWritableAccess();
+            $access->allocations++;
+        }
+        return calloc(CSize::from($items), CSize::from($size));
+    }
+}
+
+/** zlib's `zfree`: `free`, counted on the counter `opaque` holds. */
+extern "C" function releaseForZlib(?WritablePointer<Opaque> $opaque, ?WritablePointer<Opaque> $address): void
+{
+    unsafe {
+        if ($opaque != null) {
+            let $counter = WritableSharedReference::borrow<AllocationCounter>($opaque);
+            let writable $access = $counter->acquireWritableAccess();
+            $access->releases++;
+        }
+        free($address);
+    }
+}
+
+/** A buffer `malloc` allocated, released once when its owner ends. */
+internal class ForeignBuffer
+{
+    function __construct(
+        internal WritablePointer<uint8> $bytes,
+        internal int $length,
+    ) {}
+
+    function getBytes(): ByteRegion
+    {
+        return unsafe(ByteRegion::fromPointer($this, Pointer::from($this->bytes), $this->length));
+    }
+
+    writable function getWritableBytes(): WritableByteRegion
+    {
+        return unsafe(WritableByteRegion::fromPointer($this, $this->bytes, $this->length));
+    }
+
+    function __destruct()
+    {
+        try {
+            echo "foreign buffer released\n";
+        } catch (IoError $error) {
+        }
+        unsafe { free(WritablePointer::cast<Opaque>($this->bytes)); }
+    }
+}
+
+function allocateForeign(int $length): ForeignBuffer
+{
+    unsafe {
+        ?WritablePointer<Opaque> $memory = malloc(CSize::from($length));
+        if ($memory != null) {
+            return new ForeignBuffer(WritablePointer::cast<uint8>($memory), $length);
+        }
+    }
+    panic("out of memory");
+}
+
+function differences(ByteRegion $left, Bytes $right): int
+{
+    writable int $count = 0;
+    for (writable int $index = 0; $index < $left->length; $index++) {
+        if ($left[$index] != $right[$index]) {
+            $count++;
+        }
+    }
+    return $count;
+}
+
+function main(): void
+{
+    let $source = "Doria binds zlib. Doria binds zlib. Doria binds zlib. Doria binds zlib.";
+    let $input = $source->bytes;
+    let $length = $input->length;
+    let $bound = Int64::from(unsafe(compressBound(CUnsignedLong::from($length))));
+    echo "bound " . ($bound >= $length) . "\n";
+
+    writable Bytes $packed = Bytes::allocate($bound);
+    writable CUnsignedLong $packedLength = CUnsignedLong::from($bound);
+    unsafe {
+        writable WritableByteRegion $target = $packed->getWritableRegion(0, $bound);
+        let $status = compress2($target->writablePointer, WritablePointer::to($packedLength),
+            $input->getRegion(0, $length)->pointer, CUnsignedLong::from($length), Z_BEST_COMPRESSION);
+        echo "compress2 " . ($status == Z_OK) . "\n";
+    }
+    let $packedSize = Int64::from($packedLength);
+    echo "smaller " . ($packedSize < $length) . "\n";
+
+    writable Bytes $unpacked = Bytes::allocate($length);
+    writable CUnsignedLong $unpackedLength = CUnsignedLong::from($length);
+    unsafe {
+        writable WritableByteRegion $target = $unpacked->getWritableRegion(0, $length);
+        let $status = uncompress($target->writablePointer, WritablePointer::to($unpackedLength),
+            $packed->getRegion(0, $packedSize)->pointer, CUnsignedLong::from($packedSize));
+        echo "uncompress " . ($status == Z_OK) . "\n";
+    }
+    echo "round trip " . ($unpacked == $input) . "\n";
+
+    writable Bytes $streamed = Bytes::allocate($bound);
+    writable ZStream $stream = new ZStream(
+        totalIn: CUnsignedLong::from(0),
+        totalOut: CUnsignedLong::from(0),
+        adler: CUnsignedLong::from(0),
+        reserved: CUnsignedLong::from(0),
+    );
+    let $version = CString::from(ZLIB_VERSION);
+    unsafe {
+        let $initialized = deflateInit_(WritablePointer::to($stream), Z_BEST_COMPRESSION, $version->pointer,
+            Int32::from(ZStream::SIZE));
+        echo "deflateInit_ " . ($initialized == Z_OK) . "\n";
+        let $from = $input->getRegion(0, $length)->pointer;
+        writable WritableByteRegion $target = $streamed->getWritableRegion(0, $bound);
+        let $to = $target->writablePointer;
+        $stream->nextIn = $from;
+        $stream->availableIn = UInt32::from($length);
+        $stream->nextOut = $to;
+        $stream->availableOut = UInt32::from($bound);
+        let $finished = deflate(WritablePointer::to($stream), Z_FINISH);
+        echo "deflate " . ($finished == Z_STREAM_END) . "\n";
+        let $consumed = Int64::from($stream->totalIn);
+        let $produced = Int64::from($stream->totalOut);
+        echo "consumed " . ($consumed == $length) . "\n";
+        // zlib advances its own pointers through the Doria storage.
+        let $nextIn = $stream->nextIn ?? $from;
+        let $nextOut = $stream->nextOut ?? $to;
+        echo "input address " . ($nextIn->address == $from->address + UInt64::from($length)) . "\n";
+        echo "output address " . ($nextOut->address == $to->address + UInt64::from($produced)) . "\n";
+        echo "deflateEnd " . (deflateEnd(WritablePointer::to($stream)) == Z_OK) . "\n";
+    }
+    let $streamedSize = Int64::from($stream->totalOut);
+
+    writable Bytes $restored = Bytes::allocate($length);
+    writable CUnsignedLong $restoredLength = CUnsignedLong::from($length);
+    unsafe {
+        writable WritableByteRegion $target = $restored->getWritableRegion(0, $length);
+        let $status = uncompress($target->writablePointer, WritablePointer::to($restoredLength),
+            $streamed->getRegion(0, $streamedSize)->pointer, CUnsignedLong::from($streamedSize));
+        echo "stream round trip " . ($status == Z_OK && $restored == $input) . "\n";
+    }
+
+    // zlib allocates through Doria callbacks that count on a shared counter.
+    let $counter = new WritableSharedReference(new AllocationCounter(0, 0));
+    let $context = $counter->share();
+    writable Bytes $counted = Bytes::allocate($bound);
+    writable ZStream $countedStream = new ZStream(
+        totalIn: CUnsignedLong::from(0),
+        totalOut: CUnsignedLong::from(0),
+        adler: CUnsignedLong::from(0),
+        reserved: CUnsignedLong::from(0),
+        allocate: allocateForZlib,
+        free: releaseForZlib,
+    );
+    unsafe {
+        WritablePointer<Opaque> $handle = $context->toHandle();
+        $countedStream->opaque = $handle;
+        let $initialized = deflateInit_(WritablePointer::to($countedStream), Z_BEST_COMPRESSION,
+            $version->pointer, Int32::from(ZStream::SIZE));
+        writable WritableByteRegion $target = $counted->getWritableRegion(0, $bound);
+        $countedStream->nextIn = $input->getRegion(0, $length)->pointer;
+        $countedStream->availableIn = UInt32::from($length);
+        $countedStream->nextOut = $target->writablePointer;
+        $countedStream->availableOut = UInt32::from($bound);
+        let $finished = deflate(WritablePointer::to($countedStream), Z_FINISH);
+        let $ended = deflateEnd(WritablePointer::to($countedStream));
+        echo "counted deflate " . ($initialized == Z_OK && $finished == Z_STREAM_END && $ended == Z_OK) . "\n";
+        let $returned = WritableSharedReference::reclaim<AllocationCounter>($handle);
+    }
+    let $counts = $counter->acquireReadonlyAccess();
+    echo "allocations counted " . ($counts->allocations > 0) . "\n";
+    echo "every allocation released " . ($counts->allocations == $counts->releases) . "\n";
+
+    // zlib fills a buffer `malloc` owns, which safe code reads as a region.
+    {
+        writable ForeignBuffer $buffer = allocateForeign($length);
+        writable CUnsignedLong $foreignLength = CUnsignedLong::from($length);
+        unsafe {
+            writable WritableByteRegion $target = $buffer->getWritableBytes();
+            let $status = uncompress($target->writablePointer, WritablePointer::to($foreignLength),
+                $packed->getRegion(0, $packedSize)->pointer, CUnsignedLong::from($packedSize));
+            echo "foreign uncompress " . ($status == Z_OK) . "\n";
+        }
+        let $region = $buffer->getBytes();
+        echo "foreign region " . ($region->length == $length && differences($region, $input) == 0) . "\n";
+    }
+    echo String::fromBytes($restored) ?? "invalid";
+    echo "\n";
+}

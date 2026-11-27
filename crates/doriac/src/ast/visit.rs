@@ -109,6 +109,7 @@ pub fn stmt(statement: &Stmt, visitor: &mut dyn FnMut(&Expr)) {
             block(&statement.body, visitor);
         }
         Stmt::Increment(statement) => expr(&statement.target, visitor),
+        Stmt::Unsafe(statement) => block(&statement.block, visitor),
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
     }
 }
@@ -161,6 +162,7 @@ pub fn expr(expression: &Expr, visitor: &mut dyn FnMut(&Expr)) {
         }
         Expr::IsType { expr: value, .. }
         | Expr::Grouped { expr: value, .. }
+        | Expr::Unsafe { expr: value, .. }
         | Expr::Unary { expr: value, .. } => expr(value, visitor),
         Expr::FunctionCall { args, .. }
         | Expr::StaticCall { args, .. }

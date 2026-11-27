@@ -12,6 +12,12 @@ pub trait Transform: Sized {
     fn function(&mut self, function: &mut FunctionDecl) {
         function.walk(self);
     }
+    fn statement(&mut self, statement: &mut Stmt) {
+        statement.walk(self);
+    }
+    fn expression(&mut self, expression: &mut Expr) {
+        expression.walk(self);
+    }
 }
 
 pub trait Transformable {
@@ -109,6 +115,25 @@ macro_rules! enumeration {
         }
     };
 }
+// A syntax node a transform may intercept: its `walk` visits the children,
+// and `transform` goes through the node's hook on [`Transform`].
+macro_rules! hooked_enumeration {
+    ($hook:ident, $ty:ident { $($variant:ident $(($value:ident))? $({$($field:ident),* $(,)?})?),* $(,)? }) => {
+        impl $ty {
+            pub fn walk<T: Transform>(&mut self, transform: &mut T) {
+                match self { $(Self::$variant $(($value))? $({$($field),*})? => {
+                    $($value.transform(transform);)?
+                    $($($field.transform(transform);)*)?
+                }),* }
+            }
+        }
+        impl Transformable for $ty {
+            fn transform<T: Transform>(&mut self, transform: &mut T) {
+                transform.$hook(self);
+            }
+        }
+    };
+}
 
 structure!(NameSegmentRef { text, span });
 structure!(QualifiedNameRef {
@@ -138,8 +163,11 @@ structure!(FunctionTypeRef {
     return_type,
     return_type_span,
     throws_clause,
+    c_abi,
     span
 });
+structure!(ForeignAbi { value, span });
+structure!(CAbiTypeRef { extern_span, abi });
 structure!(FunctionTypeParameterRef {
     ownership_mode,
     ownership_modifier_span,
@@ -271,6 +299,9 @@ walk_struct!(FunctionDecl {
     consuming_span,
     is_static,
     static_span,
+    unsafe_span,
+    linkage,
+    documentation,
     name,
     name_span,
     type_params,
@@ -283,7 +314,11 @@ walk_struct!(FunctionDecl {
     modifier_prefix_span,
     span
 });
-enumeration!(FunctionBody { Block(value), Requirement { semicolon_span }, Intrinsic { implementation, span } });
+enumeration!(FunctionLinkage { Doria, CAbi { extern_span, abi }, Foreign { block } });
+structure!(DocComment { span, safety });
+structure!(DocSection { span, text });
+enumeration!(FunctionBody { Block(value), Requirement { semicolon_span },
+    Foreign { semicolon_span }, Intrinsic { implementation, span } });
 structure!(FunctionSyntax {
     keyword_span,
     type_parameters,
@@ -331,9 +366,15 @@ enumeration!(ConstructorParameterRole { Ordinary,
 structure!(ArgumentName { text, span });
 structure!(Argument { name, value, span });
 structure!(Block { statements, span });
-enumeration!(Stmt { Block(value), VarDecl(value), Assignment(value), Echo { expr, span },
+hooked_enumeration!(statement, Stmt { Block(value), VarDecl(value), Assignment(value), Echo { expr, span },
     Return { expr, span }, Throw(value), Try(value), If(value), While(value), DoWhile(value),
-    For(value), Break { span }, Continue { span }, Foreach(value), Increment(value), Expr { expr, span } });
+    For(value), Break { span }, Continue { span }, Foreach(value), Increment(value), Expr { expr, span },
+    Unsafe(value) });
+structure!(UnsafeBlock {
+    keyword_span,
+    block,
+    span
+});
 structure!(ThrowStmt {
     keyword_span,
     expr,
@@ -477,22 +518,25 @@ structure!(ClosureCapture {
     span
 });
 enumeration!(ClosureBody { Expression { arrow_span, expression }, Block(value) });
-enumeration!(Expr {
+hooked_enumeration!(expression, Expr {
     Variable { name, span }, This { span }, Identifier { name, span }, String { value, span },
     InterpolatedString { parts, span }, Int { value, span }, Float { value, span },
     Bool { value, span }, Null { span }, Array { elements, span },
     ArrayRepeat { value, count, span }, Index { collection, index, span },
     PropertyAccess { object, property, member_span, null_safe, take_span, span },
-    MethodCall { object, method, member_span, args, argument_list_span, null_safe, span },
-    IsType { expr, ty, span }, FunctionCall { name, args, span },
+    MethodCall { object, method, member_span, type_arguments, args, argument_list_span,
+        null_safe, span },
+    IsType { expr, ty, span }, FunctionCall { name, type_arguments, args, span },
     CallableCall { callee, open_span, args, close_span, argument_list_span, span },
     StaticCall { qualifier, qualifier_span, method, member_span, member_sigil_span,
-        args, argument_list_span, span },
+        type_arguments, args, argument_list_span, span },
     StaticMember { qualifier, qualifier_span, member, member_span, member_sigil_span, span },
     New { class_type, args, shared, span }, Grouped { expr, span }, Unary { op, expr, span },
     Binary { left, op, right, span }, Range { start, end, inclusive, span },
     Match { scrutinee, mode, arms, origin, span }, When(value), Closure(value),
+    Unsafe { keyword_span, expr, span },
 });
+structure!(CallTypeArguments { arguments, span });
 structure!(WhenExpression {
     given,
     result_type,

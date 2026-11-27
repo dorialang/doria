@@ -70,8 +70,11 @@ pub struct EnumLayout {
     pub cases: Vec<EnumCaseLayout>,
 }
 
+/// The storage of `?T` for an inline value `T` that has no null value of its
+/// own, a payload enum or a foreign struct or union: a presence byte at
+/// offset 0, then the payload at the first offset aligned for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NullableEnumLayout {
+pub struct NullableInlineLayout {
     pub presence_offset: u32,
     pub payload_offset: u32,
     pub size: u32,
@@ -165,7 +168,23 @@ pub fn compute_enum_layout(
     })
 }
 
-pub fn nullable_enum_layout(payload: &EnumLayout) -> Result<NullableEnumLayout, EnumLayoutError> {
+impl EnumLayout {
+    pub const fn shape(&self) -> LayoutShape {
+        LayoutShape {
+            size: self.size,
+            align: self.align,
+        }
+    }
+}
+
+/// The one nullable layout of every inline value without a null value of
+/// its own ([`NullableInlineLayout`]).
+pub fn nullable_inline_layout(
+    payload: LayoutShape,
+) -> Result<NullableInlineLayout, EnumLayoutError> {
+    if payload.align == 0 || !payload.align.is_power_of_two() {
+        return Err(EnumLayoutError::InvalidAlignment);
+    }
     let payload_offset = checked_align_up(1, payload.align)?;
     let size = checked_align_up(
         payload_offset
@@ -173,7 +192,7 @@ pub fn nullable_enum_layout(payload: &EnumLayout) -> Result<NullableEnumLayout, 
             .ok_or(EnumLayoutError::SizeOverflow)?,
         payload.align,
     )?;
-    Ok(NullableEnumLayout {
+    Ok(NullableInlineLayout {
         presence_offset: 0,
         payload_offset,
         size,
@@ -261,11 +280,19 @@ mod tests {
     fn nullable_layout_aligns_the_inline_payload_after_presence() {
         let payload = compute_enum_layout(EnumId(0), &[vec![LayoutShape { size: 8, align: 8 }]])
             .expect("payload layout");
-        let nullable = nullable_enum_layout(&payload).expect("nullable layout");
+        let nullable = nullable_inline_layout(payload.shape()).expect("nullable layout");
 
         assert_eq!(nullable.presence_offset, 0);
         assert_eq!(nullable.payload_offset, 8);
         assert_eq!(nullable.size, 24);
         assert_eq!(nullable.align, 8);
+
+        // A byte-aligned C struct follows the presence byte directly.
+        let color = nullable_inline_layout(LayoutShape { size: 4, align: 1 }).expect("layout");
+        assert_eq!((color.payload_offset, color.size, color.align), (1, 5, 1));
+        assert_eq!(
+            nullable_inline_layout(LayoutShape { size: 4, align: 3 }),
+            Err(EnumLayoutError::InvalidAlignment)
+        );
     }
 }

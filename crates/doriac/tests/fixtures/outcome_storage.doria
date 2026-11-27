@@ -29,7 +29,7 @@ function parameterStorage(int $iterations): int {
         $sum += replace($value, $index);
         $index++;
     }
-    if (number($value) != -1) { panic("private Copy parameter changed its caller"); }
+    if ($iterations > 0 && number($value) != $iterations - 1) { panic("lent Copy parameter lost its write"); }
     return $sum;
 }
 

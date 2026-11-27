@@ -473,7 +473,8 @@ pub(super) fn validate_transfer_plan(
     } else {
         mir::ByteRegionKind::Readonly
     };
-    if region.ty != mir::Type::ByteRegion(kind) || (reading && !region.writable) {
+    if region.ty != mir::Type::Region(mir::RegionType::bytes(kind)) || (reading && !region.writable)
+    {
         return Err(malformed_mir(
             "transfer configuration has an incompatible byte-region loan",
         ));
@@ -644,11 +645,11 @@ pub(super) fn validate_requirement(
     }
     let region = &signature.parameters[expected_parameters - 1];
     if region.ty
-        != mir::Type::ByteRegion(if reading {
+        != mir::Type::Region(mir::RegionType::bytes(if reading {
             mir::ByteRegionKind::Writable
         } else {
             mir::ByteRegionKind::Readonly
-        })
+        }))
         || region.mode
             != if reading {
                 mir::FunctionParameterMode::Writable

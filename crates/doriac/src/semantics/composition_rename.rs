@@ -476,7 +476,17 @@ fn visit_program(program: &Program, traits_only: bool, visitor: &mut dyn FnMut(&
                     visit_function(requirement, visitor);
                 }
             }
-            Item::Trait(_) => {}
+            Item::Trait(_) | Item::ExternBlock(_) => {}
+            Item::ForeignAggregate(aggregate) => {
+                for default in aggregate
+                    .fields
+                    .iter()
+                    .flatten()
+                    .filter_map(|field| field.default.as_ref())
+                {
+                    ast::visit::expr(default, visitor);
+                }
+            }
         }
     }
 }

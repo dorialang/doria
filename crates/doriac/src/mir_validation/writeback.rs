@@ -555,7 +555,7 @@ pub(super) fn complete_value(
     }
     if matches!(
         expression,
-        mir::Rvalue::ByteRegion(mir::ByteRegionExpression::Region { .. })
+        mir::Rvalue::Region(mir::RegionExpression::Region { .. })
     ) {
         // Formation preserves the byte-storage owners, but produces a new
         // inline descriptor. Its replacement domain and home are the region,
@@ -668,14 +668,13 @@ fn forwarded(value: &mir::Rvalue) -> bool {
                     | NullablePayloadEnumExpression::Call { .. }
                     | NullablePayloadEnumExpression::Coalesce { .. }
             )
-            | Rvalue::ByteRegion(
-                ByteRegionExpression::Call { .. }
-                    | ByteRegionExpression::AssumePresent { .. }
-                    | ByteRegionExpression::Coalesce { .. }
+            | Rvalue::Region(
+                RegionExpression::Call { .. }
+                    | RegionExpression::AssumePresent { .. }
+                    | RegionExpression::Coalesce { .. }
             )
-            | Rvalue::NullableByteRegion(
-                NullableByteRegionExpression::Present(_)
-                    | NullableByteRegionExpression::Call { .. }
+            | Rvalue::NullableRegion(
+                NullableRegionExpression::Present(_) | NullableRegionExpression::Call { .. }
             )
     )
 }

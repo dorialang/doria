@@ -347,7 +347,7 @@ fn skipped_short_circuit_calls_preserve_narrowing_facts() {
         "stage22-skipped-short-circuit-call.doria",
         r#"
 function clear(writable ?int $value): bool { $value = null; return true; }
-function read(?int $value): int
+function read(writable ?int $value): int
 {
     if ($value == null) { return 0; }
     false && clear($value);
@@ -1965,7 +1965,7 @@ class ReadonlyReceiver
 
 #[test]
 fn shared_validation_invalidates_nullable_class_presence_after_writable_calls() {
-    let mut program = doriac::lower_source_to_mir(
+    let mut program = doriac::lower_library_source_to_mir(
         "stage22-writable-nullable-class-presence.doria",
         r#"
 class Box { int $value = 1; }
@@ -1978,7 +1978,6 @@ function read(writable ?Box $box): void
     consume($box);
 }
 
-function main(): void {}
 "#,
     )
     .expect("the readonly-call control fixture should lower");

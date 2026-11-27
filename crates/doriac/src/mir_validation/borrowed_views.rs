@@ -194,8 +194,7 @@ impl State {
                     {
                         HashSet::from([Source::input(
                             local.id,
-                            byte_regions::kind(local.ty)
-                                .is_some_and(mir::ByteRegionKind::is_writable),
+                            byte_regions::kind(local.ty).is_some_and(mir::RegionType::is_writable),
                             if byte_regions::kind(local.ty).is_some() {
                                 mir::RetainedLifetime::LastUse
                             } else {
@@ -963,7 +962,7 @@ impl State {
             | mir::Statement::AssignCollectionIndex { .. }
             | mir::Statement::CollectionClear { .. }
             | mir::Statement::AssignProperty { .. }
-            | mir::Statement::AssignByteRegionIndex { .. }
+            | mir::Statement::AssignRegionIndex { .. }
             | mir::Statement::CopyWithinByteRegion { .. } => true,
             _ => false,
         }
@@ -989,7 +988,7 @@ impl State {
                 }
                 Ok(())
             }
-            mir::Statement::AssignByteRegionIndex { region, .. }
+            mir::Statement::AssignRegionIndex { region, .. }
             | mir::Statement::CopyWithinByteRegion { region, .. } => self.conflicts(*region),
             _ => Ok(()),
         }
@@ -1041,6 +1040,19 @@ impl State {
                     mir::CoreCollectionOperation::KeyAt { target, .. }
                     | mir::CoreCollectionOperation::ValueAt { target, .. },
             } => Some((*target, self.roots[collection.0].clone())),
+            // A fixed-length array field's region views the aggregate that
+            // holds the field (Decision 0148 section 6): a local, or the
+            // object whose property holds it. A static's storage belongs to
+            // no local, as for every other static place.
+            mir::Statement::ForeignField {
+                aggregate,
+                access: mir::ForeignFieldAccess::Region { target, .. },
+                ..
+            } => Some((
+                *target,
+                aggregate_owner(*aggregate)
+                    .map_or_else(HashSet::new, |owner| self.roots[owner.0].clone()),
+            )),
             mir::Statement::AssignLocal { target, value }
                 if !local_in(function, *target)?.owned =>
             {
@@ -1087,6 +1099,11 @@ impl State {
         let assigned_view_parents = match statement {
             mir::Statement::AssignLocal { value, .. } => Self::value_parents(program, value)?,
             mir::Statement::CoreCollection { collection, .. } => HashSet::from([*collection]),
+            mir::Statement::ForeignField {
+                aggregate,
+                access: mir::ForeignFieldAccess::Region { .. },
+                ..
+            } => aggregate_owner(*aggregate).into_iter().collect(),
             _ => HashSet::new(),
         };
         let assigned_storage = match statement {
@@ -2201,7 +2218,7 @@ pub(super) fn validate(
             returned_selectors.extend(state.returned_storage_selectors(program, value)?);
             returned_storage.push(state.returned_storage(program, function, value)?);
             let sources = retained::value_sources(program, value, &state.roots, &state.loans)?;
-            if matches!(value.ty(), mir::Type::ByteRegion(_)) && sources.is_empty() {
+            if matches!(value.ty(), mir::Type::Region(_)) && sources.is_empty() {
                 return Err(malformed_mir(
                     "byte region return has no retained source provenance",
                 ));
@@ -2253,6 +2270,26 @@ pub(super) fn validate(
     stored_owners::validate_returned_storage(function, returned_storage)?;
     stored_owners::validate_removals(function, normal_removals, exceptional_removals)?;
     Ok(())
+}
+
+/// The local that owns the storage of a foreign struct or union place: the
+/// local itself, the class value whose property holds the aggregate, the
+/// collection whose element it is, or the region viewing the element. A
+/// static property's storage belongs to no local.
+fn aggregate_owner(place: mir::InlinePlace) -> Option<mir::LocalId> {
+    match place {
+        mir::InlinePlace::Local(local) | mir::InlinePlace::NullableLocalAssumeNonNull(local) => {
+            Some(local)
+        }
+        mir::InlinePlace::Property { object, .. }
+        | mir::InlinePlace::NullablePropertyAssumeNonNull { object, .. } => Some(object),
+        mir::InlinePlace::CollectionElement { collection, .. }
+        | mir::InlinePlace::NullableCollectionElementAssumeNonNull { collection, .. } => {
+            Some(collection)
+        }
+        mir::InlinePlace::RegionElement { region, .. } => Some(region),
+        mir::InlinePlace::Static(_) | mir::InlinePlace::NullableStaticAssumeNonNull(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -2320,7 +2357,7 @@ enum Split { case Both(function(): int $first, function(): int $second); }
 function split(take Split $pair, function(): int $a, function(): int $b): int {
     return match (take $pair) { Split::Both($first, $second) => $first() + $second(), };
 }
-function main(): void {}
+function main(): void { let $sum = split(Split::Both(fn() => 1, fn() => 2), fn() => 3, fn() => 4); }
 "#,
         )
         .unwrap();
@@ -2414,7 +2451,7 @@ function main(): void {}
 enum Retry { case Complete; case Pending(function(): int $resume); }
 function classify(Retry $retry): void {}
 function classifyNullable(?Retry $retry): void { if ($retry == null) { return; } }
-function main(): void {}
+function main(): void { classify(Retry::Complete); classifyNullable(null); }
 "#,
         )
         .unwrap();
@@ -2494,7 +2531,7 @@ function main(): void {}
     fn graph(edges: &[Vec<usize>]) -> mir::Function {
         let program = crate::lower_source_to_mir(
             "block-worklist.doria",
-            "function graph(bool $condition): void {} function main(): void {}",
+            "function graph(bool $condition): void {} function main(): void { graph(false); }",
         )
         .unwrap();
         let mut function = program
@@ -2622,7 +2659,7 @@ function main(): void {}
             r#"class Failure implements Error { function __construct(string $message) {} }
 function prepare(): void throws Failure {}
 function graph(): void { try { prepare(); } catch (Failure) {} }
-function main(): void {}"#,
+function main(): void { graph(); }"#,
         )
         .unwrap();
         let function = program

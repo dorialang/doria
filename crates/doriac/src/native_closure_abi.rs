@@ -69,10 +69,10 @@ pub fn borrow_home_type_key(ty: mir::Type) -> u64 {
         }
         mir::Type::String => 8,
         mir::Type::NullableString => 9,
-        mir::Type::ByteRegion(kind) => {
+        mir::Type::Region(kind) => {
             (u64::from(kind.is_writable()) << BORROW_HOME_NOMINAL_ID_SHIFT) | 11
         }
-        mir::Type::NullableByteRegion(kind) => {
+        mir::Type::NullableRegion(kind) => {
             (u64::from(kind.is_writable()) << BORROW_HOME_NOMINAL_ID_SHIFT) | 12
         }
         _ => 0,
@@ -185,9 +185,9 @@ pub fn direct_borrow_home_place(value: &mir::Rvalue) -> Option<BorrowHomePlace> 
             stream,
             borrowed_from,
         }) => Some((*borrowed_from, Q::StandardReadinessSource(*class, *stream))),
-        mir::Rvalue::ByteRegion(mir::ByteRegionExpression::AssumePresent { value, .. }) => {
+        mir::Rvalue::Region(mir::RegionExpression::AssumePresent { value, .. }) => {
             match value.as_ref() {
-                mir::NullableByteRegionExpression::Local { local, .. } => Some((*local, Q::Direct)),
+                mir::NullableRegionExpression::Local { local, .. } => Some((*local, Q::Direct)),
                 _ => None,
             }
         }
@@ -338,8 +338,8 @@ pub fn direct_borrow_home_place(value: &mir::Rvalue) -> Option<BorrowHomePlace> 
         mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Present(value)) => {
             direct_borrow_home_place(&mir::Rvalue::Function(value.clone()))
         }
-        mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Present(value)) => {
-            direct_borrow_home_place(&mir::Rvalue::ByteRegion(value.clone()))
+        mir::Rvalue::NullableRegion(mir::NullableRegionExpression::Present(value)) => {
+            direct_borrow_home_place(&mir::Rvalue::Region(value.clone()))
         }
         mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Value(value)) => {
             direct_borrow_home_place(&mir::Rvalue::PayloadEnum(value.clone()))
@@ -465,11 +465,8 @@ pub fn borrow_home_projection_types(program: &mir::Program, target: mir::Type) -
         mir::Type::String | mir::Type::NullableString => {
             return vec![mir::Type::String, mir::Type::NullableString];
         }
-        mir::Type::ByteRegion(kind) | mir::Type::NullableByteRegion(kind) => {
-            return vec![
-                mir::Type::ByteRegion(kind),
-                mir::Type::NullableByteRegion(kind),
-            ];
+        mir::Type::Region(kind) | mir::Type::NullableRegion(kind) => {
+            return vec![mir::Type::Region(kind), mir::Type::NullableRegion(kind)];
         }
         _ => {}
     }
@@ -534,14 +531,13 @@ pub struct NativeCallableSignaturePlan {
     pub checked: bool,
 }
 
-pub fn parameter_uses_borrow_home(
-    ty: mir::Type,
-    mode: mir::FunctionParameterMode,
-    writable_copy: bool,
-) -> bool {
-    mode != mir::FunctionParameterMode::Take
-        && (ty.has_move_ownership()
-            || writable_copy && mode == mir::FunctionParameterMode::Writable)
+/// Whether a parameter receives the caller's place as a borrow home: every
+/// borrowed move-owned value, and every writable parameter of any type in
+/// functions, methods and closures alike (Decision 0121; Andrew's ruling of
+/// 2026-11-21, "Writable always borrows (Recommended)").
+pub fn parameter_uses_borrow_home(ty: mir::Type, mode: mir::FunctionParameterMode) -> bool {
+    mode == mir::FunctionParameterMode::Writable
+        || mode != mir::FunctionParameterMode::Take && ty.has_move_ownership()
 }
 
 impl NativeCallableSignaturePlan {
@@ -566,7 +562,6 @@ impl NativeCallableSignaturePlan {
             function.return_borrow.map(|borrow| {
                 return_borrow_argument_index(borrow, function.receiver_mode.is_some())
             }),
-            function.closure.is_some(),
             |index| {
                 let local = function.params[index + usize::from(function.closure.is_some())];
                 function.retains_writable_input(local)
@@ -586,7 +581,6 @@ impl NativeCallableSignaturePlan {
             function
                 .return_borrow
                 .map(|borrow| return_borrow_argument_index(borrow, false)),
-            true,
             |_| false,
         )
     }
@@ -603,7 +597,6 @@ impl NativeCallableSignaturePlan {
             function
                 .return_borrow
                 .map(|borrow| return_borrow_argument_index(borrow, false)),
-            false,
             |_| false,
         )
     }
@@ -612,7 +605,6 @@ impl NativeCallableSignaturePlan {
         mut self,
         parameters: impl Iterator<Item = mir::FunctionParameter>,
         returned_source: Option<usize>,
-        writable_copy: bool,
         retained_place: impl Fn(usize) -> bool,
     ) -> Self {
         // A borrowed input may be retained in caller-owned storage without
@@ -621,9 +613,8 @@ impl NativeCallableSignaturePlan {
         let homes = parameters
             .enumerate()
             .filter_map(|(index, parameter)| {
-                (parameter_uses_borrow_home(parameter.ty, parameter.mode, writable_copy)
-                    || retained_place(index))
-                .then_some(NativeCallableHiddenInput::ParameterBorrowHome(index))
+                (parameter_uses_borrow_home(parameter.ty, parameter.mode) || retained_place(index))
+                    .then_some(NativeCallableHiddenInput::ParameterBorrowHome(index))
             })
             .collect::<Vec<_>>();
         if returned_source.is_some_and(|index| {
@@ -797,7 +788,7 @@ pub const fn direct_value_slots(ty: mir::Type) -> DirectValueSlots {
         mir::Type::NullableScalar(scalar) => {
             DirectValueSlots::integer(1).plus(direct_scalar_slots(scalar))
         }
-        mir::Type::ByteRegion(_)
+        mir::Type::Region(_)
         | mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
@@ -805,7 +796,7 @@ pub const fn direct_value_slots(ty: mir::Type) -> DirectValueSlots {
         | mir::Type::NullableFunction(_)
         | mir::Type::Class(_)
         | mir::Type::NullableClass(_) => DirectValueSlots::integer(2),
-        mir::Type::NullableByteRegion(_) => DirectValueSlots::integer(3),
+        mir::Type::NullableRegion(_) => DirectValueSlots::integer(3),
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
@@ -831,6 +822,8 @@ pub const fn direct_value_slots(ty: mir::Type) -> DirectValueSlots {
         | mir::Type::NullableCollection(_)
         | mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => DirectValueSlots::integer(1),
     }
 }
@@ -858,9 +851,12 @@ pub const fn returns_through_result_slot(return_type: mir::ReturnType, checked: 
     match return_type {
         mir::ReturnType::Void => false,
         mir::ReturnType::Value(_) if checked => true,
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)) => {
-            true
-        }
+        mir::ReturnType::Value(
+            mir::Type::PayloadEnum(_)
+            | mir::Type::NullablePayloadEnum(_)
+            | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_),
+        ) => true,
         mir::ReturnType::Value(ty) => !direct_value_slots(ty).fits(DIRECT_RETURN_SLOTS),
     }
 }
@@ -1028,6 +1024,96 @@ pub fn environment_layout(
     })
 }
 
+/// The layout of a value that lives in memory and travels by its address:
+/// a payload enum, nullable or not, or a foreign struct or union. Both
+/// native backends copy such a value by its bytes, wherever it is stored.
+pub const fn memory_value_layout(ty: mir::Type) -> Option<NativeLayout> {
+    match ty {
+        mir::Type::PayloadEnum(payload) => Some(NativeLayout {
+            size: payload.size,
+            align: payload.align,
+        }),
+        mir::Type::NullablePayloadEnum(payload) => Some(NativeLayout {
+            size: payload.nullable_size,
+            align: payload.align,
+        }),
+        mir::Type::ForeignAggregate(aggregate) => Some(NativeLayout {
+            size: aggregate.size,
+            align: aggregate.align,
+        }),
+        mir::Type::NullableForeignAggregate(aggregate) => Some(NativeLayout {
+            size: aggregate.nullable_size,
+            align: aggregate.align,
+        }),
+        _ => None,
+    }
+}
+
+/// How a nullable scalar `?T` is laid out wherever it is stored: a local's
+/// slot, a property, an element, a closure capture, a static, or memory C
+/// reads and writes. Every native layout, load and store of `?T` follows
+/// this one rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullableScalarForm {
+    /// A presence word, then the payload `payload_offset` bytes in.
+    Tagged { payload_offset: u32 },
+    /// The payload alone, absent as the all-zero payload. A nullable
+    /// pointer (`?Pointer<T>`, `?WritablePointer<T>` or `?extern "C" function(...)`) is
+    /// one word and null is address zero (Decision 0148 section 3), the
+    /// form C reads and writes.
+    ZeroIsNull,
+}
+
+impl NullableScalarForm {
+    /// The byte offset of the payload within the stored `?T`.
+    pub const fn payload_offset(self) -> u32 {
+        match self {
+            Self::Tagged { payload_offset } => payload_offset,
+            Self::ZeroIsNull => 0,
+        }
+    }
+}
+
+/// Whether `?T` takes [`NullableScalarForm::ZeroIsNull`], independently of
+/// the target's pointer width.
+pub const fn nullable_scalar_is_zero_is_null(scalar: mir::ScalarType) -> bool {
+    matches!(
+        scalar,
+        mir::ScalarType::Inline(crate::inline_value::InlineValueType::Pointer)
+    )
+}
+
+/// Where the payload of a `?T` value starts in its storage, for a place
+/// checking narrowed to present that is read or addressed in place: a
+/// nullable foreign aggregate or an FFI-safe nullable scalar. `None` for
+/// every other type.
+pub const fn nullable_payload_offset(ty: mir::Type, pointer_size: u32) -> Option<u32> {
+    match ty {
+        mir::Type::NullableForeignAggregate(aggregate) => Some(aggregate.nullable_payload_offset),
+        mir::Type::NullableScalar(scalar) => {
+            Some(nullable_scalar_form(scalar, pointer_size).payload_offset())
+        }
+        _ => None,
+    }
+}
+
+pub const fn nullable_scalar_form(
+    scalar: mir::ScalarType,
+    pointer_size: u32,
+) -> NullableScalarForm {
+    if nullable_scalar_is_zero_is_null(scalar) {
+        return NullableScalarForm::ZeroIsNull;
+    }
+    let payload = type_layout(mir::Type::Scalar(scalar), pointer_size);
+    NullableScalarForm::Tagged {
+        payload_offset: if payload.align > pointer_size {
+            payload.align
+        } else {
+            pointer_size
+        },
+    }
+}
+
 pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
     if ty.shared_interface().is_some() {
         return NativeLayout {
@@ -1050,28 +1136,23 @@ pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
             size: ty.storage_bytes(),
             align: ty.storage_bytes(),
         },
-        mir::Type::NullableScalar(scalar) => {
-            let payload = type_layout(mir::Type::Scalar(scalar), pointer_size);
-            let align = if payload.align > pointer_size {
-                payload.align
-            } else {
-                pointer_size
-            };
-            NativeLayout {
-                size: align * 2,
-                align,
-            }
-        }
+        mir::Type::NullableScalar(scalar) => match nullable_scalar_form(scalar, pointer_size) {
+            NullableScalarForm::ZeroIsNull => type_layout(mir::Type::Scalar(scalar), pointer_size),
+            NullableScalarForm::Tagged { payload_offset } => NativeLayout {
+                size: payload_offset * 2,
+                align: payload_offset,
+            },
+        },
         mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
         | mir::Type::Function(_)
         | mir::Type::NullableFunction(_)
-        | mir::Type::ByteRegion(_) => NativeLayout {
+        | mir::Type::Region(_) => NativeLayout {
             size: pointer_size * 2,
             align: pointer_size,
         },
-        mir::Type::NullableByteRegion(_) => NativeLayout {
+        mir::Type::NullableRegion(_) => NativeLayout {
             size: pointer_size * 3,
             align: pointer_size,
         },
@@ -1080,6 +1161,14 @@ pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
             align: ty.align,
         },
         mir::Type::NullablePayloadEnum(ty) => NativeLayout {
+            size: ty.nullable_size,
+            align: ty.align,
+        },
+        mir::Type::ForeignAggregate(ty) => NativeLayout {
+            size: ty.size,
+            align: ty.align,
+        },
+        mir::Type::NullableForeignAggregate(ty) => NativeLayout {
             size: ty.nullable_size,
             align: ty.align,
         },
@@ -1129,10 +1218,7 @@ pub fn value_layout(program: &mir::Program, ty: mir::Type, pointer_size: u32) ->
 pub const fn needs_drop(ty: mir::Type) -> bool {
     matches!(ty, mir::Type::String | mir::Type::NullableString)
         || (ty.requires_owned_cleanup()
-            && !matches!(
-                ty,
-                mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
-            ))
+            && !matches!(ty, mir::Type::Region(_) | mir::Type::NullableRegion(_)))
 }
 
 fn align_up(value: u32, align: u32) -> Result<u32, BackendError> {
@@ -1153,7 +1239,7 @@ fn malformed(message: impl Into<String>) -> BackendError {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn parameter_homes_distinguish_copy_values_writable_callbacks_and_move_loans() {
+    fn parameter_homes_distinguish_copy_values_writable_places_and_move_loans() {
         use super::parameter_uses_borrow_home;
         use crate::mir::{FunctionParameterMode as Mode, ScalarType, Type};
         for ty in [
@@ -1161,18 +1247,14 @@ mod tests {
             Type::NullableScalar(ScalarType::Bool),
             Type::String,
         ] {
-            assert!(!parameter_uses_borrow_home(ty, Mode::Readonly, false));
-            assert!(!parameter_uses_borrow_home(ty, Mode::Writable, false));
-            assert!(!parameter_uses_borrow_home(ty, Mode::Readonly, true));
-            assert!(parameter_uses_borrow_home(ty, Mode::Writable, true));
-            assert!(!parameter_uses_borrow_home(ty, Mode::Take, true));
+            assert!(!parameter_uses_borrow_home(ty, Mode::Readonly));
+            assert!(parameter_uses_borrow_home(ty, Mode::Writable));
+            assert!(!parameter_uses_borrow_home(ty, Mode::Take));
         }
         for ty in [Type::Mixed, Type::NullableMixed] {
-            for callback in [false, true] {
-                assert!(parameter_uses_borrow_home(ty, Mode::Readonly, callback));
-                assert!(parameter_uses_borrow_home(ty, Mode::Writable, callback));
-                assert!(!parameter_uses_borrow_home(ty, Mode::Take, callback));
-            }
+            assert!(parameter_uses_borrow_home(ty, Mode::Readonly));
+            assert!(parameter_uses_borrow_home(ty, Mode::Writable));
+            assert!(!parameter_uses_borrow_home(ty, Mode::Take));
         }
     }
 
@@ -1262,18 +1344,18 @@ mod tests {
             key(mir::Type::NullablePayloadEnum(payload_enum)),
             key(mir::Type::String),
             key(mir::Type::NullableString),
-            key(mir::Type::ByteRegion(
+            key(mir::Type::Region(mir::RegionType::bytes(
                 crate::types::ByteRegionKind::Readonly,
-            )),
-            key(mir::Type::NullableByteRegion(
+            ))),
+            key(mir::Type::NullableRegion(mir::RegionType::bytes(
                 crate::types::ByteRegionKind::Readonly,
-            )),
-            key(mir::Type::ByteRegion(
+            ))),
+            key(mir::Type::Region(mir::RegionType::bytes(
                 crate::types::ByteRegionKind::Writable,
-            )),
-            key(mir::Type::NullableByteRegion(
+            ))),
+            key(mir::Type::NullableRegion(mir::RegionType::bytes(
                 crate::types::ByteRegionKind::Writable,
-            )),
+            ))),
             key(mir::Type::Scalar(mir::ScalarType::Bool)),
             key(mir::Type::NullableScalar(mir::ScalarType::Bool)),
             key(mir::Type::Scalar(mir::ScalarType::Integer(
@@ -1375,6 +1457,7 @@ mod tests {
                 writable: false,
                 owned: false,
                 synthetic: false,
+                binding: None,
             };
             assert!(super::local_needs_borrow_home(&function, &local), "{ty}");
             local.owned = true;
@@ -1388,6 +1471,7 @@ mod tests {
             writable: false,
             owned: false,
             synthetic: false,
+            binding: None,
         };
         assert!(!super::local_needs_borrow_home(&function, &parameter));
 
@@ -1573,6 +1657,7 @@ function main(): void { let $input = StandardStreams::input; observe($input); }
                 writable: false,
                 owned: false,
                 synthetic: false,
+                binding: None,
             }];
             assert!(super::has_nominal_borrow_home(ty), "{ty}");
             assert!(
@@ -1977,7 +2062,10 @@ function main(): void
             mir::Type::Scalar(deadline),
             mir::Type::NullableScalar(int),
             mir::Type::NullableScalar(float),
-            mir::Type::ByteRegion(ByteRegionKind::Readonly),
+            mir::Type::Region(mir::RegionType {
+                access: ByteRegionKind::Readonly,
+                array: None,
+            }),
             mir::Type::NullableString,
             mir::Type::Interface(mir::InterfaceTypeId(0)),
             mir::Type::NullableFunction(mir::FunctionTypeId(0)),
@@ -1989,8 +2077,14 @@ function main(): void
         }
         // Three slots exceed x86-64's two integer return registers.
         for ty in [
-            mir::Type::NullableByteRegion(ByteRegionKind::Readonly),
-            mir::Type::NullableByteRegion(ByteRegionKind::Writable),
+            mir::Type::NullableRegion(mir::RegionType {
+                access: ByteRegionKind::Readonly,
+                array: None,
+            }),
+            mir::Type::NullableRegion(mir::RegionType {
+                access: ByteRegionKind::Writable,
+                array: None,
+            }),
             mir::Type::NullableScalar(deadline),
         ] {
             assert_eq!(direct_value_slots(ty).total, 3, "{ty:?}");

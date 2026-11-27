@@ -622,7 +622,8 @@ function prove(writable int $n): int
 
 function main(): int
 {
-    return prove(1);
+    let writable $value = 1;
+    return prove($value);
 }
 "#,
             42,

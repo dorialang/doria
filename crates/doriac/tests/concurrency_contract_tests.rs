@@ -195,7 +195,11 @@ use Doria\Std\Concurrency\CancellationToken;
 function equal(CancellationToken $first, CancellationToken $second): bool { return $first == $second; }
 function different(CancellationToken $first, CancellationToken $second): bool { return $first != $second; }
 function optional(?CancellationToken $first, ?CancellationToken $second): bool { return $first == $second; }
-function main(): void {}
+function main(): void {
+    let $reach = function(CancellationToken $first, CancellationToken $second): bool {
+        return equal($first, $second) && different($first, $second) && optional($first, $second);
+    };
+}
 "#,
     )
     .unwrap();

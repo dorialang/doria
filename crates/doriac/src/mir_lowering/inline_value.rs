@@ -237,6 +237,9 @@ pub(super) fn lower_expression_with_ownership(
         });
     }
     let operand = match expr {
+        hir::Expr::Grouped { span, .. } if context.unsafe_region_fact(*span).is_some() => {
+            return Err(unsafe_region::bypassed(*span));
+        }
         hir::Expr::Grouped { expr, .. } => {
             return lower_expression_with_ownership(expr, ty, owned, context)
         }
@@ -272,10 +275,13 @@ pub(super) fn lower_expression_with_ownership(
                         .exact_mixed_local(expr)
                         .is_some_and(|(_, actual)| actual == expected) =>
                 {
-                    mir::Operand::MixedPayload {
-                        mixed: local,
-                        tag: mir::MixedTag::Inline(ty),
-                    }
+                    let Some(tag) = context.exact_mixed_tag(expr) else {
+                        return Err(vec![unsupported(
+                            expr.span(),
+                            "a narrowed `mixed` inline value has no exact tag",
+                        )]);
+                    };
+                    mir::Operand::MixedPayload { mixed: local, tag }
                 }
                 _ => {
                     return Err(vec![unsupported(
@@ -303,17 +309,7 @@ pub(super) fn lower_expression_with_ownership(
         }
         hir::Expr::Index {
             collection, index, ..
-        } => {
-            let (collection, index) =
-                lower_collection_index_operand(collection, index, expected, context)?;
-            mir::Operand::CollectionIndex {
-                index_span: expr.span(),
-                collection,
-                index: Box::new(index),
-                positional: false,
-                remove: false,
-            }
-        }
+        } => lower_scalar_index_operand(expr, collection, index, scalar, context)?,
         hir::Expr::StaticMember {
             class_name,
             member,

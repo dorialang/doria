@@ -133,6 +133,9 @@ impl<'a> PropertyHookFacts<'a> {
                 consuming_span: None,
                 is_static: property.is_static,
                 static_span: None,
+                unsafe_span: None,
+                linkage: crate::ast::FunctionLinkage::Doria,
+                documentation: None,
                 name: accessor_name(&property.name, hook.kind),
                 name_span: hook.keyword_span,
                 type_params: Vec::new(),
@@ -242,7 +245,7 @@ pub fn declaration_facts(
 }
 
 fn is_direct_this(mut expression: &Expr) -> bool {
-    while let Expr::Grouped { expr, .. } = expression {
+    while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expression {
         expression = expr;
     }
     matches!(expression, Expr::This { .. })

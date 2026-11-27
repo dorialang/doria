@@ -1,0 +1,20 @@
+# Decision 0148 acceptance 1: a package that binds zlib. `#[Library("zlib")]`
+# in src/main.doria names the logical library; this table maps it per
+# platform (section 19). On Windows the package carries zlib's import
+# library and DLL under native/windows, for example copied from vcpkg's
+# `zlib:x64-windows`.
+manifest-version = 2
+
+[package]
+name = "zlib-binding"
+version = "0.1.0"
+edition = "2026"
+publishable = false
+kind = "binary"
+entry = "src/main.doria"
+
+[native-libraries.zlib]
+link = "dynamic"
+linux = { pkg-config = "zlib" }
+macos = { system = "z" }
+windows = { library = "zlib", search-paths = ["native/windows/lib"], runtime-files = ["native/windows/bin/zlib1.dll"] }

@@ -295,6 +295,7 @@ impl Builder<'_> {
         let incoming = if matches!(
             statement,
             Stmt::Block(_)
+                | Stmt::Unsafe(_)
                 | Stmt::If(_)
                 | Stmt::While(_)
                 | Stmt::DoWhile(_)
@@ -312,7 +313,9 @@ impl Builder<'_> {
             incoming
         };
         match statement {
-            Stmt::Block(block) => self.build_statements(&block.statements, incoming),
+            Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                self.build_statements(&block.statements, incoming)
+            }
             Stmt::Return { span, .. } => {
                 if let Some(finalizer_depth) = self
                     .value_regions
@@ -1270,7 +1273,7 @@ fn constant_condition(expr: &Expr) -> ConstantCondition {
     match expr {
         Expr::Bool { value: true, .. } => ConstantCondition::AlwaysTrue,
         Expr::Bool { value: false, .. } => ConstantCondition::AlwaysFalse,
-        Expr::Grouped { expr, .. } => constant_condition(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => constant_condition(expr),
         _ => ConstantCondition::Unknown,
     }
 }
@@ -1342,6 +1345,7 @@ fn contains_value_region(expression: &Expr) -> bool {
 fn expression_children(expression: &Expr) -> Vec<&Expr> {
     match expression {
         Expr::Grouped { expr, .. }
+        | Expr::Unsafe { expr, .. }
         | Expr::Unary { expr, .. }
         | Expr::IsType { expr, .. }
         | Expr::PropertyAccess { object: expr, .. } => vec![expr],
@@ -1400,6 +1404,7 @@ fn expression_children(expression: &Expr) -> Vec<&Expr> {
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
         Stmt::Block(block) => block.span,
+        Stmt::Unsafe(statement) => statement.span,
         Stmt::VarDecl(decl) => decl.span,
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. } | Stmt::Return { span, .. } | Stmt::Expr { span, .. } => *span,

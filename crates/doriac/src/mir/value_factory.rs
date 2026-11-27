@@ -13,22 +13,20 @@ pub(crate) fn direct_call_result(
 ) -> mir::Rvalue {
     use mir::*;
     match ty {
-        Type::ByteRegion(kind) => Rvalue::ByteRegion(ByteRegionExpression::Call {
+        Type::Region(kind) => Rvalue::Region(RegionExpression::Call {
             span,
             kind,
             function,
             args,
             return_borrow,
         }),
-        Type::NullableByteRegion(kind) => {
-            Rvalue::NullableByteRegion(NullableByteRegionExpression::Call {
-                span,
-                kind,
-                function,
-                args,
-                return_borrow,
-            })
-        }
+        Type::NullableRegion(kind) => Rvalue::NullableRegion(NullableRegionExpression::Call {
+            span,
+            kind,
+            function,
+            args,
+            return_borrow,
+        }),
         Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source return types")
         }
@@ -172,6 +170,23 @@ pub(crate) fn direct_call_result(
             args,
             return_borrow,
         }),
+        // A foreign struct or union is a Copy value without loans.
+        Type::ForeignAggregate(ty) => {
+            Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::Call {
+                ty,
+                function,
+                args,
+                span,
+            })
+        }
+        Type::NullableForeignAggregate(ty) => {
+            Rvalue::NullableForeignAggregate(mir::NullableForeignAggregateExpression::Call {
+                ty,
+                function,
+                args,
+                span,
+            })
+        }
         Type::NullablePayloadEnum(ty) => {
             Rvalue::NullablePayloadEnum(NullablePayloadEnumExpression::Call {
                 span,
@@ -313,13 +328,13 @@ pub(crate) fn pending_owned_rvalue(
 
 pub(crate) fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rvalue {
     match ty {
-        mir::Type::ByteRegion(kind) => mir::Rvalue::ByteRegion(mir::ByteRegionExpression::Local {
+        mir::Type::Region(kind) => mir::Rvalue::Region(mir::RegionExpression::Local {
             kind,
             local,
             transfer: transfer && kind.is_writable(),
         }),
-        mir::Type::NullableByteRegion(kind) => {
-            mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Local {
+        mir::Type::NullableRegion(kind) => {
+            mir::Rvalue::NullableRegion(mir::NullableRegionExpression::Local {
                 kind,
                 local,
                 transfer: transfer && kind.is_writable(),
@@ -517,6 +532,15 @@ pub(crate) fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -
                 transfer,
             })
         }
+        mir::Type::ForeignAggregate(ty) => {
+            mir::Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::Local { ty, local })
+        }
+        mir::Type::NullableForeignAggregate(ty) => {
+            mir::Rvalue::NullableForeignAggregate(mir::NullableForeignAggregateExpression::Local {
+                ty,
+                local,
+            })
+        }
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are compiler-private and cannot be source rvalues")
         }
@@ -526,8 +550,8 @@ pub(crate) fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -
 pub(crate) fn nullable_present_rvalue(value: mir::Rvalue) -> mir::Rvalue {
     use mir::Rvalue;
     match value {
-        Rvalue::ByteRegion(value) => {
-            Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Present(value))
+        Rvalue::Region(value) => {
+            Rvalue::NullableRegion(mir::NullableRegionExpression::Present(value))
         }
         Rvalue::Value(value) => Rvalue::NullableScalar(mir::NullableScalarExpression::Value(value)),
         Rvalue::String(value) => {
@@ -548,6 +572,9 @@ pub(crate) fn nullable_present_rvalue(value: mir::Rvalue) -> mir::Rvalue {
         Rvalue::Function(value) => {
             Rvalue::NullableFunction(mir::NullableFunctionExpression::Present(value))
         }
+        Rvalue::ForeignAggregate(value) => Rvalue::NullableForeignAggregate(
+            mir::NullableForeignAggregateExpression::Present(value),
+        ),
         Rvalue::SharedReference(value) => {
             Rvalue::NullableSharedReference(mir::NullableSharedReferenceExpression::Shared(value))
         }

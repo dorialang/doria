@@ -222,6 +222,7 @@ fn primitive_hash(
         value: Box::new(value),
         span,
         value_span: span,
+        boundary: None,
     };
     match local_rvalue(receiver.0, receiver.1, false) {
         mir::Rvalue::String(value) => Ok(scalar(mir::IntegerExpression::use_operand(
@@ -498,6 +499,7 @@ pub(super) fn membership(
         local,
         mir::Type::NullableScalar(ty),
         mir::Type::Scalar(ty),
+        None,
         false,
         span,
         context,
@@ -798,7 +800,7 @@ pub(super) fn duplicate(
         });
         context.terminate_current(mir::Terminator::Jump(exit));
         context.current_block = Some(call);
-        let receiver = narrowed_match_local_rvalue(source, ty, inner, false, span, context)?;
+        let receiver = narrowed_match_local_rvalue(source, ty, inner, None, false, span, context)?;
         let value = invoke(
             CoreValueOperation::Clone,
             receiver,
@@ -938,7 +940,7 @@ fn invoke_equality(
     let present = |(local, ty), context: &LoweringContext<'_>| {
         let (inner, nullable) = non_null_match_type(ty);
         if nullable {
-            narrowed_match_local_rvalue(local, ty, inner, false, span, context)
+            narrowed_match_local_rvalue(local, ty, inner, None, false, span, context)
         } else {
             Ok(local_rvalue(local, ty, false))
         }

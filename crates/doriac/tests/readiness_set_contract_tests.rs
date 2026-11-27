@@ -232,10 +232,9 @@ function view(ReadinessSet $set, RegistrationKey<ReadableFile> $key): ReadableFi
 function writableView(writable ReadinessSet $set, RegistrationKey<ReadableFile> $key): ReadableFile throws IoError {
     return $set->getWritableStream($key);
 }
-function main(): void {}
 "#
     );
-    let valid = doriac::lower_source_to_mir("readiness-loan-mir.doria", &source).unwrap();
+    let valid = doriac::lower_library_source_to_mir("readiness-loan-mir.doria", &source).unwrap();
     doriac::mir_validation::validate_program(&valid).unwrap();
     for fault in 0..6 {
         let mut invalid = valid.clone();
@@ -741,7 +740,7 @@ fn php_membership_uses_checked_native_transport_for_concrete_and_generic_calls()
 fn php_registration_getters_use_the_same_borrow_transport_as_property_access() {
     for stream in ["ReadableFile", "ReadyOnly", "ReadinessStream"] {
         let source = format!(
-            "{IMPORTS}\n{ADAPTER}\nfunction register(writable ReadinessSet $set, take {stream} $stream): void throws IoError {{ $set->register($stream); }} function main(): void {{}}"
+            "{IMPORTS}\n{ADAPTER}\nfunction register(writable ReadinessSet $set, take {stream} $stream): void throws IoError {{ $set->register($stream); }} function main(): void {{ let $reach = function(writable ReadinessSet $set, take {stream} $stream): void {{ try {{ register($set, $stream); }} catch (IoError) {{}} }}; }}"
         );
         let artifact =
             doriac::compile_source("registration-getter.doria", &source, BackendTarget::Php)
@@ -923,10 +922,10 @@ function retain(writable ReadinessSet $set, take BorrowingReady $stream,
 function fresh(RegistrationKey<BorrowingReady> $seed): RegistrationKey<BorrowingReady> throws IoError {{
     return $seed;
 }}
-function main(): void {{}}
 "#
     );
-    let mut program = doriac::lower_source_to_mir("stored-owner-mir.doria", source).unwrap();
+    let mut program =
+        doriac::lower_library_source_to_mir("stored-owner-mir.doria", source).unwrap();
     let function = program
         .functions
         .iter_mut()
@@ -944,6 +943,7 @@ function main(): void {{}}
         writable: false,
         owned: false,
         synthetic: true,
+        binding: None,
     });
     let error = mir::LocalId(function.locals.len());
     function.locals.push(mir::Local {
@@ -953,6 +953,7 @@ function main(): void {{}}
         writable: false,
         owned: true,
         synthetic: true,
+        binding: None,
     });
     let identity = mir::RetainedStorageIdentity {
         origin: function.source_span,
@@ -1130,6 +1131,7 @@ fn mir_helpers_preserve_storage_effects_across_return_types_and_expression_posit
                         owned: false,
                         writable: false,
                         synthetic: true,
+                        binding: None,
                     });
                     statements.push(mir::Statement::AssignLocal {
                         target,
@@ -1331,6 +1333,7 @@ fn mir_conditional_removal_requires_the_call_to_execute_on_every_path() {
             owned: false,
             writable: false,
             synthetic: false,
+            binding: None,
         });
         relay.params.push(enabled);
         relay
@@ -1481,6 +1484,7 @@ fn mir_conditional_removal_requires_the_call_to_execute_on_every_path() {
                     owned: false,
                     writable: false,
                     synthetic: false,
+                    binding: None,
                 });
                 relay.params.push(receiver);
                 relay
@@ -1796,10 +1800,9 @@ class KeyBox {{ function __construct(?RegistrationKey<ReadableFile> $key) {{}} }
 function fromStorage(KeyBox $box, RegistrationKey<ReadableFile> $fallback): RegistrationKey<ReadableFile> {{
     return $box->key ?? $fallback;
 }}
-function main(): void {{}}
 "#
     );
-    let program = doriac::lower_source_to_mir("key-forwarding.doria", source).unwrap();
+    let program = doriac::lower_library_source_to_mir("key-forwarding.doria", source).unwrap();
     doriac::mir_validation::validate_program(&program).unwrap();
     for name in ["select", "relay", "checked"] {
         let function = program
@@ -1952,10 +1955,9 @@ class SecondPicker implements KeyPicker {{
 function selectVirtual(RootPicker $picker, RegistrationKey<ReadableFile> $first, RegistrationKey<ReadableFile> $second): RegistrationKey<ReadableFile> {{ return $picker->select($first, $second); }}
 function selectErased(KeyPicker $picker, RegistrationKey<ReadableFile> $first, RegistrationKey<ReadableFile> $second): RegistrationKey<ReadableFile> {{ return $picker->select($first, $second); }}
 function selectCheckedErased(KeyPicker $picker, RegistrationKey<ReadableFile> $first, RegistrationKey<ReadableFile> $second): RegistrationKey<ReadableFile> throws IoError {{ return $picker->selectChecked($first, $second); }}
-function main(): void {{}}
 "#
     );
-    let program = doriac::lower_source_to_mir("dispatched-keys.doria", source).unwrap();
+    let program = doriac::lower_library_source_to_mir("dispatched-keys.doria", source).unwrap();
     doriac::mir_validation::validate_program(&program).unwrap();
     for name in ["selectVirtual", "selectErased", "selectCheckedErased"] {
         let function = program
@@ -2015,6 +2017,7 @@ fn mir_registration_then_removal_preserves_new_and_incoming_sources() {
         writable: false,
         owned: true,
         synthetic: true,
+        binding: None,
     });
     function.return_type = mir::ReturnType::Value(stream_type);
     function.blocks[1].terminator = mir::Terminator::CheckedIo {
@@ -2323,7 +2326,6 @@ function exercise(): void throws IoError {{
     }}
     $source->add(2);
 }}
-function main(): void {{}}
 "#
         );
         let analysis = analyze(&source);
@@ -2341,9 +2343,10 @@ function main(): void {{}}
         let valid = source.replacen("        $source->add(2);", "", 1);
         assert_valid(&analyze(&valid));
         let helper = format!(
-            "{IMPORTS}\nfunction inspect(ReadinessSet $set): void {{}}\nfunction keep(take ReadinessSet $input): function(): void {{ return {callback}; }}\nfunction main(): void {{}}"
+            "{IMPORTS}\nfunction inspect(ReadinessSet $set): void {{}}\nfunction keep(take ReadinessSet $input): function(): void {{ return {callback}; }}\n"
         );
-        let program = doriac::lower_source_to_mir("captured-storage.doria", &helper).unwrap();
+        let program =
+            doriac::lower_library_source_to_mir("captured-storage.doria", &helper).unwrap();
         let keep = program.functions.iter().find(|f| f.name == "keep").unwrap();
         assert!(matches!(
             keep.return_borrow,
@@ -2439,8 +2442,11 @@ function main(): void {{}}
 
 #[test]
 fn mir_proves_returned_storage_from_helper_bodies() {
-    let source = format!("{IMPORTS}\nfunction forward(take ReadinessSet $set): ReadinessSet {{ return $set; }}\nfunction main(): void {{}}");
-    let mut program = doriac::lower_source_to_mir("returned-storage.doria", &source).unwrap();
+    let source = format!(
+        "{IMPORTS}\nfunction forward(take ReadinessSet $set): ReadinessSet {{ return $set; }}\n"
+    );
+    let mut program =
+        doriac::lower_library_source_to_mir("returned-storage.doria", &source).unwrap();
     doriac::mir_validation::validate_program(&program).unwrap();
     let function = program
         .functions
@@ -2699,7 +2705,6 @@ function exercise(): void throws IoError {{
     }}
     $source->add(3);
 }}
-function main(): void {{}}
 "#
             );
             let analysis = analyze(&source);
@@ -2721,9 +2726,9 @@ function main(): void {{}}
             )));
         }
         let source = format!(
-            "{IMPORTS}{owner}\nfunction forward(take {ty} $sets): {ty} {{ return $sets; }}\nfunction main(): void {{}}"
+            "{IMPORTS}{owner}\nfunction forward(take {ty} $sets): {ty} {{ return $sets; }}\n"
         );
-        let mut program = doriac::lower_source_to_mir("collection-storage.doria", &source)
+        let mut program = doriac::lower_library_source_to_mir("collection-storage.doria", &source)
             .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
         doriac::mir_validation::validate_program(&program).unwrap();
         let forward = program
@@ -2752,11 +2757,11 @@ fn borrowed_collection_elements_remain_tied_to_the_container_lifetime() {
         ("List<List<ReadinessSet>>", "$sets[0][0]"),
         ("Dictionary<string, ReadinessSet>", "$sets[\"slot\"]"),
     ] {
-        let source = format!(
-            "{IMPORTS}\nfunction first({ty} $sets): ReadinessSet {{ return {value}; }}\nfunction main(): void {{}}"
-        );
-        let mut program = doriac::lower_source_to_mir("borrowed-collection-storage.doria", &source)
-            .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+        let source =
+            format!("{IMPORTS}\nfunction first({ty} $sets): ReadinessSet {{ return {value}; }}\n");
+        let mut program =
+            doriac::lower_library_source_to_mir("borrowed-collection-storage.doria", &source)
+                .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
         doriac::mir_validation::validate_program(&program).unwrap();
         let first = program
             .functions
@@ -2826,7 +2831,6 @@ function exercise(): void throws IoError {{
     }}
     $source->add(3);
 }}
-function main(): void {{}}
 "#
             );
             let analysis = analyze(&source);
@@ -2847,8 +2851,8 @@ function main(): void {{}}
                 1,
             )));
         }
-        let source = format!("{IMPORTS}\nfunction extract(take {ty} $incoming): {result} {{ let writable $sets = $incoming; return {extraction}; }} function main(): void {{}}");
-        let mut program = doriac::lower_source_to_mir("extracted-storage.doria", &source)
+        let source = format!("{IMPORTS}\nfunction extract(take {ty} $incoming): {result} {{ let writable $sets = $incoming; return {extraction}; }}");
+        let mut program = doriac::lower_library_source_to_mir("extracted-storage.doria", &source)
             .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
         doriac::mir_validation::validate_program(&program).unwrap();
         program
@@ -2885,7 +2889,6 @@ function exercise(): void throws IoError {{
     {clearing}
     $source->add(2);
 }}
-function main(): void {{}}
 "#
         );
         assert_valid(&analyze(&source));
@@ -2894,10 +2897,9 @@ function main(): void {{}}
         r#"{IMPORTS}
 function emptySets(writable List<ReadinessSet> $sets): void {{ $sets->clear(); }}
 function relay(writable List<ReadinessSet> $sets): void {{ emptySets($sets); }}
-function main(): void {{}}
 "#
     );
-    let program = doriac::lower_source_to_mir("cleared-storage.doria", &source).unwrap();
+    let program = doriac::lower_library_source_to_mir("cleared-storage.doria", &source).unwrap();
     doriac::mir_validation::validate_program(&program).unwrap();
     for name in ["emptySets", "relay"] {
         let mut forged = program.clone();
@@ -2975,8 +2977,8 @@ class Key implements Comparable<Key>, Equatable<Key>, Hashable {
             ),
         ] {
             let returned = format!("?{}", element.trim_start_matches('?'));
-            let source = format!("{IMPORTS}{key}\nfunction extract(take {collection} $incoming{parameters}): {returned} {{ let writable $sets = $incoming; return {operation}; }} function main(): void {{}}");
-            let mut program = doriac::lower_source_to_mir("element-carrier.doria", &source)
+            let source = format!("{IMPORTS}{key}\nfunction extract(take {collection} $incoming{parameters}): {returned} {{ let writable $sets = $incoming; return {operation}; }}");
+            let mut program = doriac::lower_library_source_to_mir("element-carrier.doria", &source)
                 .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
             doriac::mir_validation::validate_program(&program)
                 .unwrap_or_else(|error| panic!("{source}\n{error:#?}"));

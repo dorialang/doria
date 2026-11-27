@@ -55,9 +55,10 @@ impl Entry {
         {
             return None;
         }
+        // A transfer moves bytes, so the offset counts one-byte elements in
+        // whatever storage the buffer views.
         let mut region = self.buffer;
-        let source = region.source.as_mut()?;
-        source.index = source.index.checked_add(offset)?;
+        region.source = Some(region.source?.advance(offset, 1));
         region.length = length;
         Some(region)
     }
@@ -821,7 +822,7 @@ impl Interpreter<'_> {
         };
         let region = match progress {
             Some(length) if length <= entry.region.length => ByteRegionValue {
-                kind: mir::ByteRegionKind::Readonly,
+                kind: mir::RegionType::bytes(mir::ByteRegionKind::Readonly),
                 nullable: true,
                 source: entry.region.source,
                 length,
@@ -831,7 +832,7 @@ impl Interpreter<'_> {
                     "completed read exceeds its retained buffer",
                 ));
             }
-            None => ByteRegionValue::absent(mir::ByteRegionKind::Readonly),
+            None => ByteRegionValue::absent(mir::RegionType::bytes(mir::ByteRegionKind::Readonly)),
         };
         Ok(CheckedIoResult::Success(Some(LocalValue::ByteRegion(
             region,
@@ -1892,18 +1893,20 @@ function main(): void {
     fn reuse_ranges_use_original_storage_and_preserve_it_on_rejection() {
         for reading in [true, false] {
             let buffer = ByteRegionValue {
-                kind: if reading {
+                kind: mir::RegionType::bytes(if reading {
                     mir::ByteRegionKind::Writable
                 } else {
                     mir::ByteRegionKind::Readonly
-                },
-                nullable: false,
-                source: Some(CollectionElementPlace {
-                    collection: 4,
-                    generation: 7,
-                    index: 11,
-                    ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
                 }),
+                nullable: false,
+                source: Some(super::byte_region::RegionSource::Elements(
+                    CollectionElementPlace {
+                        collection: 4,
+                        generation: 7,
+                        index: 11,
+                        ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                    },
+                )),
                 length: 8,
             };
             let mut entry = Entry {
@@ -1920,7 +1923,11 @@ function main(): void {
             };
             for (offset, length) in [(0, 8), (2, 3), (8, 0)] {
                 let selected = entry.resubmission_region(offset, length).unwrap();
-                assert_eq!(selected.source.unwrap().index, 11 + offset);
+                let Some(super::byte_region::RegionSource::Elements(place)) = selected.source
+                else {
+                    panic!("a resubmission keeps the buffer's storage")
+                };
+                assert_eq!(place.index, 11 + offset);
                 assert_eq!(selected.length, length);
                 assert_eq!(selected.kind, buffer.kind);
                 assert_eq!(entry.buffer, buffer);

@@ -339,7 +339,7 @@ function main(): void
 
 /// The String surface table is the checker's only source: every executable
 /// member type-checks with the declared result type, and every pending member
-/// reports E0304.
+/// reports E0304. A member that needs an unsafe context is written in one.
 #[test]
 fn string_surface_table_matches_the_checker() {
     use doriac::string_surface::{StringMemberKind, StringValueType, STRING_MEMBERS};
@@ -353,6 +353,8 @@ fn string_surface_table_matches_the_checker() {
             StringValueType::NullableInt => "null",
             StringValueType::NullableString => "null",
             StringValueType::StringList => "[\"a\"]",
+            StringValueType::CStringPointer => "$cText->pointer",
+            StringValueType::Utf16Pointer => "$utf16Text->pointer",
             other => panic!("no sample argument for {other:?}"),
         }
     }
@@ -371,6 +373,11 @@ fn string_surface_table_matches_the_checker() {
                 format!("String::{}({arguments})", member.name)
             }
         };
+        let expression = if member.unsafe_operation.is_some() {
+            format!("unsafe({expression})")
+        } else {
+            expression
+        };
         let declaration = match member.result {
             StringValueType::ByteRegion
             | StringValueType::StringIterable
@@ -379,7 +386,11 @@ fn string_surface_table_matches_the_checker() {
             result => result.source().to_string(),
         };
         let source = format!(
-            "function main(): void\n{{\n    let $text = \"a\";\n    {declaration} $value = {expression};\n}}\n"
+            "use Doria\\Std\\Ffi\\{{CString, Utf16String}};\n\
+             function main(): void\n{{\n    let $text = \"a\";\n    \
+             let $cText = CString::from($text);\n    \
+             let $utf16Text = Utf16String::from($text);\n    \
+             {declaration} $value = {expression};\n}}\n"
         );
         let result = doriac::check_source("surface.doria", &source);
         if member.is_executable() {

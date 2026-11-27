@@ -729,10 +729,7 @@ fn release_report_identifies_llvm_without_cranelift_phase_data() {
     let compilation = doriac::performance::compile_native(
         "main.doria".to_string(),
         "function main(): int { return 42; }\n".to_string(),
-        doriac::backend::CompileOptions {
-            target: doriac::backend::BackendTarget::Native,
-            native_profile: doriac::backend::NativeProfile::Release,
-        },
+        doriac::backend::CompileOptions::native(doriac::backend::NativeProfile::Release),
         Duration::ZERO,
         vec!["doriac".to_string(), "compile".to_string()],
     )

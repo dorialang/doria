@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+mod call_type_arguments;
 mod callable_contracts;
 mod collection_keys;
 pub mod composition;
@@ -11,12 +12,17 @@ mod enum_inference;
 #[cfg(test)]
 mod enum_specialization_tests;
 pub(crate) mod executable_effects;
+mod foreign_aggregates;
+mod foreign_checks;
+mod foreign_handles;
+mod foreign_pointers;
 mod instantiation;
 mod interface_witnesses;
 mod nominal_proof;
 mod nonblocking;
 mod ownership_checking;
 mod property_hooks;
+mod reachability;
 mod return_specialization;
 mod scoped_requests;
 mod specialized_ownership;
@@ -27,6 +33,7 @@ pub(crate) use callable_contracts::{
     CallGraph as GenericCallGraph, GenericCall as CheckedGenericCall,
     Instance as CallableInstanceKey, InterfaceGenericCall,
 };
+pub use reachability::Reachability;
 pub(crate) use return_specialization::Facts as SpecializedReturnBorrows;
 pub(crate) use virtual_dispatch::Family as VirtualMethodFamily;
 
@@ -94,6 +101,12 @@ pub enum ForeachIterationKind {
     DictionaryKey,
 }
 
+/// A `foreach` over a value no iterable family classifies.
+const FOREACH_SOURCE_NOT_ITERABLE_CODE: &str = "E0810";
+/// A default on a parameter that lends the caller's storage (Andrew's ruling
+/// of 2026-11-21, "Writable always borrows (Recommended)").
+const WRITABLE_PARAMETER_DEFAULT_CODE: &str = "E0818";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForeachIterableFamily {
     IntegerRange,
@@ -108,6 +121,10 @@ pub enum ForeachIterableFamily {
     DictionaryValuesProjection,
     PriorityQueue,
     Bytes,
+    /// `ByteRegion`, `WritableByteRegion`, `ArrayRegion<T>` and
+    /// `WritableArrayRegion<T>` (Decision 0148 section 8, amendment
+    /// Iterating Regions of 2026-11-20).
+    Region,
     PublicIterable,
     Other,
 }
@@ -127,6 +144,7 @@ impl ForeachIterableFamily {
             Self::DictionaryValuesProjection => "Dictionary values projection",
             Self::PriorityQueue => "PriorityQueue",
             Self::Bytes => "Bytes",
+            Self::Region => "region",
             Self::PublicIterable => "public Iterable",
             Self::Other => "this value",
         }
@@ -324,10 +342,36 @@ pub struct SemanticInfo {
     pub matches: HashMap<Span, MatchSemanticInfo>,
     /// Fully checked value type for each `when` expression.
     pub whens: HashMap<Span, WhenSemanticInfo>,
+    /// The value of each `if`, `else if` and `when` branch condition that is a
+    /// constant expression, by the condition's span. A branch whose condition
+    /// is constant false for the target is neither emitted nor linked
+    /// (Decision 0148 section 17); checking still covers it.
+    pub constant_conditions: HashMap<Span, bool>,
+    /// The functions and methods reachable from the program's roots, the one
+    /// set every backend emits (Decision 0148 section 17, amendment of
+    /// 2026-11-21). An extern declaration outside it references no C symbol
+    /// and needs no link input.
+    pub reachable: Reachability,
     /// Source-order statement classification for each `given` prelude.
     pub given_preludes: HashMap<Span, GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<Span, CallableTarget>,
+    /// The binding of each extern declaration, keyed by its declaration span
+    /// (Decision 0148 sections 14 to 18).
+    pub foreign_bindings: HashMap<Span, crate::foreign::ForeignBinding>,
+    /// The canonical names of the C-callable Doria functions (Decision 0148
+    /// section 12).
+    pub c_abi_functions: HashSet<String>,
+    /// Each name of a C-callable function used as a value, the address of its C
+    /// entry, by span, with the function's canonical name (section 12).
+    pub c_abi_function_values: HashMap<Span, String>,
+    /// Each unsafe context outside every other one, by the span MIR lowering
+    /// sees: the region the native companion library runs (sections 22 and
+    /// 23).
+    pub unsafe_contexts: HashMap<Span, crate::foreign::UnsafeContextFact>,
+    /// Every foreign struct and union by canonical name (Decision 0148
+    /// section 6).
+    pub foreign_aggregates: HashMap<String, crate::foreign::ForeignAggregateFacts>,
     pub retained_callables: HashMap<Span, crate::ownership::RetainedCallableInfo>,
     /// Concrete ownership facts for generic bodies whose erasures depend on Copy/Move.
     pub(crate) specialized_ownership: specialized_ownership::FactsByInstance,
@@ -998,6 +1042,7 @@ impl MatchGuardSemanticInfo {
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
         Stmt::Block(block) => block.span,
+        Stmt::Unsafe(statement) => statement.span,
         Stmt::VarDecl(declaration) => declaration.span,
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. }
@@ -1036,7 +1081,9 @@ fn collect_return_expression_spans(block: &Block, returns: &mut Vec<Option<Span>
     for statement in &block.statements {
         match statement {
             Stmt::Return { expr, .. } => returns.push(expr.as_ref().map(Expr::span)),
-            Stmt::Block(block) => collect_return_expression_spans(block, returns),
+            Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                collect_return_expression_spans(block, returns)
+            }
             Stmt::If(statement) => {
                 collect_return_expression_spans(&statement.then_block, returns);
                 if let Some(branch) = &statement.else_branch {
@@ -1375,6 +1422,7 @@ fn finish_checked_analysis(
     let program = checker.program;
     checker.check_behavioral_arrow_bodies();
     checker.check_attributes();
+    checker.check_foreign_declarations();
     checker
         .test_semantics
         .tests
@@ -1508,6 +1556,7 @@ fn finish_checked_analysis(
         }
     }
     let callable_admissions = checker.checked_callable_admissions();
+    let foreign_aggregates = checker.foreign_aggregate_facts();
     let member_declarations = callable_contracts::member_declarations(program);
     let virtual_dispatch = if checker
         .diagnostics
@@ -1544,6 +1593,7 @@ fn finish_checked_analysis(
         &mut checker.contracts,
         &checker.composition,
     );
+    let reachable = Reachability::compute(&checker);
     let mut analysis = SemanticAnalysis {
         info: SemanticInfo {
             // The entry points that accept an analysis fill this from its
@@ -1574,8 +1624,15 @@ fn finish_checked_analysis(
             type_test_types: checker.type_test_types,
             matches: checker.matches,
             whens: checker.whens,
+            constant_conditions: checker.constant_conditions,
+            reachable,
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
+            foreign_bindings: std::mem::take(&mut checker.foreign.bindings),
+            c_abi_functions: std::mem::take(&mut checker.foreign.c_abi_functions),
+            c_abi_function_values: std::mem::take(&mut checker.foreign.c_abi_function_values),
+            unsafe_contexts: std::mem::take(&mut checker.foreign.unsafe_contexts),
+            foreign_aggregates,
             retained_callables,
             specialized_ownership,
             specialized_return_borrows: checker.specialized_return_borrow_seed,
@@ -1894,6 +1951,7 @@ fn collect_class_hierarchy_semantics(
 }
 
 fn collect_concrete_instances(program: &Program, checker: &mut Checker<'_>) {
+    checker.check_generic_pointee_arguments();
     let mut expanded_nominals = HashSet::new();
     loop {
         let previous_count = checker.class_instantiations.len() + checker.enum_instantiations.len();
@@ -2503,6 +2561,8 @@ fn collect_callable_nominal_instantiations(program: &Program, checker: &mut Chec
             | Item::Interface(_)
             | Item::Trait(_)
             | Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_)
             | Item::Statement(_) => {}
         }
     }
@@ -2885,6 +2945,8 @@ struct Checker<'program> {
     function_signatures: HashMap<Span, FunctionInfo>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
+    /// Unsafe contexts and foreign declarations (Decision 0148).
+    foreign: foreign_checks::ForeignState,
     integer_expression_types: HashMap<Span, IntegerType>,
     float_expression_types: HashMap<Span, FloatType>,
     expression_types: HashMap<Span, ResolvedType>,
@@ -2896,6 +2958,13 @@ struct Checker<'program> {
     type_test_types: HashMap<Span, ResolvedType>,
     matches: HashMap<Span, MatchSemanticInfo>,
     whens: HashMap<Span, WhenSemanticInfo>,
+    constant_conditions: HashMap<Span, bool>,
+    /// The body of each branch whose condition is constant false for the
+    /// target: checked, never emitted (Decision 0148 section 17).
+    dead_branches: Vec<Span>,
+    /// Each call, construction, hook access and class named as a type by
+    /// site, the edges reachability follows.
+    reach_sites: Vec<(Span, reachability::ReachTarget)>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     call_targets: HashMap<Span, CallableTarget>,
     method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
@@ -2907,6 +2976,8 @@ struct Checker<'program> {
     core_operation_calls: HashMap<Span, Vec<CoreValueCallInfo>>,
     symbolic_collection_keys: Vec<collection_keys::SymbolicKey>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
+    /// Type arguments stated at calls, keyed by the call's span.
+    stated_type_arguments: HashMap<Span, call_type_arguments::StatedTypeArguments>,
     pending_enum_constructions: HashMap<Span, GenericInference>,
     pending_availability_calls: HashMap<(Span, Span), conditional_capabilities::AvailabilityCall>,
     pending_relational_comparisons: Vec<(Span, TypeId, TypeId)>,
@@ -3322,11 +3393,31 @@ fn semantic_type_capabilities(
             needs_drop: true,
             equality: true,
         },
-        TypeKind::ByteRegion(kind) => EnumCapabilities {
+        TypeKind::ByteRegion(kind) | TypeKind::ArrayRegion(kind, _) => EnumCapabilities {
             copy: !kind.is_writable(),
             trivial_copy: !kind.is_writable(),
             needs_drop: false,
             equality: false,
+        },
+        // `CString` and `Utf16String` are Move values that own their
+        // buffer and have no `==` (Decision 0148 section 9).
+        TypeKind::Foreign(crate::foreign::ForeignType::OwnedString(_)) => EnumCapabilities {
+            copy: false,
+            trivial_copy: false,
+            needs_drop: true,
+            equality: false,
+        },
+        // Every other foreign value is a Copy value with no cleanup.
+        // Pointers, boundary values and C function pointers compare with
+        // `==`; foreign aggregates do not (Decision 0148 sections 4, 5 and 6).
+        TypeKind::Foreign(foreign) => EnumCapabilities {
+            equality: !matches!(
+                foreign,
+                crate::foreign::ForeignType::Aggregate(_)
+                    | crate::foreign::ForeignType::FixedArray { .. }
+                    | crate::foreign::ForeignType::Opaque
+            ),
+            ..copy_trivial
         },
         TypeKind::Void
         | TypeKind::Interface(_)
@@ -3360,6 +3451,7 @@ fn semantic_layout_shape(
     ty: TypeId,
     enum_layouts: &HashMap<EnumType<TypeId>, EnumLayout>,
     classes: &HashMap<String, ClassInfo>,
+    aggregates: &HashMap<String, foreign_aggregates::ForeignAggregateInfo>,
 ) -> Option<LayoutShape> {
     const POINTER: u32 = 8;
     let scalar = |bytes| LayoutShape {
@@ -3370,7 +3462,10 @@ fn semantic_layout_shape(
         TypeKind::Integer(value) => Some(scalar(value.storage_bytes())),
         TypeKind::Float(value) => Some(scalar(value.storage_bytes())),
         TypeKind::Bool => Some(scalar(1)),
-        TypeKind::ByteRegion(_) | TypeKind::Error | TypeKind::Interface(_) => Some(LayoutShape {
+        TypeKind::ByteRegion(_)
+        | TypeKind::ArrayRegion(_, _)
+        | TypeKind::Error
+        | TypeKind::Interface(_) => Some(LayoutShape {
             size: POINTER * 2,
             align: POINTER,
         }),
@@ -3410,8 +3505,36 @@ fn semantic_layout_shape(
                 }
             }
         }),
+        // An owned foreign string is the address of its buffer.
+        TypeKind::Foreign(crate::foreign::ForeignType::OwnedString(_)) => Some(scalar(POINTER)),
+        // Foreign values have the target C layout (Decision 0148 sections 5
+        // and 6); `Opaque` has none.
+        TypeKind::Foreign(_) => {
+            let layout = foreign_aggregates::foreign_c_type(
+                types,
+                aggregates,
+                ty,
+                crate::c_layout::CTarget::host(),
+            )?;
+            Some(LayoutShape {
+                size: u32::try_from(layout.size()).ok()?,
+                align: u32::try_from(layout.align()).ok()?,
+            })
+        }
         TypeKind::Nullable(inner) => {
             let inner_kind = types.kind(*inner);
+            if matches!(
+                inner_kind,
+                TypeKind::Foreign(
+                    crate::foreign::ForeignType::Pointer { .. }
+                        | crate::foreign::ForeignType::Function(_)
+                        | crate::foreign::ForeignType::OwnedString(_)
+                )
+            ) {
+                // Null is address zero (Decision 0148 section 3); an absent
+                // owned string has no buffer.
+                return Some(scalar(POINTER));
+            }
             if matches!(
                 inner_kind,
                 TypeKind::Function(_) | TypeKind::Error | TypeKind::Interface(_)
@@ -3448,7 +3571,7 @@ fn semantic_layout_shape(
             ) {
                 return Some(scalar(POINTER));
             }
-            let payload = semantic_layout_shape(types, *inner, enum_layouts, classes)?;
+            let payload = semantic_layout_shape(types, *inner, enum_layouts, classes, aggregates)?;
             let align = POINTER.max(payload.align);
             let payload_offset = checked_layout_align(POINTER, payload.align)?;
             let size = checked_layout_align(payload_offset.checked_add(payload.size)?, align)?;
@@ -3593,6 +3716,11 @@ enum LifecycleMethod {
 enum TypePosition {
     Return,
     Value,
+    /// The type argument of `Pointer<T>` or `WritablePointer<T>`, where `Opaque` and an
+    /// incomplete foreign struct are allowed.
+    Pointee,
+    /// A foreign struct or union field, where `T[N]` is allowed.
+    ForeignField,
 }
 
 impl LifecycleMethod {
@@ -3672,6 +3800,12 @@ enum DisplayConversionKind {
 }
 
 impl<'program> Checker<'program> {
+    /// Whether checking added an error after the first `before` findings.
+    /// A warning or note never makes a construct invalid (Decision 0108).
+    fn errors_since(&self, before: usize) -> bool {
+        crate::diagnostics::has_errors(&self.diagnostics[before..])
+    }
+
     fn terminal_assertion_spans(&self) -> HashSet<Span> {
         self.assertions
             .iter()
@@ -3740,6 +3874,7 @@ impl<'program> Checker<'program> {
             function_signatures: HashMap::new(),
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
+            foreign: foreign_checks::ForeignState::default(),
             integer_expression_types: HashMap::new(),
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
@@ -3751,6 +3886,9 @@ impl<'program> Checker<'program> {
             type_test_types: HashMap::new(),
             matches: HashMap::new(),
             whens: HashMap::new(),
+            constant_conditions: HashMap::new(),
+            dead_branches: Vec::new(),
+            reach_sites: Vec::new(),
             given_preludes: HashMap::new(),
             call_targets: HashMap::new(),
             method_call_targets: HashMap::new(),
@@ -3762,6 +3900,7 @@ impl<'program> Checker<'program> {
             core_operation_calls: HashMap::new(),
             symbolic_collection_keys: Vec::new(),
             pending_generic_calls: HashMap::new(),
+            stated_type_arguments: HashMap::new(),
             pending_enum_constructions: HashMap::new(),
             pending_availability_calls: HashMap::new(),
             pending_relational_comparisons: Vec::new(),
@@ -3848,6 +3987,9 @@ impl<'program> Checker<'program> {
 
     fn check(&mut self) {
         self.predeclare_classes();
+        self.collect_foreign_aggregates();
+        self.check_foreign_aggregate_cycles();
+        self.record_foreign_layout_constants();
         self.collect_enums();
         self.collect_classes();
         self.collect_interface_declarations();
@@ -3866,6 +4008,7 @@ impl<'program> Checker<'program> {
         self.check_nominal_conformances();
         self.validate_parent_constructor_protocols();
         self.report_unresolved_generic_calls();
+        self.report_unconsumed_type_arguments();
         self.check_pending_integer_literal_ranges();
         self.check_pending_class_conformances();
         self.publish_interface_specializations();
@@ -3882,6 +4025,7 @@ impl<'program> Checker<'program> {
     fn check_callable_bodies(&mut self) {
         self.finalize_enum_metadata();
         self.collect_functions();
+        self.collect_unsafe_callables();
         self.apply_ambient_effect_seed();
         self.check_instance_property_initializers();
         self.infer_return_borrow_signatures(false);
@@ -3925,7 +4069,7 @@ impl<'program> Checker<'program> {
                 Item::Constant(constant) => self.check_constant_initializer(constant, None),
                 Item::Class(class_decl) => self.check_class(class_decl),
                 Item::Enum(enum_decl) => self.check_enum(enum_decl),
-                Item::Interface(_) => {}
+                Item::Interface(_) | Item::ExternBlock(_) | Item::ForeignAggregate(_) => {}
                 Item::Trait(declaration) => self.check_trait_bodies(declaration),
             }
         }
@@ -4209,7 +4353,7 @@ impl<'program> Checker<'program> {
                         name: param.name.clone(),
                     },
                 );
-                if self.diagnostics.len() != diagnostics_before_default {
+                if self.errors_since(diagnostics_before_default) {
                     return None;
                 }
                 match crate::const_eval::evaluate_attribute_value(
@@ -4265,7 +4409,7 @@ impl<'program> Checker<'program> {
                 default_value,
             });
         }
-        if self.diagnostics.len() != diagnostics_before {
+        if self.errors_since(diagnostics_before) {
             return;
         }
         let (source, package) = self.attribute_context(class_decl.span);
@@ -4381,7 +4525,7 @@ impl<'program> Checker<'program> {
                 .with_title("Missing Required Argument"),
             );
         }
-        if self.diagnostics.len() != diagnostics_before {
+        if self.errors_since(diagnostics_before) {
             return None;
         }
 
@@ -4401,7 +4545,7 @@ impl<'program> Checker<'program> {
                     name: parameter.declaration.name.clone(),
                 },
             );
-            if self.diagnostics.len() != diagnostics_before_argument {
+            if self.errors_since(diagnostics_before_argument) {
                 continue;
             }
             match crate::const_eval::evaluate_attribute_value(
@@ -4433,7 +4577,7 @@ impl<'program> Checker<'program> {
                 Err(diagnostics) => self.diagnostics.extend(diagnostics),
             }
         }
-        if self.diagnostics.len() != diagnostics_before {
+        if self.errors_since(diagnostics_before) {
             return None;
         }
 
@@ -4522,9 +4666,11 @@ impl<'program> Checker<'program> {
                 visiting.remove(enum_type);
                 compatible
             }
-            TypeKind::Void
+            TypeKind::Foreign(_)
+            | TypeKind::Void
             | TypeKind::Bytes
             | TypeKind::ByteRegion(_)
+            | TypeKind::ArrayRegion(_, _)
             | TypeKind::Interface(_)
             | TypeKind::InterfaceSelf(_)
             | TypeKind::TraitSelf(_)
@@ -4566,9 +4712,37 @@ impl<'program> Checker<'program> {
             .iter()
             .find(|declaration| declaration.declaration_span == span)
             .map(|declaration| declaration.id.clone())
+            .or_else(|| self.compiler_known_declaration_id(span))
+    }
+
+    /// The identity of a declaration a compiler-known module adds: name
+    /// resolution records only authored declarations, and these carry the
+    /// module's canonical identity (`crate::names::standard_type_identity`).
+    fn compiler_known_declaration_id(&self, span: Span) -> Option<crate::names::GlobalSymbolId> {
+        if !span.source.is_compiler_owned() {
+            return None;
+        }
+        let name = self.program.items.iter().find_map(|item| match item {
+            Item::Class(declaration) if declaration.span == span => Some(&declaration.name),
+            Item::Enum(declaration) if declaration.span == span => Some(&declaration.name),
+            _ => None,
+        })?;
+        Some(crate::names::GlobalSymbolId {
+            owner: crate::names::GlobalSymbolOwner::CompilerKnown(
+                crate::names::standard_type_identity(name)?,
+            ),
+            qualified_name: name.clone(),
+        })
     }
 
     fn resolve_attribute_target(&self, syntax: &AttributeTargetSyntax) -> Option<AttributeTarget> {
+        if syntax.kind == AttributeTargetKind::ExternBlock {
+            let (source, _) = self.attribute_context(syntax.target_span);
+            return Some(AttributeTarget::ExternBlock {
+                source,
+                span: syntax.target_span,
+            });
+        }
         if matches!(
             syntax.kind,
             AttributeTargetKind::Class
@@ -4577,6 +4751,8 @@ impl<'program> Checker<'program> {
                 | AttributeTargetKind::Trait
                 | AttributeTargetKind::Function
                 | AttributeTargetKind::Constant
+                | AttributeTargetKind::ForeignFunction
+                | AttributeTargetKind::ForeignAggregate
         ) {
             return self
                 .global_id_for_declaration_span(syntax.target_span)
@@ -4759,7 +4935,10 @@ impl<'program> Checker<'program> {
                         }
                     }
                 }
-                Item::Constant(_) | Item::Statement(_) => {}
+                Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
+                | Item::Statement(_) => {}
             }
         }
         None
@@ -6015,7 +6194,12 @@ impl<'program> Checker<'program> {
                 Item::Class(declaration) => Some(declaration.name.as_str()),
                 Item::Interface(declaration) => Some(declaration.name.as_str()),
                 Item::Trait(declaration) => Some(declaration.name.as_str()),
-                Item::Enum(_) | Item::Function(_) | Item::Constant(_) | Item::Statement(_) => None,
+                Item::ForeignAggregate(declaration) => Some(declaration.name.as_str()),
+                Item::Enum(_)
+                | Item::Function(_)
+                | Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::Statement(_) => None,
             })
             .collect::<HashSet<_>>();
 
@@ -6445,6 +6629,7 @@ impl<'program> Checker<'program> {
                                     field.ty,
                                     &layouts,
                                     &self.classes,
+                                    &self.foreign.aggregates,
                                 )
                             })
                             .collect::<Option<Vec<_>>>()
@@ -6903,7 +7088,11 @@ impl<'program> Checker<'program> {
                 continue;
             }
 
-            if let Some(message) = Self::reserved_callable_name_message(source_name) {
+            // A foreign declaration reports its name under the link-name rule
+            // (Decision 0148 section 15).
+            if let Some(message) = Self::reserved_callable_name_message(source_name)
+                .filter(|_| !function.linkage.is_foreign())
+            {
                 self.diagnostics
                     .push(Diagnostic::new("E0310", message, function.span));
                 continue;
@@ -6921,6 +7110,9 @@ impl<'program> Checker<'program> {
                 continue;
             }
 
+            if function.linkage.is_c_abi() {
+                self.foreign.c_abi_functions.insert(function.name.clone());
+            }
             self.functions.insert(function.name.clone(), signature);
         }
     }
@@ -7392,9 +7584,12 @@ impl<'program> Checker<'program> {
                         })
                     })
                     .collect(),
-                Item::Enum(_) | Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {
-                    Vec::new()
-                }
+                Item::Enum(_)
+                | Item::Interface(_)
+                | Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
+                | Item::Statement(_) => Vec::new(),
             })
             .collect::<Vec<_>>();
         let graphs = if checked_bodies {
@@ -7448,6 +7643,9 @@ impl<'program> Checker<'program> {
                         )
                     }),
                 );
+                // The body is checked again as its callable, as `check_function`
+                // checks it.
+                let previous_callable = self.current_callable.replace(function.span);
                 let previous_owner = std::mem::replace(
                     &mut self.current_lexical_owner,
                     LexicalOwner::Callable(function.span),
@@ -7516,6 +7714,7 @@ impl<'program> Checker<'program> {
                 self.nominal_condition_scopes
                     .truncate(condition_scope_depth);
                 self.current_lexical_owner = previous_owner;
+                self.current_callable = previous_callable;
                 if inferred != signature.return_borrow {
                     self.set_return_borrow(function, declaring_class.as_deref(), inferred);
                     changed = true;
@@ -7840,6 +8039,32 @@ impl<'program> Checker<'program> {
         }
         if let Some(borrow) = self.authored_call_return_borrow(call) {
             return borrow;
+        }
+        // A region over foreign memory borrows its owner argument
+        // (Decision 0148 section 10).
+        if let Expr::StaticCall {
+            qualifier,
+            method,
+            args,
+            ..
+        } = call
+        {
+            if let Some(region) =
+                crate::byte_intrinsics::RegionCompanion::from_pointer_call(qualifier, method)
+            {
+                return crate::byte_intrinsics::from_pointer_argument(args, 0).map_or(
+                    ReturnBorrowLookup::Resolved(None),
+                    |(argument_index, _)| ReturnBorrowLookup::ResolvedArgument {
+                        borrow: ReturnBorrow {
+                            source: BorrowSource::Parameter(0),
+                            kind: ReturnBorrowKind::Retained,
+                            writable: region.kind.is_writable(),
+                            lifetime: RetainedLifetime::LastUse,
+                        },
+                        argument_index,
+                    },
+                );
+            }
         }
         if let Expr::MethodCall { object, method, .. } = call {
             let receiver_type = self
@@ -8181,6 +8406,7 @@ impl<'program> Checker<'program> {
                 ty,
                 take: param.take,
                 writable: param.writable,
+                lends_storage: param.writable && (!promoted || param.borrow_span.is_some()),
                 has_default,
                 default,
                 declaration: Some(param.span),
@@ -8219,7 +8445,9 @@ impl<'program> Checker<'program> {
 
     fn assignment_target_variable_name(target: &Expr) -> Option<&str> {
         match target {
-            Expr::Grouped { expr, .. } => Self::assignment_target_variable_name(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::assignment_target_variable_name(expr)
+            }
             Expr::Variable { name, .. } => Some(name),
             _ => None,
         }
@@ -8320,7 +8548,13 @@ impl<'program> Checker<'program> {
                 order: ForeachIterationOrder::ValueOrder,
             };
         }
-        match self.types.kind(iterable_ty).clone() {
+        // A present shared-reference access object walks its payload, as
+        // member access through it does; lowering reaches the same payload.
+        let classified = match self.forwarded_access_payload(iterable_ty) {
+            Some((payload, false)) => payload,
+            _ => iterable_ty,
+        };
+        match self.types.kind(classified).clone() {
             TypeKind::List(value) => ForeachTypePlan {
                 family: ForeachIterableFamily::List,
                 iteration_kind: ForeachIterationKind::SequenceIndex,
@@ -8385,6 +8619,22 @@ impl<'program> Checker<'program> {
                 value_binding_type: value,
                 order: ForeachIterationOrder::ValueOrder,
             },
+            TypeKind::ByteRegion(_) => ForeachTypePlan {
+                family: ForeachIterableFamily::Region,
+                iteration_kind: ForeachIterationKind::SequenceIndex,
+                iterable_type: iterable_ty,
+                first_binding_type: Some(self.types.intern(TypeKind::Integer(IntegerType::Int64))),
+                value_binding_type: self.types.intern(TypeKind::Integer(IntegerType::UInt8)),
+                order: ForeachIterationOrder::Sequence,
+            },
+            TypeKind::ArrayRegion(_, element) => ForeachTypePlan {
+                family: ForeachIterableFamily::Region,
+                iteration_kind: ForeachIterationKind::SequenceIndex,
+                iterable_type: iterable_ty,
+                first_binding_type: Some(self.types.intern(TypeKind::Integer(IntegerType::Int64))),
+                value_binding_type: element,
+                order: ForeachIterationOrder::Sequence,
+            },
             TypeKind::Bytes => ForeachTypePlan {
                 family: ForeachIterableFamily::Bytes,
                 iteration_kind: ForeachIterationKind::ValueOnly,
@@ -8414,7 +8664,9 @@ impl<'program> Checker<'program> {
 
     fn dictionary_foreach_projection(expr: &Expr) -> Option<(&Expr, DictionaryProjection)> {
         match expr {
-            Expr::Grouped { expr, .. } => Self::dictionary_foreach_projection(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::dictionary_foreach_projection(expr)
+            }
             Expr::PropertyAccess {
                 object,
                 property,
@@ -9240,28 +9492,35 @@ impl<'program> Checker<'program> {
         declared: &[TypeId],
         observed: &CheckedEffectSet,
     ) {
-        // Authored reach: a destructor must catch whatever its own body may
-        // raise, not only what the closures and members it currently reaches
-        // happen to raise.
+        // Authored reach: a destructor or a C-callable function must catch whatever
+        // its own body may raise, not only what the closures and members it
+        // currently reaches happen to raise. Neither lets any checked Error
+        // escape, automatic I/O included (Decision 0148 section 12, amendment
+        // of 2026-11-20).
+        let closed_boundary = function.name == "__destruct" || function.linkage.is_c_abi();
         let mut uncovered = Vec::new();
         for effect in observed.reach.iter().copied() {
             let resolved = self.types.resolved(effect);
             if crate::checked_effects::is_test_assertion_effect(&resolved)
-                || (function.name != "__destruct"
-                    && crate::checked_effects::is_ambient_io_effect(&resolved))
+                || (!closed_boundary && crate::checked_effects::is_ambient_io_effect(&resolved))
             {
                 continue;
             }
             // The effective signature includes inferred ambient transport for
-            // ABI lowering. Destructors still cannot let any checked Error
-            // escape, so that runtime profile must never count as an authored
-            // declaration satisfying the lifecycle boundary.
-            if function.name != "__destruct" && self.checked_error_type_covers(declared, effect) {
+            // ABI lowering. A closed boundary still cannot let any checked
+            // Error escape, so that runtime profile must never count as an
+            // authored declaration satisfying it.
+            if !closed_boundary && self.checked_error_type_covers(declared, effect) {
                 continue;
             }
             uncovered.push(effect);
         }
         if uncovered.is_empty() {
+            return;
+        }
+        if function.linkage.is_c_abi() {
+            let diagnostic = self.c_abi_escaping_errors(function, &uncovered);
+            self.diagnostics.push(diagnostic);
             return;
         }
 
@@ -9496,11 +9755,17 @@ impl<'program> Checker<'program> {
         );
     }
 
-    fn record_callable_dependency(&mut self, callee: Span) {
+    fn record_callable_dependency(&mut self, callee: Span, site: Span) {
+        self.reach_sites
+            .push((site, reachability::ReachTarget::Callable(callee)));
         self.record_effect_dependency(callable_contracts::EffectDependency::Exact(callee));
     }
 
-    fn record_method_effect_dependency(&mut self, method: &MethodInfo, direct: bool) {
+    fn record_method_effect_dependency(&mut self, method: &MethodInfo, direct: bool, site: Span) {
+        self.reach_sites.push((
+            site,
+            reachability::ReachTarget::Callable(method.declaration),
+        ));
         let target = if direct || method.virtual_root.is_none() {
             callable_contracts::EffectDependency::Exact(method.declaration)
         } else {
@@ -9511,7 +9776,7 @@ impl<'program> Checker<'program> {
 
     fn record_exact_receiver_dispatch(&mut self, object: &Expr, method: &MethodInfo, span: Span) {
         let mut object = object;
-        while let Expr::Grouped { expr, .. } = object {
+        while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = object {
             object = expr;
         }
         let lifecycle_this = matches!(object, Expr::This { .. })
@@ -9654,6 +9919,43 @@ impl<'program> Checker<'program> {
             .expect("parameter-default validation requires a default");
         let kind = self.types.kind(ty).clone();
 
+        // A writable parameter lends the caller's own storage, so an omitted
+        // argument has none to lend (Andrew's ruling of 2026-11-21, "Writable
+        // always borrows (Recommended)"). On a promoted constructor parameter
+        // `writable` makes the property writable instead (Decision 0083).
+        let promoted = function.name == "__construct"
+            && param.constructor_role.is_promoted()
+            && param.borrow_span.is_none();
+        if param.writable && !promoted {
+            let removal = Span {
+                start: param.name_span.end,
+                end: default.span().end,
+                ..default.span()
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    WRITABLE_PARAMETER_DEFAULT_CODE,
+                    format!("writable parameter `${}` cannot have a default value", param.name),
+                    default.span(),
+                )
+                .with_title("Writable Parameter Cannot Have A Default")
+                .with_explanation(
+                    "A `writable` parameter lends the caller's own variable or property to the function, so its changes reach the caller. An omitted argument has no storage to lend.",
+                )
+                .with_help("remove the default and pass a writable variable at every call, or drop `writable` and return the new value")
+                .with_structured_fix(
+                    "Remove The Default Value",
+                    crate::diagnostics::FixApplicability::RequiresReview,
+                    vec![crate::diagnostics::FixEdit {
+                        source: crate::diagnostics::DiagnosticSource::Current,
+                        span: removal,
+                        replacement: String::new(),
+                    }],
+                ),
+            );
+            return;
+        }
+
         if matches!(kind, TypeKind::String) && param.take {
             self.diagnostics.push(Diagnostic::new(
                 "E0498",
@@ -9680,6 +9982,12 @@ impl<'program> Checker<'program> {
                     | TypeKind::Bool
                     | TypeKind::Enum(_) => true,
                     TypeKind::Class(class) => class.inline_copy_type().is_some(),
+                    // A nullable C pointer defaults to null (Decision 0148
+                    // section 15).
+                    TypeKind::Foreign(
+                        crate::foreign::ForeignType::Pointer { .. }
+                        | crate::foreign::ForeignType::Function(_),
+                    ) => true,
                     _ => false,
                 };
                 supported && !self.type_is_move_type(*inner)
@@ -9873,6 +10181,25 @@ impl<'program> Checker<'program> {
                     loop_depth,
                 );
             }
+            Stmt::Unsafe(unsafe_block) => {
+                let mut nested_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::nested);
+                self.enter_unsafe_context(
+                    unsafe_block.keyword_span,
+                    unsafe_block.block.span,
+                    crate::foreign::UnsafeContextForm::Block,
+                );
+                self.check_block(
+                    &unsafe_block.block,
+                    scopes,
+                    method_context,
+                    nested_constructor_init_context.as_mut(),
+                    return_context,
+                    loop_depth,
+                );
+                self.leave_unsafe_context();
+            }
             Stmt::VarDecl(decl) => {
                 self.check_local_declaration(decl, scopes, method_context);
             }
@@ -9912,7 +10239,7 @@ impl<'program> Checker<'program> {
                         expr.span(),
                     ));
                 }
-                if self.diagnostics.len() == diagnostics_before {
+                if !self.errors_since(diagnostics_before) {
                     self.record_compiler_known_effects(
                         crate::builtins::ECHO_CHECKED_ERROR_TYPES,
                         *span,
@@ -9923,7 +10250,9 @@ impl<'program> Checker<'program> {
                 let previous = self.allow_terminal_assertion;
                 self.allow_terminal_assertion = true;
                 match expr {
-                    Expr::FunctionCall { name, args, span } if name == "panic" => {
+                    Expr::FunctionCall {
+                        name, args, span, ..
+                    } if name == "panic" => {
                         for arg in args {
                             self.check_expr(&arg.value, scopes, method_context);
                         }
@@ -9978,27 +10307,38 @@ impl<'program> Checker<'program> {
                     self.check_given_prelude(given, &mut construct_scopes, method_context);
                 }
                 self.check_condition(&if_stmt.condition, &construct_scopes, method_context);
+                let constant = self.record_constant_condition(&if_stmt.condition);
                 let mut then_scopes = construct_scopes.clone();
                 let mut then_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::nested);
-                self.check_block(
-                    &if_stmt.then_block,
-                    &mut then_scopes,
-                    method_context,
-                    then_constructor_init_context.as_mut(),
-                    return_context,
-                    loop_depth,
+                self.check_branch(
+                    constant == Some(false),
+                    if_stmt.then_block.span,
+                    |checker| {
+                        checker.check_block(
+                            &if_stmt.then_block,
+                            &mut then_scopes,
+                            method_context,
+                            then_constructor_init_context.as_mut(),
+                            return_context,
+                            loop_depth,
+                        )
+                    },
                 );
                 if let Some(else_branch) = &if_stmt.else_branch {
-                    self.check_else_branch(
-                        else_branch,
-                        &construct_scopes,
-                        method_context,
-                        constructor_init_context.as_deref(),
-                        return_context,
-                        loop_depth,
-                    );
+                    // A failed `given` gate reaches the else branch.
+                    let dead = constant == Some(true) && if_stmt.given.is_none();
+                    self.check_branch(dead, else_branch.span(), |checker| {
+                        checker.check_else_branch(
+                            else_branch,
+                            &construct_scopes,
+                            method_context,
+                            constructor_init_context.as_deref(),
+                            return_context,
+                            loop_depth,
+                        )
+                    });
                 }
                 self.check_finally(
                     if_stmt.finally.as_ref(),
@@ -10199,6 +10539,37 @@ impl<'program> Checker<'program> {
                         method_context,
                     );
                 }
+                // Checking owns the iterable families (Decision 0132): a
+                // source that none of them classifies is not iterable, so
+                // lowering never meets one.
+                // A source whose type is already in error has its finding;
+                // reporting it again here would be a cascade.
+                if plan.family == ForeachIterableFamily::Other
+                    && !matches!(
+                        self.types.kind(iterable_ty),
+                        TypeKind::Unknown
+                            | TypeKind::Mixed
+                            | TypeKind::EmptyCollection
+                            | TypeKind::Heterogeneous
+                    )
+                    && !self.conformances_rejected(iterable_ty)
+                {
+                    let got = self.types.display(iterable_ty);
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            FOREACH_SOURCE_NOT_ITERABLE_CODE,
+                            format!("`foreach` cannot walk a value of type `{got}`"),
+                            foreach.iterable.span(),
+                        )
+                        .with_title("Foreach Source Is Not Iterable")
+                        .with_explanation(
+                            "`foreach` walks integer ranges, `T[]`, the collections, regions and values that implement `Iterable<T>`.",
+                        )
+                        .with_help(
+                            "walk one of those, such as a region of the value's elements, or loop with `for` over an index",
+                        ),
+                    );
+                }
                 if plan.family == ForeachIterableFamily::PublicIterable {
                     self.select_public_iteration(plan.iterable_type, foreach.span);
                     if foreach.value_binding.writable {
@@ -10217,7 +10588,38 @@ impl<'program> Checker<'program> {
                 // mutating collection method. Only these families yield
                 // writable elements; every other source reports its own rule,
                 // and an unresolved source has already been reported.
+                // A readonly region's elements cannot change through it.
                 if foreach.value_binding.writable
+                    && plan.family == ForeachIterableFamily::Region
+                    && matches!(
+                        self.types.kind(plan.iterable_type),
+                        TypeKind::ByteRegion(crate::types::ByteRegionKind::Readonly)
+                            | TypeKind::ArrayRegion(crate::types::ByteRegionKind::Readonly, _)
+                    )
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0201",
+                            "a writable foreach binding needs a writable region",
+                            foreach.iterable.span(),
+                        )
+                        .with_title("Writable Foreach Needs A Writable Collection")
+                        .with_primary_label("This Region Is Readonly")
+                        .with_related(
+                            foreach
+                                .value_binding
+                                .writable_span
+                                .unwrap_or(foreach.value_binding.span),
+                            "Writable Binding Declared Here",
+                        )
+                        .with_explanation(
+                            "A `writable` foreach binding changes each element in place, so the region it walks must be a `WritableByteRegion` or `WritableArrayRegion<T>`.",
+                        )
+                        .with_help(
+                            "walk a writable region from `getWritableRegion(...)` bound to a writable variable, or remove `writable` from the binding to only read the elements",
+                        ),
+                    );
+                } else if foreach.value_binding.writable
                     && dictionary_projection.is_none()
                     && matches!(
                         plan.family,
@@ -10226,6 +10628,7 @@ impl<'program> Checker<'program> {
                             | ForeachIterableFamily::Dictionary
                             | ForeachIterableFamily::SortedDictionary
                             | ForeachIterableFamily::Deque
+                            | ForeachIterableFamily::Region
                     )
                 {
                     self.record_capture_requirement_for_expr(
@@ -10967,7 +11370,7 @@ impl<'program> Checker<'program> {
             // A grouped declaration is atomic. Its initializer is checked in
             // the previous scope, and no name from the group is introduced if
             // any part of the declaration is invalid.
-            if self.diagnostics.len() != diagnostics_before {
+            if self.errors_since(diagnostics_before) {
                 return;
             }
         }
@@ -11077,6 +11480,14 @@ impl<'program> Checker<'program> {
                 );
                 let target_ty = target.ty;
                 let destination = target.destination.clone();
+                if !self.check_fixed_array_field_assignment(
+                    Self::ungroup_expr(&assignment.target),
+                    &assignment.value,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
                 let assignment_ok = self.check_expr_assignable(
                     target.ty,
                     &assignment.value,
@@ -11251,26 +11662,36 @@ impl<'program> Checker<'program> {
                     self.check_given_prelude(given, &mut construct_scopes, method_context);
                 }
                 self.check_condition(&if_stmt.condition, &construct_scopes, method_context);
+                let constant = self.record_constant_condition(&if_stmt.condition);
                 let mut then_scopes = construct_scopes.clone();
                 let mut then_constructor_init_context =
                     constructor_init_context.map(ConstructorInitContext::nested);
-                self.check_block(
-                    &if_stmt.then_block,
-                    &mut then_scopes,
-                    method_context,
-                    then_constructor_init_context.as_mut(),
-                    return_context,
-                    loop_depth,
+                self.check_branch(
+                    constant == Some(false),
+                    if_stmt.then_block.span,
+                    |checker| {
+                        checker.check_block(
+                            &if_stmt.then_block,
+                            &mut then_scopes,
+                            method_context,
+                            then_constructor_init_context.as_mut(),
+                            return_context,
+                            loop_depth,
+                        )
+                    },
                 );
                 if let Some(else_branch) = &if_stmt.else_branch {
-                    self.check_else_branch(
-                        else_branch,
-                        &construct_scopes,
-                        method_context,
-                        constructor_init_context,
-                        return_context,
-                        loop_depth,
-                    );
+                    let dead = constant == Some(true) && if_stmt.given.is_none();
+                    self.check_branch(dead, else_branch.span(), |checker| {
+                        checker.check_else_branch(
+                            else_branch,
+                            &construct_scopes,
+                            method_context,
+                            constructor_init_context,
+                            return_context,
+                            loop_depth,
+                        )
+                    });
                 }
                 self.check_finally(
                     if_stmt.finally.as_ref(),
@@ -11314,6 +11735,27 @@ impl<'program> Checker<'program> {
             format!("condition must be `bool`, got `{}`", self.types.display(ty)),
             condition.span(),
         ));
+    }
+
+    /// Records a branch condition that is a constant expression.
+    fn record_constant_condition(&mut self, condition: &Expr) -> Option<bool> {
+        let value = crate::const_eval::evaluate_bool_expression(&self.const_evaluation, condition)?;
+        self.constant_conditions.insert(condition.span(), value);
+        Some(value)
+    }
+
+    /// Checks `branch` with `check`; when `dead` its condition is constant
+    /// false for the target, so it is checked and emits nothing.
+    fn check_branch<R>(
+        &mut self,
+        dead: bool,
+        branch: Span,
+        check: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        if dead && !self.dead_branches.contains(&branch) {
+            self.dead_branches.push(branch);
+        }
+        check(self)
     }
 
     fn check_given_prelude(
@@ -11718,7 +12160,9 @@ impl<'program> Checker<'program> {
 
     fn expression_root_binding(&self, expr: &Expr, scopes: &ScopeStack) -> Option<Binding> {
         match expr {
-            Expr::Grouped { expr, .. } => self.expression_root_binding(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expression_root_binding(expr, scopes)
+            }
             Expr::Variable { name, .. } => scopes.lookup(name).cloned(),
             Expr::This { .. } => scopes.lookup("this").cloned(),
             Expr::PropertyAccess { object, .. }
@@ -11742,13 +12186,13 @@ impl<'program> Checker<'program> {
         self.record_collection_construction_type(expr, expected);
         let span = expr.span();
         self.contextual_expression_types.insert(span, expected);
-        if let Expr::Grouped { expr, .. } = expr {
+        if let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expr {
             self.record_expected_expression_type(expr, expected);
         }
     }
 
     fn record_collection_construction_type(&mut self, expr: &Expr, expected: TypeId) {
-        if let Expr::Grouped { expr, .. } = expr {
+        if let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expr {
             self.record_collection_construction_type(expr, expected);
             return;
         }
@@ -11822,6 +12266,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if self.record_pointer_method_argument_types(object_ty, method, args) {
+            return;
+        }
         if let TypeKind::List(element) = self.types.kind(object_ty).clone() {
             if matches!(method, "map" | "filter" | "reduce") {
                 self.record_list_algorithm_argument_types(
@@ -11885,6 +12332,7 @@ impl<'program> Checker<'program> {
         let bool_ty = self.types.intern(TypeKind::Bool);
         let void = self.types.intern(TypeKind::Void);
         let expected_result = self.contextual_expression_types.get(&span).copied();
+        let stated = self.stated_list_algorithm_type_argument(method, span);
         let make_callback = |checker: &mut Self, invocation_mode, parameters, return_type| {
             checker
                 .types
@@ -11898,9 +12346,11 @@ impl<'program> Checker<'program> {
         };
         match (method, args) {
             ("map", [callback]) => {
-                let result = expected_result.and_then(|result| match self.types.kind(result) {
-                    TypeKind::List(value) => Some(*value),
-                    _ => None,
+                let result = stated.or_else(|| {
+                    expected_result.and_then(|result| match self.types.kind(result) {
+                        TypeKind::List(value) => Some(*value),
+                        _ => None,
+                    })
                 });
                 if let Some(result) = result {
                     let callback_ty = make_callback(
@@ -11929,7 +12379,7 @@ impl<'program> Checker<'program> {
             }
             ("reduce", [initial, callback]) => {
                 let inferred = self.infer_expr_type(&initial.value, scopes, method_context);
-                let accumulator = expected_result.or_else(|| {
+                let accumulator = stated.or(expected_result).or_else(|| {
                     (!matches!(
                         self.types.kind(inferred),
                         TypeKind::Unknown | TypeKind::EmptyCollection
@@ -11970,6 +12420,9 @@ impl<'program> Checker<'program> {
         let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context) else {
             return;
         };
+        if self.record_foreign_companion_argument_types(&class_name, method, args) {
+            return;
+        }
         let params = self
             .classes
             .get(&class_name)
@@ -12003,7 +12456,8 @@ impl<'program> Checker<'program> {
             Expr::FunctionCall { name, .. } => name == crate::compiler_known_test::EXPECT,
             Expr::PropertyAccess { object, .. }
             | Expr::MethodCall { object, .. }
-            | Expr::Grouped { expr: object, .. } => Self::contains_compiler_expect(object),
+            | Expr::Grouped { expr: object, .. }
+            | Expr::Unsafe { expr: object, .. } => Self::contains_compiler_expect(object),
             _ => false,
         }
     }
@@ -12033,7 +12487,10 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        if let Expr::FunctionCall { name, args, span } = expr {
+        if let Expr::FunctionCall {
+            name, args, span, ..
+        } = expr
+        {
             if name == crate::compiler_known_test::FAIL {
                 self.check_fail_assertion(args, *span, scopes, method_context);
                 return true;
@@ -12458,7 +12915,7 @@ impl<'program> Checker<'program> {
             }
             _ => unreachable!("fail is not a terminal matcher method"),
         }
-        if self.diagnostics.len() != diagnostics_before_domain {
+        if self.errors_since(diagnostics_before_domain) {
             return true;
         }
 
@@ -12614,6 +13071,7 @@ impl<'program> Checker<'program> {
             TypeKind::Void
             | TypeKind::Nullable(_)
             | TypeKind::ByteRegion(_)
+            | TypeKind::ArrayRegion(_, _)
             | TypeKind::Interface(_)
             | TypeKind::InterfaceSelf(_)
             | TypeKind::TraitSelf(_)
@@ -12629,7 +13087,8 @@ impl<'program> Checker<'program> {
             | TypeKind::Set(_)
             | TypeKind::SortedSet(_)
             | TypeKind::PriorityQueue(_)
-            | TypeKind::Deque(_) => false,
+            | TypeKind::Deque(_)
+            | TypeKind::Foreign(_) => false,
         }
     }
 
@@ -13120,6 +13579,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         allow_range_expr: bool,
     ) {
+        self.register_stated_type_arguments(expr, method_context);
         if self.check_assertion_expression(expr, scopes, method_context) {
             return;
         }
@@ -13236,6 +13696,24 @@ impl<'program> Checker<'program> {
                     method_context,
                 );
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if self
+                    .check_foreign_field_read(
+                        object,
+                        object_ty,
+                        property,
+                        *member_span,
+                        *span,
+                        *null_safe,
+                        scopes,
+                        method_context,
+                    )
+                    .is_some()
+                    || self
+                        .check_pointer_property(object_ty, property, *member_span, *null_safe)
+                        .is_some()
+                {
+                    return;
+                }
                 if property == "referencedValue"
                     && self
                         .shared_handle_type(object_ty, *null_safe)
@@ -13298,6 +13776,7 @@ impl<'program> Checker<'program> {
                 args,
                 argument_list_span,
                 null_safe,
+                ..
             } => {
                 self.check_expr(object, scopes, method_context);
                 self.record_member_receiver_access(object, scopes, method_context);
@@ -13343,6 +13822,28 @@ impl<'program> Checker<'program> {
                 ) {
                     return;
                 }
+                if self.check_pointer_method_call(
+                    object,
+                    method,
+                    *member_span,
+                    args,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
+                if self.check_handle_method_call(
+                    object,
+                    method,
+                    args,
+                    *null_safe,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
                 if !self.check_string_instance_method_call(
                     object,
                     method,
@@ -13376,7 +13877,9 @@ impl<'program> Checker<'program> {
                 self.check_expr(expr, scopes, method_context);
                 self.check_is_type(expr, ty, *span, scopes, method_context);
             }
-            Expr::FunctionCall { name, args, span } => {
+            Expr::FunctionCall {
+                name, args, span, ..
+            } => {
                 if crate::compiler_known_test::is_future_member(name) {
                     return;
                 }
@@ -13441,6 +13944,15 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 let class_name = &class_type.name;
+                if self.check_foreign_aggregate_construction(
+                    class_type,
+                    args,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
                 if self.interface_declaration(class_name).is_some()
                     || self.trait_declaration(class_name).is_some()
                 {
@@ -13523,6 +14035,20 @@ impl<'program> Checker<'program> {
             Expr::Grouped { expr, .. } => {
                 self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr)
             }
+            Expr::Unsafe {
+                keyword_span,
+                expr,
+                span,
+            } => {
+                self.enter_unsafe_context(
+                    *keyword_span,
+                    *span,
+                    crate::foreign::UnsafeContextForm::Expression,
+                );
+                self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr);
+                self.leave_unsafe_context();
+                self.reject_escaping_handle_borrow(expr);
+            }
             Expr::Unary { op, expr, span } => {
                 if *op == UnaryOp::Negate {
                     if let (Some(magnitude), Some(operand_span)) = (
@@ -13565,7 +14091,13 @@ impl<'program> Checker<'program> {
             Expr::When(_) => self.check_when_expression(expr, scopes, method_context),
             Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { name, span } => {
-                if !self
+                // A C-callable function's name is the address of its C entry
+                // (Decision 0148 section 12).
+                if self.foreign.c_abi_functions.contains(name) {
+                    self.foreign
+                        .c_abi_function_values
+                        .insert(*span, name.clone());
+                } else if !self
                     .const_evaluation
                     .values
                     .contains_key(&crate::const_eval::ConstKey::TopLevel(name.clone()))
@@ -13742,8 +14274,31 @@ impl<'program> Checker<'program> {
     ) -> TypeId {
         let function = match self.types.kind(callee_ty).clone() {
             TypeKind::Function(function) => function,
+            // A C function pointer is called by copying each argument, so
+            // its parameters are readonly and it has no checked effects.
+            TypeKind::Foreign(crate::foreign::ForeignType::Function(function)) => {
+                self.require_unsafe(span, "calling a C function pointer");
+                SemanticFunctionType {
+                    invocation_mode: FunctionInvocationMode::Readonly,
+                    parameters: function
+                        .parameters
+                        .iter()
+                        .map(|parameter| SemanticFunctionParameter {
+                            ownership_mode: FunctionTypeParameterMode::Readonly,
+                            ty: *parameter,
+                        })
+                        .collect(),
+                    return_type: function.return_type,
+                    checked_effects: Vec::new(),
+                    return_borrow: None,
+                }
+            }
             TypeKind::Nullable(inner)
-                if matches!(self.types.kind(inner), TypeKind::Function(_)) =>
+                if matches!(
+                    self.types.kind(inner),
+                    TypeKind::Function(_)
+                        | TypeKind::Foreign(crate::foreign::ForeignType::Function(_))
+                ) =>
             {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -13940,7 +14495,9 @@ impl<'program> Checker<'program> {
 
     fn expression_provides_owned_value(&self, expr: &Expr, scopes: &ScopeStack) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => self.expression_provides_owned_value(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expression_provides_owned_value(expr, scopes)
+            }
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .is_some_and(|binding| binding.ownership == BindingOwnership::Owned),
@@ -14225,6 +14782,7 @@ impl<'program> Checker<'program> {
             })
             .collect::<Vec<_>>();
 
+        self.enter_closure_barrier();
         self.active_closures.push(ActiveClosure {
             id: closure_id,
             captures,
@@ -14360,6 +14918,7 @@ impl<'program> Checker<'program> {
         self.closure_reach_effects
             .insert(closure_id, inferred_effects.reach.clone());
         let mut active = self.active_closures.pop().expect("active closure");
+        self.leave_closure_barrier();
 
         let invocation_mode = active
             .captures
@@ -15469,19 +16028,29 @@ impl<'program> Checker<'program> {
             saw_value: false,
         });
 
+        // A branch after one whose condition is constant true emits nothing,
+        // except the unconditioned branch a failed `given` gate reaches.
+        let mut decided = false;
         for branch in branches {
+            let mut constant = None;
             if let Some(condition) = &branch.condition {
                 self.check_condition(condition, &when_scopes, method_context);
+                constant = self.record_constant_condition(condition);
             }
+            let dead = constant == Some(false)
+                || (decided && (branch.condition.is_some() || given.is_none()));
+            decided |= constant == Some(true);
             let mut branch_scopes = when_scopes.clone();
-            self.check_block(
-                &branch.block,
-                &mut branch_scopes,
-                method_context,
-                None,
-                None,
-                enclosing_loop_depth,
-            );
+            self.check_branch(dead, branch.block.span, |checker| {
+                checker.check_block(
+                    &branch.block,
+                    &mut branch_scopes,
+                    method_context,
+                    None,
+                    None,
+                    enclosing_loop_depth,
+                )
+            });
             if crate::return_analysis::analyze_block_with_given_and_terminals(
                 &branch.block,
                 branch.block.span,
@@ -16133,6 +16702,11 @@ impl<'program> Checker<'program> {
             crate::const_eval::ConstValue::PayloadEnum(value) => self
                 .types
                 .intern_resolved(&ResolvedType::Enum(value.value.enum_type.clone())),
+            crate::const_eval::ConstValue::ForeignAggregate(value) => {
+                self.types.intern_resolved(&ResolvedType::Foreign(Box::new(
+                    crate::foreign::ForeignType::Aggregate(value.aggregate.clone()),
+                )))
+            }
         }
     }
 
@@ -16174,8 +16748,40 @@ impl<'program> Checker<'program> {
         }
     }
 
+    /// A field write changes the foreign struct or union that holds the
+    /// field, so `object`, the aggregate, must be a writable object path,
+    /// exactly as the receiver of a class property write must be (Decision
+    /// 0148 section 6). An aggregate held by a property is readonly when
+    /// the property is or when the object holding it is. A readonly binding
+    /// holding the aggregate is the ownership checker's finding (E0479).
+    fn check_foreign_field_container(
+        &mut self,
+        object: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let mut container = Self::ungroup_expr(object);
+        while let Expr::PropertyAccess { object: inner, .. } = container {
+            let inner_ty = self.infer_expr_type(inner, scopes, method_context);
+            if self.aggregate_of(inner_ty).is_none() {
+                break;
+            }
+            container = Self::ungroup_expr(inner);
+        }
+        if matches!(container, Expr::Variable { .. })
+            || self.is_writable_object_path(object, scopes, method_context)
+        {
+            return;
+        }
+        self.diagnostics.push(Diagnostic::new(
+            "E0201",
+            "cannot write through readonly object path",
+            object.span(),
+        ));
+    }
+
     fn ungroup_expr(mut expr: &Expr) -> &Expr {
-        while let Expr::Grouped { expr: inner, .. } = expr {
+        while let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
             expr = inner;
         }
         expr
@@ -16183,7 +16789,9 @@ impl<'program> Checker<'program> {
 
     fn is_grouped_range_expr(expr: &Expr) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => Self::is_grouped_range_expr(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::is_grouped_range_expr(expr)
+            }
             Expr::Range { .. } => true,
             _ => false,
         }
@@ -16196,7 +16804,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<IntegerType> {
         match expr {
-            Expr::Grouped { expr, .. } => self.range_integer_type(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.range_integer_type(expr, scopes, method_context)
+            }
             Expr::Range { start, end, .. } => {
                 let ty = self.infer_binary_type(start, &BinaryOp::Add, end, scopes, method_context);
                 match self.types.kind(ty) {
@@ -16238,7 +16848,9 @@ impl<'program> Checker<'program> {
 
     fn contextualize_range_literals(&mut self, expr: &Expr, target: IntegerType) {
         match expr {
-            Expr::Grouped { expr, .. } => self.contextualize_range_literals(expr, target),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.contextualize_range_literals(expr, target)
+            }
             Expr::Range { start, end, .. } => {
                 self.contextualize_integer_literals(start, target);
                 self.contextualize_integer_literals(end, target);
@@ -16302,7 +16914,9 @@ impl<'program> Checker<'program> {
     fn integer_literal_parts(expr: &Expr) -> Option<(u128, bool)> {
         match expr {
             Expr::Int { value, .. } => parse_decimal_magnitude(value).map(|value| (value, false)),
-            Expr::Grouped { expr, .. } => Self::integer_literal_parts(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::integer_literal_parts(expr)
+            }
             Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,
@@ -16315,7 +16929,9 @@ impl<'program> Checker<'program> {
     fn unsigned_integer_literal_magnitude(expr: &Expr) -> Option<u128> {
         match expr {
             Expr::Int { value, .. } => parse_decimal_magnitude(value),
-            Expr::Grouped { expr, .. } => Self::unsigned_integer_literal_magnitude(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::unsigned_integer_literal_magnitude(expr)
+            }
             _ => None,
         }
     }
@@ -16323,7 +16939,9 @@ impl<'program> Checker<'program> {
     fn unsigned_integer_literal_span(expr: &Expr) -> Option<Span> {
         match expr {
             Expr::Int { span, .. } => Some(*span),
-            Expr::Grouped { expr, .. } => Self::unsigned_integer_literal_span(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::unsigned_integer_literal_span(expr)
+            }
             _ => None,
         }
     }
@@ -16332,6 +16950,7 @@ impl<'program> Checker<'program> {
         self.integer_expression_types.insert(expr.span(), integer);
         match expr {
             Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
             | Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,
@@ -16368,6 +16987,7 @@ impl<'program> Checker<'program> {
 
         match expr {
             Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
             | Expr::Unary {
                 op: UnaryOp::Negate | UnaryOp::BitwiseNot,
                 expr,
@@ -16399,7 +17019,7 @@ impl<'program> Checker<'program> {
     fn is_float_literal(expr: &Expr) -> bool {
         match expr {
             Expr::Float { .. } => true,
-            Expr::Grouped { expr, .. } => Self::is_float_literal(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => Self::is_float_literal(expr),
             _ => false,
         }
     }
@@ -16407,7 +17027,7 @@ impl<'program> Checker<'program> {
     fn record_float_expression_type(&mut self, expr: &Expr, float: FloatType) {
         self.float_expression_types.insert(expr.span(), float);
         self.check_float_literal_range(expr, float);
-        if let Expr::Grouped { expr, .. } = expr {
+        if let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expr {
             self.record_float_expression_type(expr, float);
         }
     }
@@ -16444,6 +17064,7 @@ impl<'program> Checker<'program> {
 
         match expr {
             Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
             | Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,
@@ -16628,7 +17249,7 @@ impl<'program> Checker<'program> {
             return;
         }
         let mut operand = left;
-        while let Expr::Grouped { expr, .. } = operand {
+        while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = operand {
             operand = expr;
         }
         // A `mixed` binding may hold null whatever flow has narrowed it to.
@@ -16760,6 +17381,9 @@ impl<'program> Checker<'program> {
         span: Span,
         operation: &str,
     ) {
+        if self.report_foreign_operand(left, span) || self.report_foreign_operand(right, span) {
+            return;
+        }
         self.diagnostics.push(
             Diagnostic::new(
                 "E0441",
@@ -16833,6 +17457,26 @@ impl<'program> Checker<'program> {
                 )
                 .with_title("Function Values Have No Equality")
                 .with_help("compare explicit application state instead of callable identity"),
+            );
+            return;
+        }
+        // Foreign structs, unions and owned foreign strings have no `==`
+        // (Decision 0148 sections 6 and 9); pointers and boundary values do.
+        if let Some(foreign) = [left_ty, right_ty].into_iter().find(|ty| {
+            matches!(self.types.kind(*ty), TypeKind::Foreign(_))
+                && !semantic_type_capabilities(&self.types, *ty, &HashMap::new()).equality
+        }) {
+            let display = self.types.display(foreign);
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0420",
+                    format!("`{display}` values cannot be compared for equality"),
+                    span,
+                )
+                .with_title("Foreign Value Has No Equality")
+                .with_help(
+                    "compare the fields of a foreign struct, or the strings a `CString` or `Utf16String` was made from",
+                ),
             );
             return;
         }
@@ -17194,7 +17838,7 @@ impl<'program> Checker<'program> {
 
     fn is_null_literal(expr: &Expr) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => Self::is_null_literal(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => Self::is_null_literal(expr),
             Expr::Null { .. } => true,
             _ => false,
         }
@@ -17282,7 +17926,7 @@ impl<'program> Checker<'program> {
         // assignment has narrowed it (a redundant but valid check), while a bare `mixed`
         // (never nullable-declared) is reported.
         let mut operand = expr;
-        while let Expr::Grouped { expr, .. } = operand {
+        while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = operand {
             operand = expr;
         }
         if let Expr::Variable { name, .. } = operand {
@@ -17342,7 +17986,7 @@ impl<'program> Checker<'program> {
     fn type_is_move_type(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
-            TypeKind::ByteRegion(kind) => kind.is_writable(),
+            TypeKind::ByteRegion(kind) | TypeKind::ArrayRegion(kind, _) => kind.is_writable(),
             // Copy requires checked capabilities for this exact application.
             // An unmaterialized generic application retains conservative ownership.
             TypeKind::Enum(enum_type) => self
@@ -17804,6 +18448,19 @@ impl<'program> Checker<'program> {
                 }
                 self.types.intern(TypeKind::Class(class))
             }
+            // A pointer, C function pointer or fixed-length array over a
+            // type parameter, and a typed array region of one (Decision 0148
+            // section 3, amendment of 2026-11-21).
+            TypeKind::Foreign(foreign) => {
+                let foreign = foreign.map(|component| {
+                    self.substitute_type_impl(*component, substitutions, register_instances)
+                });
+                self.types.intern(TypeKind::Foreign(foreign))
+            }
+            TypeKind::ArrayRegion(kind, element) => {
+                let element = self.substitute_type_impl(element, substitutions, register_instances);
+                self.types.intern(TypeKind::ArrayRegion(kind, element))
+            }
             _ => ty,
         }
     }
@@ -17949,7 +18606,9 @@ impl<'program> Checker<'program> {
                 .filter(|value| value.ty == target)
                 .map(IntConstantEval::Known)
                 .unwrap_or(IntConstantEval::Unknown),
-            Expr::Grouped { expr, .. } => Self::eval_int_constant(expr, scopes, target),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::eval_int_constant(expr, scopes, target)
+            }
             Expr::Unary {
                 op: UnaryOp::Negate,
                 expr,
@@ -18001,7 +18660,9 @@ impl<'program> Checker<'program> {
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .and_then(|binding| binding.string_constant.clone()),
-            Expr::Grouped { expr, .. } => Self::eval_string_constant(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::eval_string_constant(expr, scopes)
+            }
             Expr::Binary {
                 left,
                 op: BinaryOp::Concat,
@@ -18072,7 +18733,7 @@ impl<'program> Checker<'program> {
         constructor_init_context: Option<&mut ConstructorInitContext>,
     ) -> Option<AssignmentTarget> {
         match target {
-            Expr::Grouped { expr, .. } => self.check_writable_place(
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => self.check_writable_place(
                 expr,
                 op,
                 scopes,
@@ -18164,6 +18825,15 @@ impl<'program> Checker<'program> {
                     return None;
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some(field) =
+                    self.check_foreign_field_write(object_ty, property, *member_span)
+                {
+                    self.check_foreign_field_container(object, scopes, method_context);
+                    return field.map(|ty| AssignmentTarget {
+                        ty,
+                        destination: AssignmentDestination::Type,
+                    });
+                }
                 if matches!(self.types.kind(object_ty), TypeKind::Enum(_)) {
                     self.diagnostics.push(
                         Diagnostic::new("E0578", "enum properties are readonly", *span)
@@ -18410,7 +19080,7 @@ impl<'program> Checker<'program> {
         requirement: CaptureRequirement,
     ) {
         match expr {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.record_capture_requirement_for_expr(expr, scopes, requirement)
             }
             Expr::Variable { name, span } => {
@@ -18549,7 +19219,12 @@ impl<'program> Checker<'program> {
                 name: name.to_string(),
             },
         );
-        self.record_callable_dependency(function_info.declaration);
+        self.require_unsafe_callable(
+            span,
+            function_info.declaration,
+            name.rsplit('\\').next().unwrap_or(name),
+        );
+        self.record_callable_dependency(function_info.declaration, span);
         let function_info = self.instantiate_generic_call(
             &format!("function `{name}`"),
             &function_info,
@@ -18567,7 +19242,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             self.record_named_call_effects(
                 callable_contracts::EffectDependency::Exact(function_info.declaration),
                 function_info.checked_effects,
@@ -18742,7 +19417,7 @@ impl<'program> Checker<'program> {
             }
             Builtin::ReadStdinBytes | Builtin::Panic => {}
         }
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             self.record_compiler_known_effects(builtin.required_error_types(), span);
             self.record_compiler_known_effects(builtin.ambient_error_types(), span);
         }
@@ -18847,6 +19522,12 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if self.reject_foreign_aggregate_method(object_ty, method, member_span) {
+            for argument in args {
+                self.check_expr(&argument.value, scopes, method_context);
+            }
+            return;
+        }
         if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
             if let Some(declared) = self.trait_method(&owner, method) {
                 self.record_contract_member_reference(member_span, vec![declared.declaration]);
@@ -19013,6 +19694,7 @@ impl<'program> Checker<'program> {
             &method_info,
             self.exact_method_calls
                 .contains(&(span, method_info.declaration)),
+            span,
         );
         if method_info.is_static {
             self.diagnostics.push(Diagnostic::new(
@@ -19077,7 +19759,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             let target = self
                 .call_targets
                 .get(&span)
@@ -19219,6 +19901,7 @@ impl<'program> Checker<'program> {
                 ty: self.string_surface_type(parameter.ty),
                 take: false,
                 writable: false,
+                lends_storage: false,
                 has_default: parameter.default.is_some(),
                 default: None,
                 declaration: None,
@@ -19250,6 +19933,11 @@ impl<'program> Checker<'program> {
             }
             self.diagnostics.push(diagnostic);
             return;
+        }
+        if let Some(operation) =
+            crate::string_surface::companion(method).and_then(|member| member.unsafe_operation)
+        {
+            self.require_unsafe(span, operation);
         }
         let Some((params, _)) = self.string_companion_signature(method) else {
             self.diagnostics.push(
@@ -19355,6 +20043,9 @@ impl<'program> Checker<'program> {
             return;
         };
         let class_name = class_name.as_str();
+        if self.check_foreign_companion_call(class_name, access, args, scopes, method_context) {
+            return;
+        }
         if let Some(definition) = self.enums.get(class_name).cloned() {
             self.check_enum_case_call(&definition, access, args, scopes, method_context);
             return;
@@ -19555,9 +20246,13 @@ impl<'program> Checker<'program> {
             let argument = &args[0].value;
             self.contextualize_integer_literals(argument, IntegerType::Int64);
             let argument_ty = self.infer_expr_type(argument, scopes, method_context);
+            // C boundary values convert to every fixed-width integer
+            // (Decision 0148 section 5).
             if !matches!(
                 self.types.kind(argument_ty),
-                TypeKind::Integer(_) | TypeKind::Unknown
+                TypeKind::Integer(_)
+                    | TypeKind::Foreign(crate::foreign::ForeignType::Boundary(_))
+                    | TypeKind::Unknown
             ) {
                 self.diagnostics.push(Diagnostic::new(
                     "E0443",
@@ -19665,7 +20360,7 @@ impl<'program> Checker<'program> {
                 direct_parent: parent_qualified,
             },
         );
-        self.record_method_effect_dependency(&method_info, parent_qualified);
+        self.record_method_effect_dependency(&method_info, parent_qualified, access.span);
         if !(parent_qualified && access.member == "__construct")
             && self.check_direct_lifecycle_method_call(
                 &declaring_class.name,
@@ -19725,7 +20420,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             let target = self
                 .call_targets
                 .get(&access.span)
@@ -19838,6 +20533,15 @@ impl<'program> Checker<'program> {
         access: StaticAccess<'_>,
         method_context: Option<&MethodContext>,
     ) {
+        if self
+            .foreign_aggregate_constant(access.qualifier, access.member, access.member_span)
+            .is_some()
+            || self
+                .foreign_call_member(access.qualifier, access.member, access.member_span, false)
+                .is_some()
+        {
+            return;
+        }
         let Some(class_name) = self.resolve_static_qualifier(access, method_context) else {
             return;
         };
@@ -19958,19 +20662,30 @@ impl<'program> Checker<'program> {
                     ty: field.ty,
                     take: self.type_is_move_type(field.ty),
                     writable: false,
+                    lends_storage: false,
                     has_default: false,
                     default: None,
                     declaration: None,
                 })
                 .collect::<Vec<_>>();
             if !definition.type_params.is_empty() {
+                let callee = format!("payload case `{}::{}`", definition.name, case.name);
+                let stated = self.stated_type_argument_bindings(
+                    &callee,
+                    &definition.type_params,
+                    access.span,
+                );
+                let stated_params = params
+                    .iter()
+                    .map(|param| self.substitute_param_info(param, &stated))
+                    .collect::<Vec<_>>();
                 let bindings = self.infer_generic_argument_bindings(
-                    &format!("payload case `{}::{}`", definition.name, case.name),
-                    &params,
+                    &callee,
+                    &stated_params,
                     args,
                     scopes,
                     method_context,
-                    &HashMap::new(),
+                    &stated,
                 );
                 self.begin_enum_construction(definition, &case.name, access.span, bindings);
                 let bindings = self.pending_enum_constructions[&access.span]
@@ -20019,6 +20734,14 @@ impl<'program> Checker<'program> {
         access: StaticAccess<'_>,
         method_context: Option<&MethodContext>,
     ) -> Option<AssignmentTarget> {
+        if let Some(ty) =
+            self.foreign_call_member(access.qualifier, access.member, access.member_span, true)
+        {
+            return Some(AssignmentTarget {
+                ty,
+                destination: AssignmentDestination::Type,
+            });
+        }
         let class_name = self.resolve_static_qualifier(access, method_context)?;
         let (_, member) = self.check_resolved_static_member(access, &class_name, method_context)?;
         let StaticMemberInfo::Property(property) = member else {
@@ -20348,6 +21071,10 @@ impl<'program> Checker<'program> {
         let Some(class_info) = self.classes.get(class_name).cloned() else {
             return;
         };
+        self.reach_sites.push((
+            span,
+            reachability::ReachTarget::Class(class_name.to_string()),
+        ));
 
         let Some(constructor) = class_info.methods.get("__construct").cloned() else {
             if !args.is_empty() {
@@ -20393,7 +21120,7 @@ impl<'program> Checker<'program> {
                 direct_parent: false,
             },
         );
-        self.record_callable_dependency(constructor.declaration);
+        self.record_callable_dependency(constructor.declaration, span);
         let constructor = self.specialize_method_for_class(&constructor, class_type);
         let diagnostics_before = self.diagnostics.len();
         self.check_call_arguments(
@@ -20404,7 +21131,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        if self.diagnostics.len() == diagnostics_before {
+        if !self.errors_since(diagnostics_before) {
             let owner = self.types.intern(TypeKind::Class(class_type.clone()));
             let ResolvedType::Class(owner) = self.types.resolved(owner) else {
                 unreachable!("interned constructor class type must resolve as a class");
@@ -20423,6 +21150,9 @@ impl<'program> Checker<'program> {
     }
 
     fn record_method_call_target(&mut self, span: Span, method: &MethodInfo, direct_parent: bool) {
+        if self.is_unsafe_callable(method.declaration) {
+            self.require_unsafe(span, "calling an unsafe method");
+        }
         self.method_call_targets.insert(
             span,
             MethodCallSemanticInfo {
@@ -20588,6 +21318,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> FunctionInfo {
         if function.type_params.is_empty() {
+            self.stated_type_argument_bindings(callee, &[], span);
             return function.clone();
         }
         let bindings = self.infer_generic_call_bindings(
@@ -20641,6 +21372,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> MethodInfo {
         if method.type_params.is_empty() {
+            self.stated_type_argument_bindings(callee, &[], span);
             self.defer_callable_availability(method, &method.enclosing_type_bindings, span);
             return method.clone();
         }
@@ -20708,13 +21440,23 @@ impl<'program> Checker<'program> {
         declaration: Span,
         initial_bindings: &HashMap<String, TypeId>,
     ) -> HashMap<String, TypeId> {
+        // Stated type arguments are fixed first; the arguments then infer
+        // only the others (Decision 0105, Amendment: Type Arguments At The
+        // Call).
+        let stated = self.stated_type_argument_bindings(callee, type_params, span);
+        let params = params
+            .iter()
+            .map(|param| self.substitute_param_info(param, &stated))
+            .collect::<Vec<_>>();
+        let mut initial = initial_bindings.clone();
+        initial.extend(stated);
         let bindings = self.infer_generic_argument_bindings(
             callee,
-            params,
+            &params,
             args,
             scopes,
             method_context,
-            initial_bindings,
+            &initial,
         );
         self.pending_generic_calls.insert(
             span,
@@ -20805,6 +21547,7 @@ impl<'program> Checker<'program> {
             ty: self.substitute_type(param.ty, bindings),
             take: param.take,
             writable: param.writable,
+            lends_storage: param.lends_storage,
             has_default: param.has_default,
             default: param.default.clone(),
             declaration: param.declaration,
@@ -20838,7 +21581,7 @@ impl<'program> Checker<'program> {
     }
 
     fn complete_generic_call_from_expected(&mut self, expr: &Expr, expected: TypeId) {
-        if let Expr::Grouped { expr, .. } = expr {
+        if let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = expr {
             self.complete_generic_call_from_expected(expr, expected);
             return;
         }
@@ -20939,7 +21682,7 @@ impl<'program> Checker<'program> {
                     *span,
                 )
                 .with_help(
-                    "bind the result through a typed declaration so the expected type determines the missing generic argument",
+                    "state the type arguments at the call, as in `first<int>($values)`, or bind the result through a typed declaration so the expected type determines them",
                 ),
             );
         }
@@ -20989,6 +21732,34 @@ impl<'program> Checker<'program> {
         if self.is_expr_assignable(param.ty, arg, scopes, method_context)
             || self.is_assignable(param.ty, got)
         {
+            // A writable Copy argument lends the caller's storage, so it must be
+            // a place the caller may change (Andrew's ruling of 2026-11-21,
+            // "Writable always borrows (Recommended)").
+            if param.lends_storage
+                && !parameter_is_class_like
+                && !matches!(self.types.kind(param.ty), TypeKind::Mixed)
+                && !self.type_is_move_type(got)
+                && self.storage_path_access(arg, scopes, method_context)
+                    != ObjectPathAccess::Writable
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0204",
+                        format!(
+                            "argument {} of {callee} must be a writable variable or property",
+                            index + 1
+                        ),
+                        arg.span(),
+                    )
+                    .with_title("Writable Parameter Needs A Writable Place")
+                    .with_explanation(
+                        "A `writable` parameter lends the caller's own variable or property to the function, so its changes reach the caller. A literal, a computed value or a readonly value has no storage the caller may change.",
+                    )
+                    .with_help("pass a variable or property declared `writable`")
+                    .with_help("or drop `writable` from the parameter and return the new value"),
+                );
+                return;
+            }
             if param.take {
                 self.record_capture_requirement_for_expr(arg, scopes, CaptureRequirement::Take);
             } else if param.writable {
@@ -21116,7 +21887,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn object_path_access(
+    pub(super) fn object_path_access(
         &mut self,
         expr: &Expr,
         scopes: &ScopeStack,
@@ -21146,7 +21917,9 @@ impl<'program> Checker<'program> {
             };
         }
         let access = match expr {
-            Expr::Grouped { expr, .. } => self.storage_path_access(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.storage_path_access(expr, scopes, method_context)
+            }
             Expr::New { .. } => ObjectPathAccess::Writable,
             Expr::Variable { name, .. } => {
                 scopes
@@ -21164,9 +21937,22 @@ impl<'program> Checker<'program> {
                 Some(ReceiverAccess::ConstructionRoot) => ObjectPathAccess::ConstructionRoot,
                 _ => ObjectPathAccess::Readonly,
             },
+            // A field of a foreign struct or union is part of the value,
+            // writable exactly when the containing place is (Decision 0148
+            // section 6), through `?->` as well; every other null-safe
+            // access is readonly.
             Expr::PropertyAccess {
-                null_safe: true, ..
-            } => ObjectPathAccess::Readonly,
+                object,
+                null_safe: true,
+                ..
+            } => {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if self.aggregate_of(object_ty).is_some() {
+                    self.object_path_access(object, scopes, method_context)
+                } else {
+                    ObjectPathAccess::Readonly
+                }
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => {
@@ -21186,6 +21972,12 @@ impl<'program> Checker<'program> {
                     return ObjectPathAccess::Readonly;
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                // A field of a foreign struct or union is part of the value,
+                // writable exactly when the containing place is (Decision
+                // 0148 section 6).
+                if self.aggregate_of(object_ty).is_some() {
+                    return parent_access;
+                }
                 let writable =
                     if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
                         self.trait_property(&owner, property)
@@ -21264,7 +22056,7 @@ impl<'program> Checker<'program> {
             return false;
         }
         match argument {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.writable_mixed_requires_semantic_check(argument_ty, expr, method_context)
             }
             Expr::This { .. } | Expr::PropertyAccess { .. } => false,
@@ -21286,7 +22078,9 @@ impl<'program> Checker<'program> {
 
     fn is_property_write_object_path(expr: &Expr) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => Self::is_property_write_object_path(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                Self::is_property_write_object_path(expr)
+            }
             Expr::Variable { .. } | Expr::This { .. } => true,
             Expr::PropertyAccess { object, .. } => Self::is_property_write_object_path(object),
             _ => false,
@@ -21352,7 +22146,7 @@ impl<'program> Checker<'program> {
 
     fn is_direct_this(expr: &Expr) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => Self::is_direct_this(expr),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => Self::is_direct_this(expr),
             Expr::This { .. } => true,
             _ => false,
         }
@@ -21693,47 +22487,57 @@ impl<'program> Checker<'program> {
     }
 
     fn const_type_id(&mut self, ty: crate::const_eval::ConstType) -> TypeId {
-        if let crate::const_eval::ConstType::NullableInlineNominal(ty) = &ty {
+        if let crate::const_eval::ConstType::NullOnly(ty) = &ty {
             return self.resolve_type_ref(ty, Span::default());
         }
-        let kind = match ty {
-            crate::const_eval::ConstType::NullableInlineNominal(_) => unreachable!(),
-            crate::const_eval::ConstType::Inline(ty) => {
-                TypeKind::Class(ClassType::new(ty.name().to_string(), Vec::new()))
-            }
-            crate::const_eval::ConstType::NullableInline(ty) => {
-                let inner = self.const_type_id(crate::const_eval::ConstType::Inline(ty));
-                TypeKind::Nullable(inner)
-            }
-            crate::const_eval::ConstType::Integer(ty) => TypeKind::Integer(ty),
-            crate::const_eval::ConstType::NullableInteger(ty) => {
-                let inner = self.types.intern(TypeKind::Integer(ty));
-                TypeKind::Nullable(inner)
-            }
-            crate::const_eval::ConstType::Float(ty) => TypeKind::Float(ty),
-            crate::const_eval::ConstType::NullableFloat(ty) => {
-                let inner = self.types.intern(TypeKind::Float(ty));
-                TypeKind::Nullable(inner)
-            }
-            crate::const_eval::ConstType::String => TypeKind::String,
-            crate::const_eval::ConstType::Bool => TypeKind::Bool,
-            crate::const_eval::ConstType::NullableBool => {
-                let inner = self.types.intern(TypeKind::Bool);
-                TypeKind::Nullable(inner)
-            }
-            crate::const_eval::ConstType::Enum(ty) => {
-                return self.types.intern_resolved(&ResolvedType::Enum(ty));
-            }
-            crate::const_eval::ConstType::NullableEnum(ty) => {
-                let enum_type = self.const_type_id(crate::const_eval::ConstType::Enum(ty));
-                TypeKind::Nullable(enum_type)
-            }
-            crate::const_eval::ConstType::Null => TypeKind::Null,
-            crate::const_eval::ConstType::NullableString => {
-                let string = self.types.intern(TypeKind::String);
-                TypeKind::Nullable(string)
-            }
-        };
+        let kind =
+            match ty {
+                crate::const_eval::ConstType::NullOnly(_) => unreachable!(),
+                crate::const_eval::ConstType::Inline(ty) => {
+                    TypeKind::Class(ClassType::new(ty.name().to_string(), Vec::new()))
+                }
+                crate::const_eval::ConstType::NullableInline(ty) => {
+                    let inner = self.const_type_id(crate::const_eval::ConstType::Inline(ty));
+                    TypeKind::Nullable(inner)
+                }
+                crate::const_eval::ConstType::Integer(ty) => TypeKind::Integer(ty),
+                crate::const_eval::ConstType::NullableInteger(ty) => {
+                    let inner = self.types.intern(TypeKind::Integer(ty));
+                    TypeKind::Nullable(inner)
+                }
+                crate::const_eval::ConstType::Float(ty) => TypeKind::Float(ty),
+                crate::const_eval::ConstType::NullableFloat(ty) => {
+                    let inner = self.types.intern(TypeKind::Float(ty));
+                    TypeKind::Nullable(inner)
+                }
+                crate::const_eval::ConstType::String => TypeKind::String,
+                crate::const_eval::ConstType::Bool => TypeKind::Bool,
+                crate::const_eval::ConstType::NullableBool => {
+                    let inner = self.types.intern(TypeKind::Bool);
+                    TypeKind::Nullable(inner)
+                }
+                crate::const_eval::ConstType::Enum(ty) => {
+                    return self.types.intern_resolved(&ResolvedType::Enum(ty));
+                }
+                crate::const_eval::ConstType::NullableEnum(ty) => {
+                    let enum_type = self.const_type_id(crate::const_eval::ConstType::Enum(ty));
+                    TypeKind::Nullable(enum_type)
+                }
+                crate::const_eval::ConstType::ForeignAggregate(aggregate) => {
+                    TypeKind::Foreign(crate::foreign::ForeignType::Aggregate(aggregate))
+                }
+                crate::const_eval::ConstType::NullableForeignAggregate(aggregate) => {
+                    let aggregate = self.types.intern(TypeKind::Foreign(
+                        crate::foreign::ForeignType::Aggregate(aggregate),
+                    ));
+                    TypeKind::Nullable(aggregate)
+                }
+                crate::const_eval::ConstType::Null => TypeKind::Null,
+                crate::const_eval::ConstType::NullableString => {
+                    let string = self.types.intern(TypeKind::String);
+                    TypeKind::Nullable(string)
+                }
+            };
         self.types.intern(kind)
     }
 
@@ -21773,6 +22577,9 @@ impl<'program> Checker<'program> {
             let mut inner = grouped.inner.clone();
             inner.nullable |= ty.nullable;
             return self.resolve_type_ref_in_position(&inner, span, position, declaring_class);
+        }
+        if let Some(foreign) = self.resolve_foreign_type_ref(ty, span, position, declaring_class) {
+            return foreign;
         }
         if let Some(function) = &ty.function {
             let function = self.resolve_function_type_ref(function, declaring_class);
@@ -21827,6 +22634,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::SharedHandle(_, _)
                 | TypeKind::Bytes
                 | TypeKind::ByteRegion(_)
+                | TypeKind::ArrayRegion(_, _)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -21834,7 +22642,8 @@ impl<'program> Checker<'program> {
                 | TypeKind::Set(_)
                 | TypeKind::SortedSet(_)
                 | TypeKind::PriorityQueue(_)
-                | TypeKind::Deque(_) => self.types.intern(TypeKind::Nullable(inner)),
+                | TypeKind::Deque(_)
+                | TypeKind::Foreign(_) => self.types.intern(TypeKind::Nullable(inner)),
                 TypeKind::Void
                 | TypeKind::Null
                 | TypeKind::Nullable(_)
@@ -21992,6 +22801,19 @@ impl<'program> Checker<'program> {
                 let element =
                     self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.types.intern(TypeKind::TypedArray(element))
+            }
+            name if crate::types::ByteRegionKind::from_array_source_name(name).is_some() => {
+                let kind = crate::types::ByteRegionKind::from_array_source_name(name)
+                    .expect("an array region name has its access");
+                if !self.expect_type_arg_count(ty, 1, span) {
+                    for arg in ty.type_arguments() {
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
+                    }
+                    return self.types.unknown();
+                }
+                let element =
+                    self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
+                self.types.intern(TypeKind::ArrayRegion(kind, element))
             }
             "List" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
@@ -22151,6 +22973,12 @@ impl<'program> Checker<'program> {
                     .collect::<Vec<_>>();
                 if !self.check_nominal_type_constraints(name, &type_params, &arguments, span) {
                     return self.types.unknown();
+                }
+                // Naming an Error class reaches its Error implementation
+                // (Decision 0148 section 17).
+                if !span.source.is_compiler_owned() {
+                    self.reach_sites
+                        .push((span, reachability::ReachTarget::NamedType(name.to_string())));
                 }
                 let class = ClassType::new(name, arguments);
                 self.record_class_instantiation(class.clone(), declaring_class);
@@ -22536,6 +23364,7 @@ impl<'program> Checker<'program> {
         if self.nominal_identity_depth > 0 {
             return true;
         }
+        self.record_generic_nominal_use(name, arguments, span);
         let identity = (name.to_string(), arguments.to_vec());
         if !self.checking_type_constraints.insert(identity.clone()) {
             return true;
@@ -22882,7 +23711,7 @@ impl<'program> Checker<'program> {
         }
 
         match value_expr {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.is_expr_assignable_impl(target, expr, scopes, method_context, false)
             }
             Expr::New { shared: true, .. } => self.is_contextual_shared_construction_assignable(
@@ -23390,6 +24219,7 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
+        self.register_stated_type_arguments(expr, method_context);
         if self.assertions.contains_key(&expr.span()) {
             return self.types.intern(TypeKind::Void);
         }
@@ -23488,6 +24318,9 @@ impl<'program> Checker<'program> {
                 };
                 self.flow_narrowed_type(binding.declared_ty, binding.ty, *span, method_context)
             }
+            Expr::Identifier { name, .. } if self.foreign.c_abi_functions.contains(name) => self
+                .c_abi_function_value_type(name)
+                .unwrap_or_else(|| self.types.unknown()),
             Expr::Identifier { name, .. } => {
                 let key = crate::const_eval::ConstKey::TopLevel(name.clone());
                 let ty = self
@@ -23520,6 +24353,19 @@ impl<'program> Checker<'program> {
                     return result;
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some(field) = self.foreign_field_type(
+                    object,
+                    object_ty,
+                    property,
+                    *null_safe,
+                    scopes,
+                    method_context,
+                ) {
+                    return field;
+                }
+                if let Some(ty) = self.pointer_property_type(object_ty, property, *null_safe) {
+                    return ty;
+                }
                 if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
                     return self
                         .trait_property(&owner, property)
@@ -23592,6 +24438,12 @@ impl<'program> Checker<'program> {
                     return self.types.intern_resolved(&call.result_type.clone());
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some(result) = self.pointer_method_type(object_ty, method, *null_safe) {
+                    return result;
+                }
+                if let Some(result) = self.handle_method_type(object_ty, method, *null_safe) {
+                    return result;
+                }
                 if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
                     let result = self
                         .trait_method(&owner, method)
@@ -23698,6 +24550,16 @@ impl<'program> Checker<'program> {
                 else {
                     return self.types.unknown();
                 };
+                if let Some(result) = self.foreign_companion_call_type(
+                    &class_name,
+                    method,
+                    args,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return result;
+                }
                 if let Some(definition) = self.enums.get(&class_name) {
                     let template = self
                         .types
@@ -23840,6 +24702,12 @@ impl<'program> Checker<'program> {
                 span,
                 ..
             } => {
+                if let Some(ty) = self.foreign_aggregate_constant_type(qualifier, member) {
+                    return ty;
+                }
+                if let Some(ty) = self.foreign_call_member_type(qualifier, member) {
+                    return ty;
+                }
                 let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context)
                 else {
                     return self.types.unknown();
@@ -23887,7 +24755,9 @@ impl<'program> Checker<'program> {
                         .unwrap_or_else(|| self.types.unknown())
                 })
             }
-            Expr::Grouped { expr, .. } => self.infer_expr_type(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.infer_expr_type(expr, scopes, method_context)
+            }
             Expr::Unary { op, expr, span } => {
                 self.infer_unary_type(op, expr, *span, scopes, method_context)
             }
@@ -24111,6 +24981,7 @@ impl<'program> Checker<'program> {
                 TypeKind::Error
                 | TypeKind::Bytes
                 | TypeKind::ByteRegion(_)
+                | TypeKind::ArrayRegion(_, _)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -24369,6 +25240,7 @@ impl<'program> Checker<'program> {
                 ty: payload,
                 take: true,
                 writable: false,
+                lends_storage: false,
                 has_default: false,
                 default: None,
                 declaration: None,
@@ -24855,6 +25727,18 @@ impl<'program> Checker<'program> {
             TypeKind::Nullable(inner) => *inner,
             _ => ty,
         };
+        if let Some(operation) = crate::byte_intrinsics::member(&self.types.resolved(ty), property)
+            .filter(|member| member.kind == crate::byte_intrinsics::ByteMemberKind::Property)
+            .and_then(|member| member.unsafe_operation)
+        {
+            // A generic region's pointer is checked at each call with the
+            // element type the call supplies (Decision 0148 section 3).
+            if let TypeKind::ArrayRegion(_, element) = self.types.kind(ty).clone() {
+                self.defer_generic_pointee(element, span);
+            }
+            self.require_unsafe(span, operation);
+            return;
+        }
         if let TypeKind::Enum(enum_type) = self.types.kind(ty).clone() {
             let definition = self.enum_definition(&enum_type);
             if property == "value" && definition.is_some_and(|value| value.backing_type.is_some()) {
@@ -25056,6 +25940,7 @@ impl<'program> Checker<'program> {
             kind,
             TypeKind::Bytes
                 | TypeKind::ByteRegion(_)
+                | TypeKind::ArrayRegion(_, _)
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -25353,6 +26238,7 @@ impl<'program> Checker<'program> {
         }
 
         let callback_index = usize::from(method == "reduce");
+        let stated = self.stated_list_algorithm_type_argument(method, span);
         let callback = &args[callback_index].value;
         let callback_ty = self.infer_expr_type(callback, scopes, method_context);
         let TypeKind::Function(function) = self.types.kind(callback_ty).clone() else {
@@ -25456,6 +26342,18 @@ impl<'program> Checker<'program> {
                         &format!(
                             "an element parameter of type `{}`",
                             self.types.display(*element)
+                        ),
+                    );
+                    return;
+                }
+                if let Some(stated) = stated.filter(|stated| *stated != function.return_type) {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Return Type Mismatch",
+                        &format!(
+                            "a return type of `{}`, the type argument stated at the call",
+                            self.types.display(stated)
                         ),
                     );
                     return;
@@ -25597,6 +26495,18 @@ impl<'program> Checker<'program> {
                         callback.span(),
                         "Reduce Callback Must Return Void",
                         "a `void` return",
+                    );
+                    return;
+                }
+                if let Some(stated) = stated.filter(|stated| *stated != accumulator_parameter.ty) {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Parameter Type Mismatch",
+                        &format!(
+                            "a writable accumulator of type `{}`, the type argument stated at the call",
+                            self.types.display(stated)
+                        ),
                     );
                     return;
                 }
@@ -26270,8 +27180,16 @@ impl<'program> Checker<'program> {
                         | TypeKind::SharedHandle(_, _)
                         | TypeKind::Bytes
                         | TypeKind::ByteRegion(_)
+                        | TypeKind::ArrayRegion(_, _)
+                ) || matches!(
+                    self.types.kind(*inner),
+                    TypeKind::Foreign(crate::foreign::ForeignType::Pointer { .. })
                 ) || (operation == "property access"
-                    && matches!(self.types.kind(*inner), TypeKind::Enum(_)));
+                    && matches!(
+                        self.types.kind(*inner),
+                        TypeKind::Enum(_)
+                            | TypeKind::Foreign(crate::foreign::ForeignType::Aggregate(_))
+                    ));
                 if !member_receiver {
                     self.diagnostics.push(Diagnostic::new(
                         "E0507",
@@ -26329,6 +27247,12 @@ impl<'program> Checker<'program> {
                     | TypeKind::Interface(_)
                     | TypeKind::Error
                     | TypeKind::Function(_)
+                    | TypeKind::Foreign(
+                        crate::foreign::ForeignType::Aggregate(_)
+                            | crate::foreign::ForeignType::Pointer { .. }
+                            | crate::foreign::ForeignType::Function(_)
+                            | crate::foreign::ForeignType::Boundary(_)
+                    )
                     | TypeKind::Unknown
             )
         {

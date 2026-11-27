@@ -192,6 +192,7 @@ unsafe extern "system" {
     // Errors.
     pub(crate) fn GetLastError() -> u32;
     pub(crate) fn GetCurrentProcessId() -> u32;
+    pub(crate) fn GetCurrentThreadId() -> u32;
     pub(crate) fn SetLastError(code: u32);
 
     // Handles.
@@ -204,7 +205,6 @@ unsafe extern "system" {
 
     // Standard devices and consoles.
     pub(crate) fn GetStdHandle(which: u32) -> NativeHandle;
-    #[cfg(test)]
     pub(crate) fn SetStdHandle(which: u32, handle: NativeHandle) -> i32;
     pub(crate) fn GetConsoleMode(handle: NativeHandle, mode: *mut u32) -> i32;
     pub(crate) fn ReadConsoleW(

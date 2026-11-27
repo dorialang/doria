@@ -108,8 +108,11 @@ fn native_region_layout_and_returns_use_inline_carriers_not_borrow_home_results(
     for kind in [ByteRegionKind::Readonly, ByteRegionKind::Writable] {
         for word in [4, 8] {
             for (ty, words) in [
-                (Type::ByteRegion(kind), 2),
-                (Type::NullableByteRegion(kind), 3),
+                (Type::Region(doriac::mir::RegionType::bytes(kind)), 2),
+                (
+                    Type::NullableRegion(doriac::mir::RegionType::bytes(kind)),
+                    3,
+                ),
             ] {
                 let layout = doriac::native_closure_abi::type_layout(ty, word);
                 assert_eq!(layout.size, word * words);
@@ -128,12 +131,18 @@ fn native_region_layout_and_returns_use_inline_carriers_not_borrow_home_results(
     for (name, expected, hidden_inputs) in [
         (
             "pair",
-            Type::ByteRegion(ByteRegionKind::Readonly),
+            Type::Region(doriac::mir::RegionType {
+                access: ByteRegionKind::Readonly,
+                array: None,
+            }),
             vec![NativeCallableHiddenInput::CurrentFrame],
         ),
         (
             "triple",
-            Type::NullableByteRegion(ByteRegionKind::Readonly),
+            Type::NullableRegion(doriac::mir::RegionType {
+                access: ByteRegionKind::Readonly,
+                array: None,
+            }),
             vec![
                 NativeCallableHiddenInput::CurrentFrame,
                 NativeCallableHiddenInput::ResultOut,

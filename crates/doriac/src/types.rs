@@ -41,6 +41,9 @@ pub(crate) enum CollectionFamily {
     PriorityQueue,
     Deque,
     Bytes,
+    /// `CString` and `Utf16String`: one owned buffer, tracked as `Bytes` is
+    /// (Decision 0148 section 9).
+    ForeignString,
 }
 
 impl CollectionFamily {
@@ -55,6 +58,11 @@ impl CollectionFamily {
             ResolvedType::PriorityQueue(_) => Some(Self::PriorityQueue),
             ResolvedType::Deque(_) => Some(Self::Deque),
             ResolvedType::Bytes => Some(Self::Bytes),
+            ResolvedType::Foreign(foreign)
+                if matches!(**foreign, crate::foreign::ForeignType::OwnedString(_)) =>
+            {
+                Some(Self::ForeignString)
+            }
             ResolvedType::Nullable(inner) | ResolvedType::SharedHandle(_, inner) => {
                 Self::from_resolved(inner)
             }
@@ -122,6 +130,9 @@ pub(crate) fn resolve_nominal_kinds_with(
         }
         ResolvedType::TypedArray(inner) => {
             ResolvedType::TypedArray(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
+        }
+        ResolvedType::ArrayRegion(kind, inner) => {
+            ResolvedType::ArrayRegion(kind, Box::new(resolve_nominal_kinds_with(*inner, resolve)))
         }
         ResolvedType::List(inner) => {
             ResolvedType::List(Box::new(resolve_nominal_kinds_with(*inner, resolve)))
@@ -278,6 +289,19 @@ fn resolve_type_ref(
                 "bool" => ResolvedType::Bool,
                 "mixed" => ResolvedType::Mixed,
                 "Error" => ResolvedType::Error,
+                crate::foreign::OPAQUE => {
+                    ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Opaque))
+                }
+                name if crate::foreign::CBoundaryType::from_source_name(name).is_some() => {
+                    ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Boundary(
+                        crate::foreign::CBoundaryType::from_source_name(name)?,
+                    )))
+                }
+                name if crate::foreign::ForeignStringEncoding::from_source_name(name).is_some() => {
+                    ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::OwnedString(
+                        crate::foreign::ForeignStringEncoding::from_source_name(name)?,
+                    )))
+                }
                 _ => ResolvedType::Class(ClassType::new(plain.name, Vec::new())),
             }
         }
@@ -289,6 +313,14 @@ fn resolve_type_ref(
         match plain.name.as_str() {
             "[]" if arguments.len() == 1 => {
                 ResolvedType::TypedArray(Box::new(arguments[0].clone()))
+            }
+            name if arguments.len() == 1
+                && ByteRegionKind::from_array_source_name(name).is_some() =>
+            {
+                ResolvedType::ArrayRegion(
+                    ByteRegionKind::from_array_source_name(name)?,
+                    Box::new(arguments[0].clone()),
+                )
             }
             "List" if arguments.len() == 1 => ResolvedType::List(Box::new(arguments[0].clone())),
             "Dictionary" if arguments.len() == 2 => ResolvedType::Dictionary(
@@ -310,6 +342,11 @@ fn resolve_type_ref(
             name if arguments.len() == 1 => {
                 if let Some(kind) = crate::types::SharedHandleKind::from_source_name(name) {
                     ResolvedType::SharedHandle(kind, Box::new(arguments[0].clone()))
+                } else if let Some(access) = crate::foreign::PointerAccess::from_source_name(name) {
+                    ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Pointer {
+                        access,
+                        pointee: arguments[0].clone(),
+                    }))
                 } else {
                     ResolvedType::Class(ClassType::new(plain.name, arguments))
                 }
@@ -360,7 +397,24 @@ pub struct FunctionTypeRef {
     pub return_type: Box<TypeRef>,
     pub return_type_span: Span,
     pub throws_clause: Option<FunctionTypeThrowsRef>,
+    /// `extern "C" function(...)`: the C function pointer type of Decision
+    /// 0148 section 12, one word and Copy, whose call is unsafe.
+    pub c_abi: Option<CAbiTypeRef>,
     pub span: Span,
+}
+
+/// The ABI string of an `extern` form. `"C"` is the only ABI (Decision 0148
+/// section 14); checking reports any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAbi {
+    pub value: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CAbiTypeRef {
+    pub extern_span: Span,
+    pub abi: ForeignAbi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,8 +526,42 @@ impl TypeRef {
         }
     }
 
+    /// A plain or namespaced name with no arguments, nullability or other
+    /// form, as `T`, `Counter` or `App\Model\User`; a type keyword such as
+    /// `int` is not one.
+    pub fn is_plain_name(&self) -> bool {
+        self.source_name.is_some()
+            && self.arguments.is_empty()
+            && !self.nullable
+            && self.function.is_none()
+            && self.grouped.is_none()
+    }
+
     pub fn array_of(element: TypeRef) -> Self {
         Self::generic("[]", vec![element])
+    }
+
+    /// `T[N]`, the fixed-length array of a foreign aggregate field (Decision
+    /// 0148 section 6): `[]` with the element type and the count as a value
+    /// argument.
+    pub fn fixed_array_of(element: TypeRef, count: String) -> Self {
+        Self::generic_with_arguments(
+            "[]",
+            vec![
+                TypeArgumentRef::Type(element),
+                TypeArgumentRef::Value(count),
+            ],
+        )
+    }
+
+    /// The element type and authored count of a `T[N]` type.
+    pub fn fixed_array_parts(&self) -> Option<(&TypeRef, &str)> {
+        match (self.name.as_str(), self.arguments.as_slice()) {
+            ("[]", [TypeArgumentRef::Type(element), TypeArgumentRef::Value(count)]) => {
+                Some((element, count))
+            }
+            _ => None,
+        }
     }
 
     pub fn unknown() -> Self {
@@ -578,6 +666,7 @@ impl TypeRef {
                             span: clause.span,
                         }
                     }),
+                    c_abi: function.c_abi.clone(),
                     span: function.span,
                 })
             }),
@@ -635,6 +724,9 @@ impl fmt::Display for TypeRef {
                 FunctionInvocationMode::Writable => " writable",
                 FunctionInvocationMode::Once => " once",
             };
+            if let Some(c_abi) = &function.c_abi {
+                write!(formatter, "extern \"{}\" ", c_abi.abi.value)?;
+            }
             write!(
                 formatter,
                 "function{invocation}({parameters}): {}",
@@ -655,6 +747,9 @@ impl fmt::Display for TypeRef {
             if let TypeArgumentRef::Type(element) = &self.arguments[0] {
                 return write!(formatter, "{element}[]");
             }
+        }
+        if let Some((element, count)) = self.fixed_array_parts() {
+            return write!(formatter, "{element}[{count}]");
         }
 
         if self.arguments.is_empty() {
@@ -984,9 +1079,33 @@ impl ByteRegionKind {
             .find(|kind| kind.source_name() == name)
     }
 
+    /// The name of the typed array region with this access (Decision 0148
+    /// section 8): a core type beside `T[]`, spelled with its element.
+    pub const fn array_source_name(self) -> &'static str {
+        match self {
+            Self::Readonly => "ArrayRegion",
+            Self::Writable => "WritableArrayRegion",
+        }
+    }
+
+    pub fn from_array_source_name(name: &str) -> Option<Self> {
+        [Self::Readonly, Self::Writable]
+            .into_iter()
+            .find(|kind| kind.array_source_name() == name)
+    }
+
+    /// The access of a byte region or typed array region type name, as a
+    /// type reference spells it.
+    pub fn from_region_name(name: &str) -> Option<Self> {
+        Self::from_source_name(name).or_else(|| Self::from_array_source_name(name))
+    }
+
+    /// The access of a region type: a byte region or a typed array region,
+    /// which share one borrow model (Decision 0110, generalized by Decision
+    /// 0148 section 8).
     pub(crate) fn from_resolved(ty: &ResolvedType) -> Option<Self> {
         match ty {
-            ResolvedType::ByteRegion(kind) => Some(*kind),
+            ResolvedType::ByteRegion(kind) | ResolvedType::ArrayRegion(kind, _) => Some(*kind),
             ResolvedType::Nullable(inner) => Self::from_resolved(inner),
             _ => None,
         }
@@ -1036,6 +1155,8 @@ pub enum TypeKind {
     Mixed,
     Error,
     TypedArray(TypeId),
+    /// `ArrayRegion<T>` or `WritableArrayRegion<T>` over a `T[]`.
+    ArrayRegion(ByteRegionKind, TypeId),
     Unknown,
     Heterogeneous,
     EmptyCollection,
@@ -1055,6 +1176,9 @@ pub enum TypeKind {
     PriorityQueue(TypeId),
     Deque(TypeId),
     SharedHandle(SharedHandleKind, TypeId),
+    /// A `Doria\Std\Ffi` type, a foreign aggregate or a C function pointer
+    /// type (Decision 0148).
+    Foreign(crate::foreign::ForeignType<TypeId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1078,6 +1202,9 @@ pub enum ResolvedType {
     InterfaceSelf(String),
     TraitSelf(String),
     TypedArray(Box<ResolvedType>),
+    /// `ArrayRegion<T>` or `WritableArrayRegion<T>`: a borrowed view of
+    /// elements of a `T[]` (Decision 0148 section 8).
+    ArrayRegion(ByteRegionKind, Box<ResolvedType>),
     List(Box<ResolvedType>),
     Dictionary(Box<ResolvedType>, Box<ResolvedType>),
     SortedDictionary(Box<ResolvedType>, Box<ResolvedType>),
@@ -1086,6 +1213,7 @@ pub enum ResolvedType {
     PriorityQueue(Box<ResolvedType>),
     Deque(Box<ResolvedType>),
     SharedHandle(SharedHandleKind, Box<ResolvedType>),
+    Foreign(Box<crate::foreign::ForeignType<ResolvedType>>),
     Unsupported,
 }
 
@@ -1119,12 +1247,17 @@ pub(crate) fn resolved_type_is_symbolic(ty: &ResolvedType) -> bool {
         }
         ResolvedType::Nullable(inner)
         | ResolvedType::TypedArray(inner)
+        | ResolvedType::ArrayRegion(_, inner)
         | ResolvedType::List(inner)
         | ResolvedType::Set(inner)
         | ResolvedType::SortedSet(inner)
         | ResolvedType::PriorityQueue(inner)
         | ResolvedType::Deque(inner)
         | ResolvedType::SharedHandle(_, inner) => resolved_type_is_symbolic(inner),
+        ResolvedType::Foreign(foreign) => foreign
+            .components()
+            .into_iter()
+            .any(resolved_type_is_symbolic),
         ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
             resolved_type_is_symbolic(key) || resolved_type_is_symbolic(value)
         }
@@ -1197,6 +1330,14 @@ fn substitute_resolved_type_impl(
         ResolvedType::TypedArray(inner) => ResolvedType::TypedArray(Box::new(
             substitute_resolved_type_impl(inner, substitutions, trait_receiver),
         )),
+        ResolvedType::ArrayRegion(kind, inner) => ResolvedType::ArrayRegion(
+            *kind,
+            Box::new(substitute_resolved_type_impl(
+                inner,
+                substitutions,
+                trait_receiver,
+            )),
+        ),
         ResolvedType::List(inner) => ResolvedType::List(Box::new(substitute_resolved_type_impl(
             inner,
             substitutions,
@@ -1290,6 +1431,11 @@ fn substitute_resolved_type_impl(
                 trait_receiver,
             )),
         ),
+        ResolvedType::Foreign(foreign) => {
+            ResolvedType::Foreign(Box::new(foreign.map(|component| {
+                substitute_resolved_type_impl(component, substitutions, trait_receiver)
+            })))
+        }
         ResolvedType::Enum(enum_type) => ResolvedType::Enum(enum_type.map_arguments(|argument| {
             substitute_resolved_type_impl(argument, substitutions, trait_receiver)
         })),
@@ -1463,6 +1609,7 @@ mod specialization_tests {
             return_type: Box::new(TypeRef::named("T")),
             return_type_span: span,
             throws_clause: None,
+            c_abi: None,
             span,
         });
         let checked = ResolvedType::Function(Box::new(SemanticFunctionType {
@@ -1515,6 +1662,7 @@ mod specialization_tests {
         let constructors: &[fn(ResolvedType) -> ResolvedType] = &[
             |inner| ResolvedType::Nullable(Box::new(inner)),
             |inner| ResolvedType::TypedArray(Box::new(inner)),
+            |inner| ResolvedType::ArrayRegion(ByteRegionKind::Readonly, Box::new(inner)),
             |inner| ResolvedType::List(Box::new(inner)),
             |inner| ResolvedType::Dictionary(Box::new(inner.clone()), Box::new(inner)),
             |inner| ResolvedType::SortedDictionary(Box::new(inner.clone()), Box::new(inner)),
@@ -1613,12 +1761,20 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
     match ty {
         ResolvedType::Nullable(inner)
         | ResolvedType::TypedArray(inner)
+        | ResolvedType::ArrayRegion(_, inner)
         | ResolvedType::List(inner)
         | ResolvedType::Set(inner)
         | ResolvedType::SortedSet(inner)
         | ResolvedType::PriorityQueue(inner)
         | ResolvedType::Deque(inner)
         | ResolvedType::SharedHandle(_, inner) => 1 + resolved_type_complexity(inner),
+        ResolvedType::Foreign(foreign) => {
+            1 + foreign
+                .components()
+                .into_iter()
+                .map(resolved_type_complexity)
+                .sum::<usize>()
+        }
         ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
             1 + resolved_type_complexity(key) + resolved_type_complexity(value)
         }
@@ -1743,6 +1899,9 @@ impl TypeRegistry {
             TypeKind::Mixed => "mixed".to_string(),
             TypeKind::Error => "Error".to_string(),
             TypeKind::TypedArray(element) => format!("{}[]", self.display(*element)),
+            TypeKind::ArrayRegion(kind, element) => {
+                format!("{}<{}>", kind.array_source_name(), self.display(*element))
+            }
             TypeKind::Unknown => "Unknown".to_string(),
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
             TypeKind::EmptyCollection => "[]".to_string(),
@@ -1781,7 +1940,12 @@ impl TypeRegistry {
             TypeKind::SharedHandle(kind, payload) => {
                 format!("{}<{}>", kind.source_name(), self.display(*payload))
             }
+            TypeKind::Foreign(foreign) => self.display_foreign(foreign),
         }
+    }
+
+    fn display_foreign(&self, foreign: &crate::foreign::ForeignType<TypeId>) -> String {
+        foreign.display_with(|component| self.display(*component))
     }
 
     fn display_function(&self, function: &SemanticFunctionType<TypeId>) -> String {
@@ -1879,6 +2043,9 @@ impl TypeRegistry {
             TypeKind::TypedArray(element) => {
                 ResolvedType::TypedArray(Box::new(self.resolved(*element)))
             }
+            TypeKind::ArrayRegion(kind, element) => {
+                ResolvedType::ArrayRegion(*kind, Box::new(self.resolved(*element)))
+            }
             TypeKind::List(element) => ResolvedType::List(Box::new(self.resolved(*element))),
             TypeKind::Dictionary(key, value) => ResolvedType::Dictionary(
                 Box::new(self.resolved(*key)),
@@ -1898,6 +2065,9 @@ impl TypeRegistry {
             TypeKind::Deque(element) => ResolvedType::Deque(Box::new(self.resolved(*element))),
             TypeKind::SharedHandle(kind, payload) => {
                 ResolvedType::SharedHandle(*kind, Box::new(self.resolved(*payload)))
+            }
+            TypeKind::Foreign(foreign) => {
+                ResolvedType::Foreign(Box::new(foreign.map(|component| self.resolved(*component))))
             }
             TypeKind::Unknown | TypeKind::Heterogeneous | TypeKind::EmptyCollection => {
                 ResolvedType::Unsupported
@@ -1970,6 +2140,10 @@ impl TypeRegistry {
                 let element = self.intern_resolved(element);
                 TypeKind::TypedArray(element)
             }
+            ResolvedType::ArrayRegion(kind, element) => {
+                let element = self.intern_resolved(element);
+                TypeKind::ArrayRegion(*kind, element)
+            }
             ResolvedType::List(element) => {
                 let element = self.intern_resolved(element);
                 TypeKind::List(element)
@@ -2003,6 +2177,9 @@ impl TypeRegistry {
             ResolvedType::SharedHandle(kind, payload) => {
                 let payload = self.intern_resolved(payload);
                 TypeKind::SharedHandle(*kind, payload)
+            }
+            ResolvedType::Foreign(foreign) => {
+                TypeKind::Foreign(foreign.map(|component| self.intern_resolved(component)))
             }
             ResolvedType::Unsupported => TypeKind::Unknown,
         };

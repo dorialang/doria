@@ -77,4 +77,5 @@ function main(): void {
     let writable $saved = make(13);
     try { $saved = $failed(); }
     catch (Failure) { echo "caught;" . number($saved) . ";"; }
+    let $last = lastCleanup();
 }

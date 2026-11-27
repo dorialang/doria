@@ -1,6 +1,12 @@
 //! The catalogue's per-code documentation (Decision 0145): every entry is in
 //! the required shape, and its example is a program that raises its code.
 
+#[path = "common/execution_directory.rs"]
+mod execution_directory;
+
+#[path = "common/native_execution_runner.rs"]
+mod native_execution;
+
 use doria_diagnostic_catalogue::explanations::ENTRY_SOURCES;
 use doriac::diagnostic_entries::{self, LookupError};
 
@@ -11,10 +17,11 @@ const CHECKED_CODES_WITHOUT_A_PROGRAM: &[&str] = &[
     // Only ever reported after another error at the same place.
     "E0454", "E0473", "E0633", "E0634", "E0696",
     // Reported when a program is compiled, not when it is checked.
-    "E0505", // Raised only through compiler interfaces that no command reaches.
+    "E0505", "E0784", "E0804", "E0805", "E0817",
+    // Raised only through compiler interfaces that no command reaches.
     "E0673", "E0674", "E0699",
     // Reported for a project's build plan or several of its files.
-    "E0676", "E0677", "E0678", "E0679", "E0680", "E0682", "E0683", "E0684", "E0685",
+    "E0676", "E0677", "E0678", "E0679", "E0680", "E0682", "E0683", "E0684", "E0685", "E0816",
     // Reported only for a test function the compiler itself generates.
     "E0711",
 ];
@@ -45,6 +52,7 @@ fn development_source_diagnostics(source: &str) -> Vec<doriac::diagnostics::Diag
                     SourceScope::Development,
                     SourceScope::Generated,
                 ],
+                windows_subsystem: None,
             },
             packages: vec![Package {
                 identity: PACKAGE.to_string(),
@@ -63,6 +71,8 @@ fn development_source_diagnostics(source: &str) -> Vec<doriac::diagnostics::Diag
                     generated_for: None,
                 }],
                 dependencies: Vec::new(),
+                native_libraries: Vec::new(),
+                unsafe_policy: None,
             }],
             compiler: CompilerOptions {
                 target: CompilerTarget::Debug,
@@ -148,6 +158,25 @@ fn check_entry(entry: &doria_diagnostic_catalogue::explanations::DiagnosticEntry
             .unwrap_or_else(|diagnostics| {
                 panic!("{code}: its example does not compile: {diagnostics:?}")
             });
+        // A panic inside an unsafe region ends the process that hosts the
+        // native companion library (Decision 0148 section 23), so an
+        // example with a region runs in a child process: the native
+        // program, whose report carries the same title.
+        if !program.companion.regions.is_empty() {
+            let run =
+                native_execution::execute_native(&program, doriac::backend::NativeProfile::Fast);
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert_eq!(run.status.code(), Some(101), "{code}: {stderr}");
+            assert!(
+                stderr.contains(code),
+                "{code}: its example ends with {stderr}"
+            );
+            assert!(
+                stderr.contains(entry.title) == entry.title_is_fixed,
+                "{code}: the entry's `Title:` line does not match the report: {stderr}"
+            );
+            return;
+        }
         let output = doriac::mir_interpreter::interpret(&program)
             .unwrap_or_else(|error| panic!("{code}: its example could not be run: {error}"));
         let raised = output.runtime_diagnostic.unwrap_or_else(|| {

@@ -31,6 +31,8 @@ fn graph_package(identity: &str, sources: Vec<Source>, dependencies: Vec<Depende
         }],
         sources,
         dependencies,
+        native_libraries: Vec::new(),
+        unsafe_policy: None,
     }
 }
 
@@ -49,6 +51,7 @@ fn graph_plan(packages: Vec<Package>, entry: &str) -> BuildPlanDocument {
                 kind: TargetKind::Binary,
                 entry_source: Some(entry.to_string()),
                 active_scopes: vec![SourceScope::Main],
+                windows_subsystem: None,
             },
             packages,
             compiler: CompilerOptions {

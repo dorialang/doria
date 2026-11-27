@@ -443,9 +443,7 @@ impl Interpreter<'_> {
             self.io_trace.file_writes += 1;
         }
         if count != 0 {
-            let base = region.source.expect("validated present region");
-            let (entries, _) = self.collection_element_storage(base)?;
-            let entries = entries.borrow();
+            let written = self.region_bytes(region, count)?;
             let contents = self.files.get_mut(&path).expect("open file exists");
             let end = position
                 .checked_add(count)
@@ -460,16 +458,7 @@ impl Interpreter<'_> {
                     }));
                 }
             }
-            for index in 0..count {
-                let LocalValue::Scalar(mir::ScalarValue::Integer(value)) =
-                    entries[base.index + index].1
-                else {
-                    return Err(InterpreterError::new(
-                        "file write region contains a non-byte",
-                    ));
-                };
-                contents[position + index] = value.unsigned_value() as u8;
-            }
+            contents[position..end].copy_from_slice(&written);
             self.file_owners
                 .get_mut(&object)
                 .expect("file owner exists")
@@ -552,17 +541,8 @@ impl Interpreter<'_> {
             Some(requested)
         };
         let count = transferred.unwrap_or(0);
-        let base = region.source.expect("validated present region");
-        let (entries, _) = self.collection_element_storage(base)?;
-        let mut entries = entries.borrow_mut();
-        for index in 0..count {
-            let byte = self.files[&path][position + index];
-            entries[base.index + index].1 = LocalValue::Scalar(mir::ScalarValue::Integer(
-                IntegerValue::from_i128(IntegerType::UInt8, i128::from(byte))
-                    .expect("byte fits uint8"),
-            ));
-        }
-        drop(entries);
+        let read = self.files[&path][position..position + count].to_vec();
+        self.write_region_bytes(region, &read)?;
         self.file_owners
             .get_mut(&object)
             .expect("file owner exists")
@@ -1032,18 +1012,20 @@ function main(): void {}
                     source: Source::File(object),
                     prepared: false,
                     region: ByteRegionValue {
-                        kind: if reading {
+                        kind: mir::RegionType::bytes(if reading {
                             crate::types::ByteRegionKind::Writable
                         } else {
                             crate::types::ByteRegionKind::Readonly
-                        },
-                        nullable: false,
-                        source: Some(CollectionElementPlace {
-                            collection: 1,
-                            generation: 0,
-                            index: 0,
-                            ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
                         }),
+                        nullable: false,
+                        source: Some(super::byte_region::RegionSource::Elements(
+                            CollectionElementPlace {
+                                collection: 1,
+                                generation: 0,
+                                index: 0,
+                                ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                            },
+                        )),
                         length: 4,
                     },
                 });

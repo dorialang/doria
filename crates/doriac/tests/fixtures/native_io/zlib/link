@@ -1,0 +1,9 @@
+# How each host links the package's `zlib` library, as its Baton.toml
+# `[native-libraries.zlib]` table resolves it (Decision 0148 sections 18
+# and 19). Windows paths are relative to the package root, which holds
+# zlib's import library and DLL under native/windows.
+linux --link-library zlib=z
+macos --link-library zlib=z
+windows --link-library zlib=zlib
+windows --link-search zlib=native/windows/lib
+windows --runtime-file zlib=native/windows/bin/zlib1.dll

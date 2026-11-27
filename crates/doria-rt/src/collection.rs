@@ -760,6 +760,43 @@ pub unsafe fn length(collection: *const DrCollectionV1) -> usize {
     (*collection).length
 }
 
+/// The element storage of a typed array and its element stride, for the
+/// typed array regions that view it (Decision 0148 section 8). A typed
+/// array is fixed-length and never rotates, so its elements are contiguous
+/// from the first.
+/// Replaces the elements of the typed array `collection` with `length`
+/// elements copied from `data`, each `value_stride` bytes in their C
+/// layout: a companion slot's buffer (Decision 0148 section 23).
+///
+/// # Safety
+///
+/// `collection` is a live typed array whose elements need no cleanup, and
+/// `data` addresses `length` of its elements.
+pub(crate) unsafe fn replace_elements(
+    frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    data: *const u8,
+    length: usize,
+) {
+    index_discard(collection);
+    let stride = (*collection).value_stride;
+    let values = allocate_values_with_frame(frame, length, stride);
+    if length != 0 {
+        ptr::copy_nonoverlapping(data, values, length * stride);
+    }
+    if !(*collection).values.is_null() {
+        deallocate((*collection).values);
+    }
+    (*collection).values = values;
+    (*collection).length = length;
+    (*collection).capacity = length;
+}
+
+pub(crate) unsafe fn element_storage(collection: *const DrCollectionV1) -> (*mut u8, usize) {
+    debug_assert!((*collection).kind != KIND_DEQUE || (*collection).head == 0);
+    ((*collection).values, (*collection).value_stride)
+}
+
 pub(crate) unsafe fn assertion_value_at(
     collection: *const DrCollectionV1,
     index: usize,

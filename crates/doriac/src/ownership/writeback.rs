@@ -16,8 +16,6 @@ pub(crate) struct Effect {
     pub home: Home,
     pub value: Home,
     pub site: Span,
-    // Named generic Copy parameters retain local value semantics.
-    pub move_condition: Option<ResolvedType>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -386,6 +384,15 @@ impl Checker<'_> {
                         .get(&id)
                         .and_then(|d| d.source_type.as_ref());
                     if declared == self.resolved_type(expression) {
+                        // A Copy value is exactly its declared type, which is the
+                        // type its argument was given at the call, a contextually
+                        // typed literal included.
+                        if let Some(declared) = declared.filter(|ty| {
+                            !resolved_type_is_move_type(ty, &self.move_enum_names)
+                                && !resolved_type_requires_conservative_move(ty)
+                        }) {
+                            return vec![Home::Typed(declared.clone())];
+                        }
                         return vec![Home::Input(BorrowSource::Parameter(index))];
                     }
                 }
@@ -450,44 +457,18 @@ impl Checker<'_> {
         }
         let homes = self.writeback_binding_homes(binding);
         let values = self.writeback_values(value, scopes);
-        let move_condition = self
-            .retained
-            .current
-            .as_ref()
-            .filter(|current| !current.closure)
-            .and(binding.canonical_id)
-            .and_then(|id| self.binding_resolution.declarations_by_id.get(&id))
-            .and_then(|declaration| declaration.source_type.clone());
+        // A writable parameter of any type lends the caller's place, so each
+        // write reaches it (Andrew's ruling of 2026-11-21, "Writable always
+        // borrows (Recommended)").
         for home in homes {
             for value in &values {
-                self.record_writeback_effect(
-                    home.clone(),
-                    value.clone(),
-                    site,
-                    site,
-                    move_condition.clone(),
-                );
+                self.record_writeback_effect(home.clone(), value.clone(), site, site);
             }
         }
     }
 
-    fn record_writeback_effect(
-        &mut self,
-        home: Home,
-        value: Home,
-        site: Span,
-        write_site: Span,
-        mut move_condition: Option<ResolvedType>,
-    ) {
-        if let Some(ty) = &move_condition {
-            if !resolved_type_requires_conservative_move(ty) {
-                if !resolved_type_is_move_type(ty, &self.move_enum_names) {
-                    return;
-                }
-                move_condition = None;
-            }
-        }
-        if let (Home::Typed(home), Home::Typed(value), None) = (&home, &value, &move_condition) {
+    fn record_writeback_effect(&mut self, home: Home, value: Home, site: Span, write_site: Span) {
+        if let (Home::Typed(home), Home::Typed(value)) = (&home, &value) {
             append(
                 &mut self.writeback.constraints,
                 &[Constraint {
@@ -510,7 +491,6 @@ impl Checker<'_> {
                     home,
                     value,
                     site: write_site,
-                    move_condition,
                 }],
             );
         }
@@ -548,10 +528,6 @@ impl Checker<'_> {
                 .map(|s| s.for_callers().writeback.clone())
                 .unwrap_or_default();
             for effect in summary.writes {
-                let move_condition = effect
-                    .move_condition
-                    .as_ref()
-                    .map(|ty| self.substitute_writeback_type(ty, site, signature));
                 let homes = self.instantiate_writeback_home(
                     &effect.home,
                     site,
@@ -579,7 +555,6 @@ impl Checker<'_> {
                             value.clone(),
                             site,
                             effect.site,
-                            move_condition.clone(),
                         );
                     }
                 }
@@ -732,18 +707,9 @@ impl Checker<'_> {
                     };
                     let mut effects = Vec::new();
                     for effect in summary.writes {
-                        let move_condition = effect
-                            .move_condition
-                            .as_ref()
-                            .map(|ty| self.substitute_writeback_type(ty, site, &signature));
                         for home in resolve_home(&effect.home, false) {
                             for value in resolve_home(&effect.value, true) {
-                                effects.push((
-                                    home.clone(),
-                                    value,
-                                    effect.site,
-                                    move_condition.clone(),
-                                ));
+                                effects.push((home.clone(), value, effect.site));
                             }
                         }
                     }
@@ -778,8 +744,8 @@ impl Checker<'_> {
                             });
                         }
                     }
-                    for (home, value, write_site, move_condition) in effects {
-                        self.record_writeback_effect(home, value, site, write_site, move_condition);
+                    for (home, value, write_site) in effects {
+                        self.record_writeback_effect(home, value, site, write_site);
                     }
                 }
                 Callable::Unknown => {
@@ -799,7 +765,6 @@ impl Checker<'_> {
                                     Home::Typed(parameter.ty.clone()),
                                     site,
                                     invocation.site,
-                                    None,
                                 );
                             }
                         }

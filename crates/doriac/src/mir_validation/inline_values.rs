@@ -142,6 +142,7 @@ mod tests {
             writable: false,
             owned: true,
             synthetic: true,
+            binding: None,
         });
         function
     }

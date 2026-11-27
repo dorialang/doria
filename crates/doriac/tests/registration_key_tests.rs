@@ -537,9 +537,9 @@ function main(): void { echo optional() == null; }
         );
     }
     for name in ["ReadTransferKey", "WriteTransferKey"] {
-        let program = doriac::lower_source_to_mir(
+        let program = doriac::lower_library_source_to_mir(
             "transfer-key-shape.doria",
-            format!("use Doria\\Std\\Io\\{name}; function forward({name} $key): {name} {{ return $key; }} function main(): void {{}}"),
+            format!("use Doria\\Std\\Io\\{name}; function forward({name} $key): {name} {{ return $key; }}"),
         )
         .unwrap();
         let class = program

@@ -22,6 +22,7 @@ use crate::types::{ResolvedType, TypeRef};
 
 mod assignment_place;
 mod bytes;
+mod companion;
 mod concurrency;
 mod core_collection;
 mod core_value;
@@ -513,7 +514,7 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
             "\n\nWhy\n  " . __doria_safe_error_message($error->message) .
             "\n\nProcess Exited With Status 70\n";
         __doria_terminal_ending();
-        @fwrite(STDERR, $message);
+        @fwrite(__DORIA_STDERR, $message);
         $caught->dropError();
         exit(70);
     }
@@ -530,7 +531,7 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
         __doria_safe_error_message($error->message) .
         "\n\nProcess Exited With Status 70\n";
     __doria_terminal_ending();
-    @fwrite(STDERR, $message);
+    @fwrite(__DORIA_STDERR, $message);
     $caught->dropError();
     exit(70);
 }
@@ -1479,10 +1480,7 @@ fn emit_php_closure_carrier(
                     .return_borrow
                     .is_some_and(|borrow| borrow.kind == mir::ReturnBorrowKind::Value)
                     && ty.has_move_ownership()
-                    && !matches!(
-                        ty,
-                        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
-                    )
+                    && !matches!(ty, mir::Type::Region(_) | mir::Type::NullableRegion(_))
                 {
                     "__DoriaCell"
                 } else {
@@ -1615,8 +1613,8 @@ fn php_mir_type(
 ) -> String {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(_)) => "int".to_string(),
-        mir::Type::ByteRegion(_) => "__DoriaByteRegion".to_string(),
-        mir::Type::NullableByteRegion(_) => "?__DoriaByteRegion".to_string(),
+        mir::Type::Region(_) => "__DoriaByteRegion".to_string(),
+        mir::Type::NullableRegion(_) => "?__DoriaByteRegion".to_string(),
         mir::Type::Scalar(mir::ScalarType::Float(_)) => "float".to_string(),
         mir::Type::Scalar(mir::ScalarType::Bool) => "bool".to_string(),
         mir::Type::Scalar(mir::ScalarType::Enum(id)) => specialization.enum_symbol_by_id(id),
@@ -1648,6 +1646,11 @@ fn php_mir_type(
         }
         mir::Type::Function(_) => "__DoriaFunctionValue".to_string(),
         mir::Type::NullableFunction(_) => "?__DoriaFunctionValue".to_string(),
+        // PHP output reports every foreign-typed expression before it
+        // reaches MIR types (Decision 0148 section 23).
+        mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_) => {
+            unreachable!("PHP output reports foreign structs and unions first")
+        }
         mir::Type::Collection(id) | mir::Type::NullableCollection(id) => {
             let nullable = matches!(ty, mir::Type::NullableCollection(_));
             let definition = &program.collection_types[id.0];
@@ -1686,10 +1689,10 @@ fn php_mir_type(
 }
 
 pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String, BackendError> {
-    match generate_artifact(program, mir)? {
-        BackendOutput::Text { contents, .. } | BackendOutput::TextWithRuntime { contents, .. } => {
-            Ok(contents)
-        }
+    match generate_artifact(program, mir, &crate::native_link::NativeLinking::default())? {
+        BackendOutput::Text { contents, .. }
+        | BackendOutput::TextWithRuntime { contents, .. }
+        | BackendOutput::TextWithCompanion { contents, .. } => Ok(contents),
         _ => unreachable!("PHP emission always produces text"),
     }
 }
@@ -1697,14 +1700,20 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
 pub fn generate_artifact(
     program: &Program,
     mir: Option<&mir::Program>,
+    linking: &crate::native_link::NativeLinking,
 ) -> Result<BackendOutput, BackendError> {
     let mut closure_plan = PhpClosurePlan::build(program, mir);
     let specialization = Rc::new(specialization::Plan::build(program, &closure_plan)?);
     validate_program(program, &specialization)?;
     specialization.prepare_call_sites(&mut closure_plan, &HashMap::new());
-    let runtime = (native_runtime::required(program) || specialization.native_standard_io)
-        .then(crate::runtime_artifact::shared_runtime_dependency)
-        .transpose()?;
+    // A program with unsafe regions runs them in its native companion
+    // library, which links the shared runtime (Decision 0148 section 23).
+    let companion = companion::Sites::build(program, mir)?;
+    let runtime = (native_runtime::required(program)
+        || specialization.native_standard_io
+        || companion.is_some())
+    .then(crate::runtime_artifact::shared_runtime_dependency)
+    .transpose()?;
     for descriptor in closure_plan.descriptors.values_mut() {
         let class = match descriptor.source_instance {
             mir::ClosureOwner::Callable(id) => specialization.callable(id).class,
@@ -1717,7 +1726,7 @@ pub fn generate_artifact(
     let closure_plan = Rc::new(closure_plan);
 
     let mut output = String::from(
-        "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function &value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    if (is_float($value)) { throw new LogicException(\"compiler float display has no width\"); }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
+        "<?php\n\n// Decision 0148 section 21: a standard stream the process started without\n// is the null device, so writing discards, reading reports end of input and\n// no file the program opens takes its place. PHP opens its random device and\n// its scripts before this runs, each on the lowest free descriptor, so a\n// standard descriptor that holds one of them was absent at start.\nfunction __doria_standard_stream(int $descriptor, string $name, string $mode)\n{\n    global $__doria_reserved_streams;\n    $probe = @fopen('php://fd/' . $descriptor, 'rb');\n    $present = $probe !== false;\n    if ($probe !== false) {\n        $stat = @fstat($probe);\n        foreach ([...get_included_files(), '/dev/urandom', '/dev/random'] as $file) {\n            $script = @stat($file);\n            if ($stat !== false && $script !== false && $stat['dev'] === $script['dev'] &&\n                $stat['ino'] === $script['ino']) { $present = false; }\n        }\n        fclose($probe);\n    }\n    if ($present && defined($name)) { return constant($name); }\n    // The shared runtime gives the null device only to a stream absent now.\n    global $__doria_absent_streams;\n    if (!$present) { $__doria_absent_streams |= 1 << $descriptor; }\n    $null = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';\n    // Opening takes the lowest free descriptor, so a closed standard one is\n    // filled before any file the program opens.\n    for ($attempt = 0; $attempt < 3; $attempt++) {\n        $open = @fopen('php://fd/' . $descriptor, 'rb');\n        if ($open !== false) { fclose($open); break; }\n        $__doria_reserved_streams[] = fopen($null, 'r+b');\n    }\n    return fopen($null, $mode);\n}\n\n$__doria_reserved_streams = [];\n$__doria_absent_streams = 0;\ndefine('__DORIA_STDIN', __doria_standard_stream(0, 'STDIN', 'rb'));\ndefine('__DORIA_STDOUT', __doria_standard_stream(1, 'STDOUT', 'wb'));\ndefine('__DORIA_STDERR', __doria_standard_stream(2, 'STDERR', 'wb'));\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function &value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    if (is_float($value)) { throw new LogicException(\"compiler float display has no width\"); }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
     );
     value_result::emit_runtime(program, &mut output, &specialization);
     emit_primitive_comparison_runtime(&mut output);
@@ -1738,6 +1747,9 @@ pub fn generate_artifact(
     output.push_str(core_collection::RUNTIME);
     if let Some(runtime) = &runtime {
         native_runtime::emit(&mut output, program, runtime);
+    }
+    if let Some(sites) = &companion {
+        companion::emit_runtime(&mut output, program, sites)?;
     }
     standard_io::emit_runtime(&mut output, runtime.is_some());
     bytes::emit_runtime(&mut output, runtime.is_some());
@@ -1819,6 +1831,7 @@ function __doria_panic(
     ?string $callable = null,
     array $facts = [],
     ?array $operation = null,
+    ?array $frames = null,
 )
 {
     global $__doria_catalogue, $__doria_panicking;
@@ -1836,7 +1849,8 @@ function __doria_panic(
     if (!$site["known"]) { $sourcePath = "<source unavailable>"; }
     // Primary labels and operation frames are separate compiler-owned spans.
     // Human rendering and private V2 transport consume this same snapshot.
-    $frames = __doria_panic_frames($operation ?? $site);
+    // A panic the native companion reports carries its own native frames.
+    $frames ??= __doria_panic_frames($operation ?? $site);
     $function = $callable ?? "main";
     if ($callable === null && isset($frames[0])) {
         $function = $frames[0][0];
@@ -1846,22 +1860,33 @@ function __doria_panic(
         $channel, $code, $message, $site, $function, $facts, $frames,
     )) {
         $__doria_panicking = true;
-        exit(101);
+        __doria_end_panic();
     }
     __doria_terminal_ending();
-    @fwrite(STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
-    @fwrite(STDERR, $sourcePath . " · line " . $line . " · " . $function . "\n");
-    @fwrite(STDERR, __doria_source_excerpt($site, $label));
-    @fwrite(STDERR, "\n\nWhy\n" . $why);
+    @fwrite(__DORIA_STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
+    @fwrite(__DORIA_STDERR, $sourcePath . " · line " . $line . " · " . $function . "\n");
+    @fwrite(__DORIA_STDERR, __doria_source_excerpt($site, $label));
+    @fwrite(__DORIA_STDERR, "\n\nWhy\n" . $why);
     if ($code === "P1000" && $message !== null) {
-        @fwrite(STDERR, "\n\nNote\n" . $message);
+        @fwrite(__DORIA_STDERR, "\n\nNote\n" . $message);
     }
-    @fwrite(STDERR, "\n\nCall Path");
+    @fwrite(__DORIA_STDERR, "\n\nCall Path");
     foreach ($frames as [$name, $framePath, $frameStart, $frameEnd, $frameLine]) {
-        @fwrite(STDERR, "\n" . $name . " · " . $framePath . ":" . $frameLine);
+        @fwrite(__DORIA_STDERR, "\n" . $name . " · " . $framePath . ":" . $frameLine);
     }
-    @fwrite(STDERR, "\n\nProcess Exited With Status 101\n");
+    @fwrite(__DORIA_STDERR, "\n\nProcess Exited With Status 101\n");
     $__doria_panicking = true;
+    __doria_end_panic();
+}
+
+// PHP cannot unwind through the native companion library, so a panic during
+// a region call ends the process through the shared runtime (Decision 0148
+// section 23).
+function __doria_end_panic(): never
+{
+    if (class_exists("__DoriaCompanion", false) && __DoriaCompanion::active()) {
+        __DoriaCompanion::endProcess(101);
+    }
     exit(101);
 }
 
@@ -1872,7 +1897,7 @@ function __doria_read_line(string $prompt, int $start, int $end, string $callabl
     }
     if ($prompt !== "") {
         __doria_write_all(
-            STDOUT,
+            __DORIA_STDOUT,
             $prompt,
             $start,
             $end,
@@ -1883,9 +1908,9 @@ function __doria_read_line(string $prompt, int $start, int $end, string $callabl
     }
     __doria_flush_stdout($start, $end, $callable);
     error_clear_last();
-    $line = @fgets(STDIN);
+    $line = @fgets(__DORIA_STDIN);
     if ($line === false) {
-        if (feof(STDIN)) { return null; }
+        if (feof(__DORIA_STDIN)) { return null; }
         __doria_throw_io(
             __DoriaStdIoIoOperation::Read,
             __DoriaStdIoIoTarget::__doriaCaseStandardInput(),
@@ -2299,7 +2324,7 @@ function __doria_write_all(
 function __doria_flush_stdout(int $start, int $end, string $callable): void
 {
     error_clear_last();
-    if (@fflush(STDOUT)) { return; }
+    if (@fflush(__DORIA_STDOUT)) { return; }
     if (__doria_is_broken_pipe(error_get_last())) { exit(0); }
     __doria_throw_io(
         __DoriaStdIoIoOperation::Flush,
@@ -2317,7 +2342,7 @@ function __doria_write_stdout(string $value, int $start, int $end, string $calla
         return;
     }
     __doria_write_all(
-        STDOUT,
+        __DORIA_STDOUT,
         $value,
         $start,
         $end,
@@ -2334,7 +2359,7 @@ function __doria_write_stderr(string $value, int $start, int $end, string $calla
         return;
     }
     __doria_write_all(
-        STDERR,
+        __DORIA_STDERR,
         $value,
         $start,
         $end,
@@ -2538,8 +2563,10 @@ function __doria_printf(
         .and_then(|program| program.selected_entry)
         .map(mir::ClosureOwner::Callable);
     scopes.matches = program.semantic_info.matches.clone();
+    scopes.companion = companion.clone();
     scopes.specialization = specialization;
     scopes.whens = program.semantic_info.whens.clone();
+    scopes.constant_conditions = Rc::new(program.semantic_info.constant_conditions.clone());
     scopes.given_preludes = program.semantic_info.given_preludes.clone();
     scopes.expression_types = php_expression_types(&program.semantic_info);
     scopes.flow_facts = Rc::new(program.semantic_info.flow_facts.clone());
@@ -2629,13 +2656,23 @@ function __doria_printf(
         }
         output.push_str("\n}\n");
     }
-    Ok(match runtime {
-        Some(runtime) => BackendOutput::TextWithRuntime {
+    Ok(match (runtime, companion) {
+        (Some(runtime), Some(sites)) => BackendOutput::TextWithCompanion {
+            extension: "php".into(),
+            contents: output,
+            runtime: Box::new(runtime),
+            companion: Box::new(crate::backend::CompanionBuild {
+                program: sites.program().clone(),
+                profile: crate::backend::NativeProfile::Fast,
+                linking: linking.clone(),
+            }),
+        },
+        (Some(runtime), None) => BackendOutput::TextWithRuntime {
             extension: "php".into(),
             contents: output,
             runtime: Box::new(runtime),
         },
-        None => BackendOutput::Text {
+        (None, _) => BackendOutput::Text {
             extension: "php".into(),
             contents: output,
         },
@@ -2722,6 +2759,26 @@ impl<'a> PhpValidation<'a> {
 }
 
 fn validate_program(program: &Program, plan: &specialization::Plan) -> Result<(), BackendError> {
+    // A constant or static holding a foreign struct or union is C data,
+    // which PHP output takes through the native companion library.
+    let mut aggregates = program
+        .semantic_info
+        .const_evaluation
+        .values
+        .values()
+        .filter_map(|decl| {
+            decl.value
+                .foreign_aggregate()
+                .map(|value| (decl.span, value.aggregate.clone()))
+        })
+        .collect::<Vec<_>>();
+    aggregates.sort_by_key(|(span, _)| (span.source.0, span.start));
+    if let Some((span, aggregate)) = aggregates.into_iter().next() {
+        foreign_value(
+            &ResolvedType::Foreign(Box::new(crate::foreign::ForeignType::Aggregate(aggregate))),
+            span,
+        )?;
+    }
     let empty = HashMap::new();
     let context = PhpValidation::new(&program.semantic_info, plan, &empty);
     for item in &program.items {
@@ -2866,6 +2923,11 @@ fn validate_function(
             "compiler invariant violated: invalid lifecycle method `{}` reached PHP emission after semantic validation",
             function.name
         )));
+    }
+    // An extern declaration's function runs in the native companion
+    // library (Decision 0148 section 23); PHP output emits none of it.
+    if function.foreign {
+        return Ok(());
     }
     for (parameter_index, param) in function.params.iter().enumerate() {
         validate_type(&param.ty, param.span, semantic_info)?;
@@ -3094,6 +3156,16 @@ fn validate_statement(
     semantic_info: &PhpValidation<'_>,
 ) -> Result<(), BackendError> {
     match statement {
+        // Unsafe code runs in the native companion library, which the
+        // native backends build (Decision 0148 section 23).
+        Stmt::Block(block)
+            if semantic_info
+                .semantic
+                .unsafe_contexts
+                .contains_key(&block.span) =>
+        {
+            Ok(())
+        }
         Stmt::Block(block) => validate_block(block, semantic_info),
         Stmt::VarDecl(decl) => {
             if let Some(ty) = &decl.ty {
@@ -3169,7 +3241,9 @@ fn validate_statement(
                     .is_some_and(|ty| {
                         matches!(
                             ty,
-                            ResolvedType::SortedDictionary(_, _) | ResolvedType::Deque(_)
+                            ResolvedType::SortedDictionary(_, _)
+                                | ResolvedType::Deque(_)
+                                | ResolvedType::ByteRegion(_)
                         ) || core_collection::uses_receiver(ty)
                     });
                 if !supported {
@@ -3327,7 +3401,27 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
         );
     }
     if let Some(ty) = semantic_info.expression_type(expr.span()) {
+        foreign_value(ty, expr.span())?;
+        array_region_value(ty, expr.span())?;
         enum_core::validate_collection(ty, expr.span())?;
+    }
+    if let Expr::StaticMember {
+        class_name, span, ..
+    } = expr
+    {
+        if semantic_info
+            .semantic
+            .foreign_aggregates
+            .contains_key(class_name)
+        {
+            return Err(BackendError::from_diagnostics(vec![
+                crate::unsafe_code::companion_form(
+                    *span,
+                    "Foreign Layouts Cannot Be Built For PHP Output Yet",
+                    "the size and alignment of a foreign struct or union are part of Doria; PHP output does not build them yet",
+                ),
+            ]));
+        }
     }
     match expr {
         Expr::Assertion(assertion) => {
@@ -3574,6 +3668,9 @@ fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), B
             validate_arguments(args, semantic_info)
         }
         Expr::StaticMember { .. } => Ok(()),
+        Expr::Grouped { span, .. } if semantic_info.semantic.unsafe_contexts.contains_key(span) => {
+            Ok(())
+        }
         Expr::Grouped { expr, .. } => validate_expr(expr, semantic_info),
         Expr::IsType { expr, ty, span } => {
             validate_expr(expr, semantic_info)?;
@@ -4059,6 +4156,60 @@ fn unsupported_collection_shape(span: Span, feature: impl Into<String>) -> Backe
     )])
 }
 
+/// PHP output does not build typed array regions (Decision 0148 section 8)
+/// yet; byte regions build.
+fn array_region_value(ty: &ResolvedType, span: Span) -> Result<(), BackendError> {
+    let region = match ty {
+        ResolvedType::Nullable(inner) => inner.as_ref(),
+        ty => ty,
+    };
+    match region {
+        ResolvedType::ArrayRegion(..) => Err(unsupported_collection_shape(
+            span,
+            "typed array regions (`ArrayRegion<T>` and `WritableArrayRegion<T>`)",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// PHP output runs unsafe code, and takes the target's C data model,
+/// through the native companion library (Decision 0148 section 23), which
+/// this compiler does not build yet.
+fn foreign_value(ty: &ResolvedType, span: Span) -> Result<(), BackendError> {
+    let foreign = match ty {
+        ResolvedType::Foreign(foreign) => foreign,
+        ResolvedType::Nullable(inner) => match inner.as_ref() {
+            ResolvedType::Foreign(foreign) => foreign,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let (title, values) = match foreign.as_ref() {
+        crate::foreign::ForeignType::Boundary(_) => (
+            "C Boundary Values Cannot Be Built For PHP Output Yet",
+            "C boundary values",
+        ),
+        crate::foreign::ForeignType::Pointer { .. } | crate::foreign::ForeignType::Function(_) => {
+            ("Pointers Cannot Be Built For PHP Output Yet", "pointers")
+        }
+        crate::foreign::ForeignType::OwnedString(_) => (
+            "Foreign Strings Cannot Be Built For PHP Output Yet",
+            "`CString` and `Utf16String` values",
+        ),
+        _ => (
+            "Foreign Values Cannot Be Built For PHP Output Yet",
+            "foreign structs and unions",
+        ),
+    };
+    Err(BackendError::from_diagnostics(vec![
+        crate::unsafe_code::companion_form(
+            span,
+            title,
+            format!("{values} are part of Doria; PHP output does not build them yet"),
+        ),
+    ]))
+}
+
 fn php_widening_integer_conversion(
     class_name: &str,
     method: &str,
@@ -4150,6 +4301,8 @@ struct PhpNameScopes {
     payload_case_tags: HashMap<crate::enums::EnumCaseSource, u32>,
     matches: HashMap<Span, MatchSemanticInfo>,
     whens: HashMap<Span, WhenSemanticInfo>,
+    /// Branch conditions checking found constant (Decision 0148 section 17).
+    constant_conditions: Rc<HashMap<Span, bool>>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     expression_types: HashMap<Span, ResolvedType>,
     flow_facts: Rc<crate::narrowing::FactsByUse>,
@@ -4175,6 +4328,8 @@ struct PhpNameScopes {
     file_payload: bool,
     readiness_set_payload: bool,
     specialization: Rc<specialization::Plan>,
+    /// The native companion plan of a program with unsafe regions.
+    companion: Option<Rc<companion::Sites>>,
     substitutions: HashMap<String, ResolvedType>,
     // The enum specialization whose PHP class is being emitted.
     enum_instance: Option<crate::enums::EnumType>,
@@ -4271,6 +4426,7 @@ impl PhpNameScopes {
             payload_case_tags: HashMap::new(),
             matches: HashMap::new(),
             whens: HashMap::new(),
+            constant_conditions: Rc::default(),
             given_preludes: HashMap::new(),
             expression_types: HashMap::new(),
             flow_facts: Rc::default(),
@@ -4294,6 +4450,7 @@ impl PhpNameScopes {
             file_payload: false,
             readiness_set_payload: false,
             specialization: Rc::default(),
+            companion: None,
             substitutions: HashMap::new(),
             enum_instance: None,
             returns_borrow: false,
@@ -4315,9 +4472,11 @@ impl PhpNameScopes {
         let mut scopes = Self::new(self.symbols.clone(), Rc::clone(&self.closure_plan));
         scopes.diagnostic_sites = Rc::clone(&self.diagnostic_sites);
         scopes.core_helpers = Rc::clone(&self.core_helpers);
+        scopes.companion = self.companion.clone();
         scopes.payload_case_tags = self.payload_case_tags.clone();
         scopes.matches = self.matches.clone();
         scopes.whens = self.whens.clone();
+        scopes.constant_conditions = Rc::clone(&self.constant_conditions);
         scopes.given_preludes = self.given_preludes.clone();
         scopes.expression_types = self.expression_types.clone();
         scopes.flow_facts = Rc::clone(&self.flow_facts);
@@ -4926,20 +5085,28 @@ fn emit_class(
         .iter()
         .filter(|class| class.declaration_name == class_decl.name)
     {
-        let mut scopes =
-            if crate::inline_value::InlineValueKind::for_name(&class_decl.name).is_some() {
-                scopes.expression_scope()
-            } else {
-                let constructor = scopes
-                    .specialization
-                    .callables
-                    .iter()
-                    .find(|callable| {
-                        callable.class == Some(class.id) && callable.symbol == "__construct"
-                    })
-                    .expect("each owned class has a checked constructor instance");
+        // An inline value has no constructor instance, and neither has a
+        // class reachable code never constructs (Decision 0148 section 17):
+        // only its static members and reachable static methods are emitted.
+        let constructor =
+            scopes.specialization.callables.iter().find(|callable| {
+                callable.class == Some(class.id) && callable.symbol == "__construct"
+            });
+        let mut scopes = match constructor {
+            Some(constructor)
+                if crate::inline_value::InlineValueKind::for_name(&class_decl.name).is_none() =>
+            {
                 scopes.specialization.scope(scopes, constructor)
-            };
+            }
+            _ => {
+                assert!(
+                    crate::inline_value::InlineValueKind::for_name(&class_decl.name).is_some()
+                        || !semantic_info.reachable.constructs(&class_decl.name),
+                    "each constructed class has a checked constructor instance"
+                );
+                scopes.expression_scope()
+            }
+        };
         scopes.current_class_id = Some(class.id);
         emit_class_instance(class_decl, semantic_info, output, indent, &scopes);
     }
@@ -5053,7 +5220,13 @@ fn emit_class_instance(
         .classes
         .iter()
         .find(|class| Some(class.id) == scopes.current_class_id);
-    let is_error = checked_class.is_some_and(|class| class.implements(BuiltinInterface::Error));
+    // Interface implementations, Error's included, are emitted when
+    // reachable code constructs or names the class (Decision 0148 section 17).
+    let implementations_reached = semantic_info
+        .reachable
+        .reaches_implementations(&class_decl.name);
+    let is_error = checked_class.is_some_and(|class| class.implements(BuiltinInterface::Error))
+        && implementations_reached;
     let class_type = crate::types::ClassType::new(
         class_decl.name.clone(),
         checked_class.unwrap().arguments.clone(),
@@ -5074,6 +5247,11 @@ fn emit_class_instance(
     }
     if is_error {
         interfaces.push("__DoriaErrorValue".to_string());
+    }
+    // A class reachable code neither constructs nor names implements nothing
+    // (Decision 0148 section 17).
+    if !implementations_reached {
+        interfaces.clear();
     }
     interfaces.sort();
     interfaces.dedup();
@@ -5451,7 +5629,12 @@ fn emit_class_instance(
         }
         output.push('\n');
     }
-    if !has_constructor && (!instance_initializers.is_empty() || parent_has_constructor) {
+    // A class reachable code never constructs has no generated constructor
+    // (Decision 0148 section 17).
+    if !has_constructor
+        && (!instance_initializers.is_empty() || parent_has_constructor)
+        && semantic_info.reachable.constructs(&class_decl.name)
+    {
         let mut constructor_scopes = scopes.expression_scope();
         constructor_scopes.current_callable = Some(format!("{}::__construct", class_decl.name));
         let parent_completed = parent_has_destructor
@@ -6144,6 +6327,9 @@ fn emit_const_value(value: &ConstValue, plan: &specialization::Plan) -> String {
                     .join(", ")
             )
         }
+        ConstValue::ForeignAggregate(_) => {
+            unreachable!("PHP validation reports constant foreign structs and unions, which PHP output takes through the native companion library")
+        }
     }
 }
 
@@ -6203,6 +6389,11 @@ fn emit_function(
     shared_scopes: &PhpNameScopes,
     emission: PhpFunctionEmission<'_>,
 ) {
+    // The native companion library holds every extern declaration's
+    // function (Decision 0148 section 23).
+    if function.foreign {
+        return;
+    }
     for callable in shared_scopes
         .specialization
         .callables
@@ -7292,7 +7483,11 @@ fn emit_statement_inner(
     scopes: &mut PhpNameScopes,
 ) {
     match statement {
-        Stmt::Block(block) => emit_block(block, output, indent, scopes),
+        Stmt::Block(block) => {
+            if !companion::emit_region_block(block, output, indent, scopes) {
+                emit_block(block, output, indent, scopes);
+            }
+        }
         Stmt::VarDecl(decl) => {
             if value_result::emit_local(decl, output, indent, scopes) {
                 return;
@@ -7511,7 +7706,13 @@ fn emit_statement_inner(
                 emit_assertion_statement(assertion, output, indent, scopes);
                 return;
             }
-            if let Expr::FunctionCall { name, args, span } = expr {
+            if companion::emit_region_expression_statement(expr, output, indent, scopes) {
+                return;
+            }
+            if let Expr::FunctionCall {
+                name, args, span, ..
+            } = expr
+            {
                 if name == "panic" && args.len() == 1 {
                     emit_panic(&args[0].value, *span, output, indent, scopes);
                     return;
@@ -8328,11 +8529,13 @@ fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bo
         ResolvedType::Nullable(inner) => resolved_type_needs_php_drop(inner, scopes),
         ResolvedType::Void
         | ResolvedType::ByteRegion(_)
+        | ResolvedType::ArrayRegion(..)
         | ResolvedType::Integer(_)
         | ResolvedType::Float(_)
         | ResolvedType::String
         | ResolvedType::Bool
         | ResolvedType::Null
+        | ResolvedType::Foreign(_)
         | ResolvedType::Unsupported => false,
     }
 }
@@ -9079,8 +9282,33 @@ fn emit_if(
     gate: Option<&str>,
     scopes: &mut PhpNameScopes,
 ) {
-    let condition = emit_condition(&if_stmt.condition, gate, output, indent, scopes);
-    writeln(output, indent, &format!("if ({condition})"));
+    // Decision 0148 section 17: a branch whose condition is constant false
+    // is not emitted. A failed `given` gate still reaches the else branch.
+    match scopes
+        .constant_conditions
+        .get(&if_stmt.condition.span())
+        .copied()
+    {
+        Some(false) => {
+            match &if_stmt.else_branch {
+                Some(ElseBranch::If(else_if)) => emit_if(else_if, output, indent, gate, scopes),
+                Some(ElseBranch::Block(block)) => emit_block(block, output, indent, scopes),
+                None => {}
+            }
+            return;
+        }
+        Some(true) => {
+            let Some(gate) = gate else {
+                emit_block(&if_stmt.then_block, output, indent, scopes);
+                return;
+            };
+            writeln(output, indent, &format!("if ({gate})"));
+        }
+        None => {
+            let condition = emit_condition(&if_stmt.condition, gate, output, indent, scopes);
+            writeln(output, indent, &format!("if ({condition})"));
+        }
+    }
     emit_block(&if_stmt.then_block, output, indent, scopes);
 
     if let Some(else_branch) = &if_stmt.else_branch {
@@ -9247,6 +9475,10 @@ fn emit_foreach_body(
         emit_public_foreach(foreach, iterable, output, indent, scopes);
         return;
     }
+    if foreach.iterable_family == crate::semantics::ForeachIterableFamily::Region {
+        emit_region_foreach(foreach, iterable, output, indent, scopes);
+        return;
+    }
     scopes.push();
     let first_name = foreach
         .first_binding
@@ -9291,6 +9523,111 @@ fn emit_foreach_body(
             emit_statement(statement, output, indent, scopes);
         }
     });
+    scopes.pop();
+    writeln(output, indent, "}");
+}
+
+/// `foreach` over a byte region (Decision 0148 section 8, amendment
+/// Iterating Regions of 2026-11-20): elements in index order through the
+/// region's checked `get`, with an optional zero-based index. A writable
+/// binding writes its element back when the iteration ends, however it
+/// ends, as PHP's by-reference walk of a typed array does.
+fn emit_region_foreach(
+    foreach: &ForeachStmt,
+    iterable: &str,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    scopes.push();
+    let region = scopes.fresh_temp("__doria_region");
+    let index = scopes.fresh_temp("__doria_region_index");
+    let first_name = foreach
+        .first_binding
+        .as_ref()
+        .map(|binding| scopes.declare(&binding.name));
+    let value_name = scopes.declare(&foreach.value_binding.name);
+    // Both bindings are direct PHP locals; a closure that captures one
+    // reads it through a cell, as the public foreach does.
+    let mut bound_cells = Vec::new();
+    for (name, binding_span, php_name) in foreach
+        .first_binding
+        .as_ref()
+        .zip(first_name.as_ref())
+        .map(|(binding, php_name)| (binding.name.as_str(), binding.span, php_name.clone()))
+        .into_iter()
+        .chain(std::iter::once((
+            foreach.value_binding.name.as_str(),
+            foreach.value_binding.span,
+            value_name.clone(),
+        )))
+    {
+        if let Some(binding) = scopes.binding_for_declaration(name, binding_span) {
+            if scopes.needs_cell(binding) {
+                scopes.bind_place(binding, PhpBindingPlace::Cell(php_name.clone()));
+                bound_cells.push(php_name);
+            } else {
+                scopes.bind_place(binding, PhpBindingPlace::Direct(php_name));
+            }
+        }
+    }
+    let span = foreach.span;
+    let start = scopes.source_location(span, span.start);
+    let end = scopes.source_location(span, span.end);
+    let callable = scopes.callable_identity();
+    writeln(output, indent, &format!("${region} = {iterable};"));
+    writeln(
+        output,
+        indent,
+        &format!("for (${index} = 0; ${index} < count(${region}); ${index}++)"),
+    );
+    writeln(output, indent, "{");
+    let bind = |name: &str, value: String| {
+        if bound_cells.iter().any(|cell| cell == name) {
+            format!("${name} = new __DoriaCell({value});")
+        } else {
+            format!("${name} = {value};")
+        }
+    };
+    if let Some(first_name) = &first_name {
+        writeln(output, indent + 1, &bind(first_name, format!("${index}")));
+    }
+    writeln(
+        output,
+        indent + 1,
+        &bind(
+            &value_name,
+            format!("${region}->get(${index}, {start}, {end}, {callable})"),
+        ),
+    );
+    let value_read = if bound_cells.contains(&value_name) {
+        format!("${value_name}->value")
+    } else {
+        format!("${value_name}")
+    };
+    let body_indent = if foreach.value_binding.writable {
+        writeln(output, indent + 1, "try");
+        writeln(output, indent + 1, "{");
+        indent + 2
+    } else {
+        indent + 1
+    };
+    emit_owned_scope(output, body_indent, scopes, |output, indent, scopes| {
+        for statement in &foreach.body.statements {
+            emit_statement(statement, output, indent, scopes);
+        }
+    });
+    if foreach.value_binding.writable {
+        writeln(output, indent + 1, "}");
+        writeln(output, indent + 1, "finally");
+        writeln(output, indent + 1, "{");
+        writeln(
+            output,
+            indent + 2,
+            &format!("${region}->set(${index}, {value_read}, {start}, {end}, {callable});"),
+        );
+        writeln(output, indent + 1, "}");
+    }
     scopes.pop();
     writeln(output, indent, "}");
 }
@@ -9499,6 +9836,9 @@ fn emit_range_foreach(
 }
 
 fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    if let Some(value) = companion::emit_region_value(expr, scopes) {
+        return value;
+    }
     if let Some(value) = scopes
         .prepared_receiver
         .as_ref()
@@ -10395,7 +10735,9 @@ fn emit_expr_unboxed_impl(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 )
             },
         ),
-        Expr::FunctionCall { name, args, span } => emit_function_call(name, args, *span, scopes),
+        Expr::FunctionCall {
+            name, args, span, ..
+        } => emit_function_call(name, args, *span, scopes),
         Expr::StaticCall {
             class_name,
             method,
@@ -11062,6 +11404,30 @@ fn emit_when_branch_chain(
     let Some((branch, rest)) = branches.split_first() else {
         return;
     };
+    // Decision 0148 section 17: a branch whose condition is constant false is
+    // not emitted, nor is a branch after one whose condition is constant
+    // true, except the unconditioned branch a failed `given` gate reaches.
+    let constant = branch
+        .condition
+        .as_ref()
+        .and_then(|condition| scopes.constant_conditions.get(&condition.span()).copied());
+    if constant == Some(false) {
+        emit_when_branch_chain(rest, gate, output, indent, scopes);
+        return;
+    }
+    if constant == Some(true) {
+        let Some(gate) = gate else {
+            emit_block(&branch.block, output, indent, scopes);
+            return;
+        };
+        writeln(output, indent, &format!("if ({gate})"));
+        emit_block(&branch.block, output, indent, scopes);
+        if let Some(fallback) = rest.iter().find(|branch| branch.condition.is_none()) {
+            writeln(output, indent, "else");
+            emit_block(&fallback.block, output, indent, scopes);
+        }
+        return;
+    }
     if let Some(condition) = &branch.condition {
         let condition = emit_condition(condition, gate, output, indent, scopes);
         writeln(output, indent, &format!("if ({condition})"));
@@ -11446,6 +11812,13 @@ fn resolved_type_identity(ty: &ResolvedType) -> String {
         ResolvedType::String => "string".to_string(),
         ResolvedType::Bytes => "Bytes".to_string(),
         ResolvedType::ByteRegion(kind) => kind.source_name().to_string(),
+        ResolvedType::ArrayRegion(kind, element) => {
+            format!(
+                "{}[{}]",
+                kind.array_source_name(),
+                resolved_type_identity(element)
+            )
+        }
         ResolvedType::Bool => "bool".to_string(),
         ResolvedType::Null => "null".to_string(),
         ResolvedType::Mixed => "mixed".to_string(),
@@ -11542,6 +11915,7 @@ fn resolved_type_identity(ty: &ResolvedType) -> String {
             kind.source_name(),
             resolved_type_identity(payload)
         ),
+        ResolvedType::Foreign(foreign) => foreign.display_with(resolved_type_identity),
         ResolvedType::Unsupported => "unsupported".to_string(),
     }
 }
@@ -12050,9 +12424,10 @@ fn php_resolved_type(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
         ResolvedType::String => "string".to_string(),
         ResolvedType::Bool => "bool".to_string(),
         ResolvedType::Null => "null".to_string(),
-        ResolvedType::Mixed | ResolvedType::Unsupported | ResolvedType::TypeParameter(_) => {
-            "mixed".to_string()
-        }
+        ResolvedType::Mixed
+        | ResolvedType::Unsupported
+        | ResolvedType::TypeParameter(_)
+        | ResolvedType::Foreign(_) => "mixed".to_string(),
         ResolvedType::Error => "__DoriaErrorValue".to_string(),
         ResolvedType::Function(_) => "__DoriaFunctionValue".to_string(),
         ResolvedType::Enum(ty) => scopes
@@ -12067,6 +12442,9 @@ fn php_resolved_type(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
         ResolvedType::Nullable(inner) => php_nullable_type_hint(php_resolved_type(inner, scopes)),
         ResolvedType::Bytes => "__DoriaBytes".to_string(),
         ResolvedType::ByteRegion(_) => "__DoriaByteRegion".to_string(),
+        // PHP output does not build typed array regions yet; the program is
+        // rejected before emission, so no declaration uses this hint.
+        ResolvedType::ArrayRegion(..) => "mixed".to_string(),
         ResolvedType::TypedArray(_)
         | ResolvedType::List(_)
         | ResolvedType::Dictionary(_, _)

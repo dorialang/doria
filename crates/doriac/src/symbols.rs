@@ -243,6 +243,12 @@ pub struct ParamInfo {
     pub ty: TypeId,
     pub take: bool,
     pub writable: bool,
+    /// Whether the argument is the caller's writable place, which the call
+    /// lends to the callee so its writes reach the caller: every `writable`
+    /// parameter except a promoted constructor parameter, where `writable`
+    /// makes the property writable (Decision 0083). Andrew's ruling of
+    /// 2026-11-21, "Writable always borrows (Recommended)".
+    pub lends_storage: bool,
     pub has_default: bool,
     /// The default as authored, on one line, when the declaring source text
     /// is available. Presentation only: `has_default` decides binding.

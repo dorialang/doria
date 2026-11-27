@@ -522,7 +522,7 @@ impl Checker<'_> {
                 }
             }
         }
-        if unambiguous && self.diagnostics.len() == before {
+        if unambiguous && !self.errors_since(before) {
             let condition = NominalConditionFacts {
                 clause: condition.span,
                 parameters,

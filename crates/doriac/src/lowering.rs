@@ -28,6 +28,10 @@ pub fn lower_program_with_semantics(
     program: &ast::Program,
     semantic_info: crate::semantics::SemanticInfo,
 ) -> DiagnosticResult<hir::Program> {
+    let unexecutable = crate::unsafe_code::unexecutable_forms(program);
+    if !unexecutable.is_empty() {
+        return Err(unexecutable);
+    }
     let declarations = crate::semantics::conditional_capabilities::check_declarations(program);
     if !declarations.diagnostics.is_empty() {
         return Err(declarations.diagnostics);
@@ -69,7 +73,16 @@ fn lower_checked_program_with_semantics(
     let mut items = Vec::with_capacity(program.items.len());
     let mut diagnostics = Vec::new();
     for item in &program.items {
-        if matches!(item, ast::Item::Interface(_) | ast::Item::Trait(_)) {
+        // An extern block's declarations are items of their own. A foreign
+        // struct or union is a layout, which checking records with its fields
+        // (`SemanticInfo::foreign_aggregates`); it has no executable item.
+        if matches!(
+            item,
+            ast::Item::Interface(_)
+                | ast::Item::Trait(_)
+                | ast::Item::ExternBlock(_)
+                | ast::Item::ForeignAggregate(_)
+        ) {
             continue;
         }
         let composed;
@@ -695,8 +708,13 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
     match item {
         ast::Item::Class(class_decl) => lower_class(class_decl).map(hir::Item::Class),
         ast::Item::Enum(enum_decl) => Ok(hir::Item::Enum(lower_enum(enum_decl))),
-        ast::Item::Interface(_) | ast::Item::Trait(_) => {
-            unreachable!("compile-time declarations do not enter HIR")
+        ast::Item::Interface(_)
+        | ast::Item::Trait(_)
+        | ast::Item::ExternBlock(_)
+        | ast::Item::ForeignAggregate(_) => {
+            unreachable!(
+                "compile-time declarations, extern blocks and foreign layouts do not enter HIR"
+            )
         }
         ast::Item::Function(function) => lower_function(function, None).map(hir::Item::Function),
         ast::Item::Constant(constant) => Ok(hir::Item::Constant(lower_constant(constant, None))),
@@ -878,6 +896,7 @@ fn lower_function(
     function: &ast::FunctionDecl,
     class_name: Option<ClassContext<'_>>,
 ) -> Result<hir::FunctionDecl, Diagnostic> {
+    let foreign = matches!(function.body, ast::FunctionBody::Foreign { .. });
     let (body, intrinsic) = match &function.body {
         ast::FunctionBody::Block(body) => (lower_block(body, class_name), None),
         ast::FunctionBody::Intrinsic {
@@ -889,6 +908,15 @@ fn lower_function(
                 span: *span,
             },
             Some(*implementation),
+        ),
+        // The call to the C function is the body, which MIR lowering
+        // builds from the declaration's checked binding.
+        ast::FunctionBody::Foreign { semicolon_span } => (
+            hir::Block {
+                statements: Vec::new(),
+                span: *semicolon_span,
+            },
+            None,
         ),
         _ => {
             return Err(Diagnostic::new(
@@ -946,6 +974,7 @@ fn lower_function(
         test_assertion_checked_effects: Vec::new(),
         body,
         intrinsic,
+        foreign,
         modifier_prefix_span: function.modifier_prefix_span,
         span: function.span,
     })
@@ -1016,6 +1045,8 @@ fn lower_block(block: &ast::Block, class_name: Option<ClassContext<'_>>) -> hir:
 fn lower_stmt(statement: &ast::Stmt, class_name: Option<ClassContext<'_>>) -> hir::Stmt {
     match statement {
         ast::Stmt::Block(block) => hir::Stmt::Block(lower_block(block, class_name)),
+        // An unsafe context changes what checking permits, not what runs.
+        ast::Stmt::Unsafe(statement) => hir::Stmt::Block(lower_block(&statement.block, class_name)),
         ast::Stmt::VarDecl(decl) => hir::Stmt::VarDecl(hir::VarDecl {
             writable: decl.writable,
             ty: decl.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
@@ -1421,7 +1452,9 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             ty: lower_type_ref(ty, class_name),
             span: *span,
         },
-        ast::Expr::FunctionCall { name, args, span } => hir::Expr::FunctionCall {
+        ast::Expr::FunctionCall {
+            name, args, span, ..
+        } => hir::Expr::FunctionCall {
             name: name.clone(),
             args: args
                 .iter()
@@ -1486,10 +1519,12 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             shared: *shared,
             span: *span,
         },
-        ast::Expr::Grouped { expr, span } => hir::Expr::Grouped {
-            expr: Box::new(lower_expr(expr, class_name)),
-            span: *span,
-        },
+        ast::Expr::Grouped { expr, span } | ast::Expr::Unsafe { expr, span, .. } => {
+            hir::Expr::Grouped {
+                expr: Box::new(lower_expr(expr, class_name)),
+                span: *span,
+            }
+        }
         ast::Expr::Unary { op, expr, span } => hir::Expr::Unary {
             op: op.clone(),
             expr: Box::new(lower_expr(expr, class_name)),

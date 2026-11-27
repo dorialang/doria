@@ -81,6 +81,11 @@ struct Resolution {
     closure_bodies: Vec<(Block, Span)>,
     entry_facts: BTreeMap<BindingId, Fact>,
     constructor_properties: HashMap<String, BindingId>,
+    /// Each place a `WritablePointer::to` addresses, with the unsafe context it is
+    /// formed in. C can write the place through the pointer during any call
+    /// in that context (Decision 0148 section 7), so no fact about it
+    /// survives a call there.
+    pointer_exposures: Vec<(Span, BindingId)>,
 }
 
 #[derive(Default)]
@@ -276,6 +281,8 @@ impl NullabilityCatalog {
                 | Item::Interface(_)
                 | Item::Trait(_)
                 | Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
                 | Item::Statement(_) => {}
             }
         }
@@ -475,6 +482,8 @@ impl MutationCatalog {
                 | Item::Interface(_)
                 | Item::Trait(_)
                 | Item::Constant(_)
+                | Item::ExternBlock(_)
+                | Item::ForeignAggregate(_)
                 | Item::Statement(_) => {}
             }
         }
@@ -655,7 +664,12 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
                     }
                 }
             }
-            Item::Enum(_) | Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {}
+            Item::Enum(_)
+            | Item::Interface(_)
+            | Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_)
+            | Item::Statement(_) => {}
         }
     }
     facts
@@ -664,6 +678,7 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
         Stmt::Block(block) => block.span,
+        Stmt::Unsafe(statement) => statement.span,
         Stmt::VarDecl(declaration) => declaration.span,
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. }
@@ -924,7 +939,7 @@ fn transfer_statement(
     nullability: &NullabilityCatalog,
 ) {
     match statement {
-        Stmt::Block(_) => {}
+        Stmt::Block(_) | Stmt::Unsafe(_) => {}
         Stmt::VarDecl(declaration) => transfer_declaration(
             &declaration.bindings,
             &declaration.initializer,
@@ -1070,9 +1085,20 @@ fn kill_mutated_call_arguments(
     resolution: &Resolution,
     mutations: &MutationCatalog,
 ) {
+    if matches!(
+        expr,
+        Expr::MethodCall { .. }
+            | Expr::FunctionCall { .. }
+            | Expr::StaticCall { .. }
+            | Expr::CallableCall { .. }
+            | Expr::New { .. }
+    ) {
+        kill_exposed_places(expr.span(), state, resolution);
+    }
     match expr {
         Expr::PropertyAccess { object, .. }
         | Expr::Grouped { expr: object, .. }
+        | Expr::Unsafe { expr: object, .. }
         | Expr::Unary { expr: object, .. }
         | Expr::IsType { expr: object, .. } => {
             kill_mutated_call_arguments(object, state, resolution, mutations)
@@ -1294,7 +1320,7 @@ fn kill_mutated_calls_in_statement(
     mutations: &MutationCatalog,
 ) {
     match statement {
-        Stmt::Block(block) => {
+        Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
             for statement in &block.statements {
                 kill_mutated_calls_in_statement(statement, state, resolution, mutations);
             }
@@ -1353,6 +1379,16 @@ fn kill_short_circuit_effects(
             let mut skipped = state.clone();
             apply_condition(left, !continue_when, &mut skipped, resolution);
             *state = joined_state(&skipped, &evaluated);
+        }
+    }
+}
+
+/// Forgets every fact about a place a `WritablePointer` addresses in the unsafe
+/// context the call at `call` runs in.
+fn kill_exposed_places(call: Span, state: &mut State, resolution: &Resolution) {
+    for (context, binding) in &resolution.pointer_exposures {
+        if context.contains(call) {
+            state.facts.remove(binding);
         }
     }
 }
@@ -1523,7 +1559,7 @@ fn expression_fact(
             }
         }
         Expr::Binary { .. } => Some(Fact::NonNull),
-        Expr::Identifier { .. } | Expr::Grouped { .. } => None,
+        Expr::Identifier { .. } | Expr::Grouped { .. } | Expr::Unsafe { .. } => None,
     }
 }
 
@@ -1645,7 +1681,7 @@ fn collect_statement(
     facts: &mut FactsByUse,
 ) {
     match statement {
-        Stmt::Block(_) => {}
+        Stmt::Block(_) | Stmt::Unsafe(_) => {}
         Stmt::VarDecl(declaration) => {
             collect_expr(
                 &declaration.initializer,
@@ -1710,6 +1746,7 @@ fn collect_expr(
             collect_expr(object, state, resolution, mutations, facts)
         }
         Expr::Grouped { expr: object, .. }
+        | Expr::Unsafe { expr: object, .. }
         | Expr::Unary { expr: object, .. }
         | Expr::IsType { expr: object, .. } => {
             collect_expr(object, state, resolution, mutations, facts)
@@ -2250,7 +2287,7 @@ fn static_qualifier_class_name(
 }
 
 fn ungroup(mut expr: &Expr) -> &Expr {
-    while let Expr::Grouped { expr: inner, .. } = expr {
+    while let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
         expr = inner;
     }
     expr
@@ -2280,6 +2317,7 @@ struct Resolver {
     next_binding: usize,
     scopes: Vec<HashMap<String, BindingId>>,
     resolution: Resolution,
+    unsafe_contexts: Vec<Span>,
 }
 
 impl Resolver {
@@ -2302,6 +2340,7 @@ impl Resolver {
                 member_types: member_types.clone(),
                 ..Resolution::default()
             },
+            unsafe_contexts: Vec::new(),
         };
         if let Some(class) = constructor_class {
             for member in &class.members {
@@ -2387,9 +2426,44 @@ impl Resolver {
         self.scopes.pop();
     }
 
+    /// Records the place a `WritablePointer::to` call addresses inside an unsafe
+    /// context.
+    fn record_pointer_exposure(
+        &mut self,
+        qualifier: &crate::ast::StaticQualifier,
+        method: &str,
+        args: &[Argument],
+    ) {
+        let crate::ast::StaticQualifier::Class(class) = qualifier else {
+            return;
+        };
+        if crate::foreign::PointerAccess::from_source_name(class)
+            != Some(crate::foreign::PointerAccess::Write)
+            || crate::pointer_intrinsics::static_member(
+                crate::foreign::PointerAccess::Write,
+                method,
+            )
+            .map(|member| member.operation)
+                != Some(crate::pointer_intrinsics::PointerOperation::AddressOf)
+        {
+            return;
+        }
+        let (Some(context), [argument]) = (self.unsafe_contexts.last().copied(), args) else {
+            return;
+        };
+        if let Some(binding) = place_binding(&argument.value, &self.resolution) {
+            self.resolution.pointer_exposures.push((context, binding));
+        }
+    }
+
     fn resolve_statement(&mut self, statement: &Stmt) {
         match statement {
             Stmt::Block(block) => self.resolve_block(block),
+            Stmt::Unsafe(crate::ast::UnsafeBlock { block, span, .. }) => {
+                self.unsafe_contexts.push(*span);
+                self.resolve_block(block);
+                self.unsafe_contexts.pop();
+            }
             Stmt::VarDecl(declaration) => {
                 self.resolve_expr(&declaration.initializer);
                 let inferred_member_type = self.resolved_member_type(&declaration.initializer);
@@ -2589,6 +2663,11 @@ impl Resolver {
                     self.resolution.property_uses.insert(*span, binding);
                 }
             }
+            Expr::Unsafe { expr, span, .. } => {
+                self.unsafe_contexts.push(*span);
+                self.resolve_expr(expr);
+                self.unsafe_contexts.pop();
+            }
             Expr::PropertyAccess { object, .. }
             | Expr::Grouped { expr: object, .. }
             | Expr::Unary { expr: object, .. }
@@ -2599,9 +2678,18 @@ impl Resolver {
                     self.resolve_expr(&argument.value);
                 }
             }
-            Expr::FunctionCall { args, .. }
-            | Expr::StaticCall { args, .. }
-            | Expr::New { args, .. } => {
+            Expr::StaticCall {
+                qualifier,
+                method,
+                args,
+                ..
+            } => {
+                for argument in args {
+                    self.resolve_expr(&argument.value);
+                }
+                self.record_pointer_exposure(qualifier, method, args);
+            }
+            Expr::FunctionCall { args, .. } | Expr::New { args, .. } => {
                 for argument in args {
                     self.resolve_expr(&argument.value);
                 }

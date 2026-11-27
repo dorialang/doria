@@ -98,6 +98,7 @@ impl Checker<'_> {
                     generic: resolved_type_requires_conservative_move(&parameter.r#type),
                     take: parameter.take,
                     writable: parameter.writable,
+                    lends: parameter.writable,
                     borrow: parameter.borrow,
                 })
                 .collect(),
