@@ -591,7 +591,10 @@ jobs:
       # Decision 0148 acceptance 3: zlib on every host. Linux installs it
       # with the LLVM packages and macOS links the system libz; Windows
       # takes vcpkg's import library with its DLL and its static library,
-      # which links against the dynamic Universal CRT (section 20).
+      # which links against the dynamic Universal CRT (section 20). The
+      # examples/ffi/zlib package links the import library and DLL from
+      # native/windows, as its Baton.toml maps them, so the parity manifest
+      # runs it from there.
       - name: Provision zlib on Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -605,6 +608,11 @@ jobs:
           }
           "VCPKG_INSTALLATION_ROOT=$(Split-Path $vcpkg)" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $installed = Join-Path (Split-Path $vcpkg) "installed\x64-windows"
+          $package = "examples\ffi\zlib\native\windows"
+          New-Item -ItemType Directory -Force -Path "$package\lib", "$package\bin" | Out-Null
+          Copy-Item (Join-Path $installed "lib\zlib.lib") "$package\lib\zlib.lib" -ErrorAction Stop
+          Copy-Item (Join-Path $installed "bin\zlib1.dll") "$package\bin\zlib1.dll" -ErrorAction Stop
 
       - name: Run Stage 40 unsafe code and FFI suites
         run: >-
