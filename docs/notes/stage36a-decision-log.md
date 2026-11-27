@@ -386,8 +386,9 @@ that pinned the whole-owner rule now pins only whole-receiver use.
 | Writable views reserve until their first write, everywhere                   | One general rule                                                                                                                              | Accepts alias patterns source checking rejects, weakening the independent proof                   |
 | Keep the MIR whole-owner rule and reject at source too                       | No validator change                                                                                                                           | Contradicts Decision 0136 and rejects ordinary disjoint-field code                                |
 
-Open: E0477 names the owner (`$this`) rather than the conflicting place, and
-says "property assignment" for element assignments too.
+Follow-up, 2026-11-21: E0471 and E0477 name stored places (`$this->buffer`),
+including the place being assigned, under the stable title "Assignment Value
+Uses Its Destination", and underline the place expression they name.
 
 ## 25. `IoOperation` labels for lock failures (Decision 0138)
 
