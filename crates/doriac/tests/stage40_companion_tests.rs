@@ -5,13 +5,17 @@
 
 #[path = "common/execution_directory.rs"]
 mod execution_directory;
+#[path = "common/fixture_linking.rs"]
+mod fixture_linking;
 
 use std::path::Path;
 
 use doriac::backend::NativeProfile;
 use doriac::mir::{Program, SlotRecord};
 use doriac::native_link::NativeLinking;
+use doriac::native_loader;
 use execution_directory::ExecutionDirectory;
+use fixture_linking::read_linking;
 
 fn program(source: &str) -> Program {
     doriac::lower_source_to_mir("companion.doria", source.to_string())
@@ -53,15 +57,14 @@ function main(): void
 
 const ZLIB_PACKAGE: &str = include_str!("../../../examples/ffi/zlib/src/main.doria");
 
-fn linking(flags: &[(&str, &str)]) -> NativeLinking {
-    let mut linking = NativeLinking::default();
-    for (flag, value) in flags {
-        linking
-            .apply_flag(flag, value, Path::new("."))
-            .unwrap_or_else(|error| panic!("{flag} {value}: {error}"));
-    }
-    linking.finish_flags().unwrap();
-    linking
+/// The link facts of the zlib package on this host, from its parity
+/// fixture's `link` file, the one the parity runner applies.
+fn zlib_linking() -> NativeLinking {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    read_linking(
+        &workspace.join("crates/doriac/tests/fixtures/native_io/zlib/link"),
+        &workspace.join("examples/ffi/zlib"),
+    )
 }
 
 /// Builds the companion of `mir` for `profile` and checks its sidecar
@@ -116,43 +119,7 @@ fn publish(
     published
 }
 
-#[cfg(unix)]
-mod loader {
-    use std::ffi::{c_char, c_int, c_void, CStr, CString};
-    use std::path::Path;
-
-    extern "C" {
-        fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
-        fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
-        fn dlerror() -> *const c_char;
-    }
-
-    const RTLD_NOW: c_int = 2;
-
-    pub struct Library(*mut c_void);
-
-    impl Library {
-        pub fn open(path: &Path) -> Self {
-            let path = CString::new(path.to_str().unwrap()).unwrap();
-            let handle = unsafe { dlopen(path.as_ptr(), RTLD_NOW) };
-            assert!(!handle.is_null(), "dlopen: {}", unsafe {
-                CStr::from_ptr(dlerror()).to_string_lossy()
-            });
-            Self(handle)
-        }
-
-        /// The address of `name`, which this library or one it loads
-        /// exports.
-        pub fn symbol(&self, name: &str) -> Option<*mut c_void> {
-            let name = CString::new(name).unwrap();
-            let address = unsafe { dlsym(self.0, name.as_ptr()) };
-            (!address.is_null()).then_some(address)
-        }
-    }
-}
-
 /// A host that accepts outputs (operation 0) and runs no other operation.
-#[cfg(unix)]
 #[repr(C)]
 struct StubHost {
     call: unsafe extern "C" fn(*mut StubHost, u32, *mut u8, *mut u8) -> i32,
@@ -169,7 +136,6 @@ struct StubHost {
     accepted: Vec<Vec<u8>>,
 }
 
-#[cfg(unix)]
 unsafe extern "C" fn stub_call(
     host: *mut StubHost,
     operation: u32,
@@ -191,7 +157,6 @@ unsafe extern "C" fn stub_call(
     0
 }
 
-#[cfg(unix)]
 unsafe extern "C" fn stub_panic(
     _: *mut StubHost,
     _: *const u8,
@@ -275,7 +240,6 @@ fn region_locals_name_the_bindings_they_lower() {
 /// Calls the region of `shout` from this process through a stub host on
 /// every profile: a fallthrough edge and a `break` edge, each writing the
 /// outputs, handing the string to the host and returning its status.
-#[cfg(unix)]
 #[test]
 fn a_region_entry_marshals_its_slots_and_returns_its_exit() {
     let source = format!("{C_LIBRARY}{SHOUT}");
@@ -293,12 +257,14 @@ fn a_region_entry_marshals_its_slots_and_returns_its_exit() {
     for profile in NativeProfile::AVAILABLE {
         let directory = ExecutionDirectory::new();
         let published = publish(&mir, *profile, &NativeLinking::default(), directory.path());
-        let library = loader::Library::open(&published.library);
-        let entry = library
-            .symbol(&region.entry_symbol())
-            .unwrap_or_else(|| panic!("{profile:?}: the entry is exported"));
-        let attach = library
-            .symbol("dr_v1_attach_region_host")
+        let (library, runtime) = native_loader::open_companion(
+            &published.library,
+            &directory.path().join(&published.runtime),
+        )
+        .unwrap_or_else(|error| panic!("{profile:?}: the companion loads: {error}"));
+        let entry = native_loader::symbol(library, &region.entry_symbol())
+            .unwrap_or_else(|error| panic!("{profile:?}: the entry is exported: {error}"));
+        let attach = native_loader::symbol(runtime, "dr_v1_attach_region_host")
             .expect("the shared runtime is loaded with the companion");
         let entry: unsafe extern "C" fn(*mut StubHost, *const u8, *mut u8, *mut u8) -> i32 =
             unsafe { std::mem::transmute(entry) };
@@ -358,7 +324,6 @@ fn a_region_entry_marshals_its_slots_and_returns_its_exit() {
 /// `examples/ffi/zlib` builds its companion on every profile, linking
 /// zlib, with one exported entry per region and one exported forwarding C
 /// entry per C-callable function.
-#[cfg(unix)]
 #[test]
 fn the_zlib_example_builds_its_companion() {
     let mir = program(ZLIB_PACKAGE);
@@ -373,24 +338,31 @@ fn the_zlib_example_builds_its_companion() {
         "{:#?}",
         mir.companion.callbacks
     );
-    let linking = linking(&[("--link-library", "zlib=z")]);
+    let linking = zlib_linking();
     for profile in NativeProfile::AVAILABLE {
         let directory = ExecutionDirectory::new();
         let published = publish(&mir, *profile, &linking, directory.path());
         let sidecar: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&published.sidecar).unwrap()).unwrap();
         assert_eq!(sidecar["foreignLibraries"], serde_json::json!(["zlib"]));
-        let library = loader::Library::open(&published.library);
+        // Loading resolves every library the companion imports, zlib
+        // included, so a missing zlib fails here on every host.
+        let (library, _) = native_loader::open_companion(
+            &published.library,
+            &directory.path().join(&published.runtime),
+        )
+        .unwrap_or_else(|error| panic!("{profile:?}: the companion and zlib load: {error}"));
+        let exported = |name: &str| native_loader::symbol(library, name).is_ok();
         for region in &mir.companion.regions {
             assert!(
-                library.symbol(&region.entry_symbol()).is_some(),
+                exported(&region.entry_symbol()),
                 "{profile:?}: {} is exported",
                 region.entry_symbol()
             );
         }
         for callback in &mir.companion.callbacks {
             assert!(
-                library.symbol(&callback.entry_symbol()).is_some(),
+                exported(&callback.entry_symbol()),
                 "{profile:?}: {} is exported",
                 callback.entry_symbol()
             );
@@ -401,12 +373,16 @@ fn the_zlib_example_builds_its_companion() {
         );
         for binding in &mir.companion.bindings {
             assert!(
-                library.symbol(&binding.entry_symbol()).is_some(),
+                exported(&binding.entry_symbol()),
                 "{profile:?}: {} is exported",
                 binding.entry_symbol()
             );
         }
-        assert!(library.symbol("deflateInit_").is_some(), "zlib is linked");
+        // A Unix lookup through the companion's handle searches the
+        // libraries it loaded; a Windows lookup searches the companion
+        // alone, where the successful load above already proved zlib.
+        #[cfg(unix)]
+        assert!(exported("deflateInit_"), "zlib is linked");
     }
 }
 

@@ -11,7 +11,10 @@ use doriac::native_link::NativeLinking;
 
 #[path = "common/execution_directory.rs"]
 mod execution_directory;
+#[path = "common/fixture_linking.rs"]
+mod fixture_linking;
 use execution_directory::ExecutionDirectory;
+use fixture_linking::read_linking;
 
 const MANIFEST: &str = include_str!("fixtures/native_parity_examples.txt");
 const NATIVE_CLOSURE_MANIFEST: &str = include_str!("fixtures/native_closures/manifest.txt");
@@ -687,45 +690,6 @@ fn lower_manifest_entry(workspace: &Path, relative_path: &str) -> doriac::mir::P
     doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
         panic!("MIR rejected parity source {relative_path}: {diagnostics:#?}")
     })
-}
-
-/// The link facts of a fixture's `link` file for this host: lines of
-/// `<linux|macos|windows> <flag> <library>=<value>`, applied as
-/// `doriac compile` applies its link flags, with relative paths resolved
-/// against `directory`. A fixture without the file links no library.
-fn read_linking(path: &Path, directory: &Path) -> NativeLinking {
-    let mut linking = NativeLinking::default();
-    let Some(bytes) = read_optional(path) else {
-        return linking;
-    };
-    let text = String::from_utf8(bytes).expect("a fixture link file should be UTF-8");
-    for line in text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-    {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        let [system, flag, value] = fields.as_slice() else {
-            panic!(
-                "{}: `{line}` should be `<linux|macos|windows> <flag> <library>=<value>`",
-                path.display()
-            );
-        };
-        assert!(
-            matches!(*system, "linux" | "macos" | "windows"),
-            "{}: `{system}` should be `linux`, `macos` or `windows`",
-            path.display()
-        );
-        if *system == std::env::consts::OS {
-            linking
-                .apply_flag(flag, value, directory)
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        }
-    }
-    linking
-        .finish_flags()
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    linking
 }
 
 /// A fixture's `php_output` file: `runs` or one diagnostic code, after any
