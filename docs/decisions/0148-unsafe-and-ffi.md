@@ -214,6 +214,31 @@ Andrew ruled on 2026-11-21: "Allow it for arrays, lists and regions
 place, pinned as a field of that element is. Dictionary values and set
 members have no stable position and are not places.
 
+### Amendment: PHP Output Of Host Operations (2026-11-27)
+
+Section 22 records every host operation as a MIR statement, and section 23
+has PHP output run each region in the companion. PHP output generates PHP
+from the syntax tree and has no path that runs a MIR statement, so running
+host operations under it needs PHP output generated from validated MIR.
+Andrew ruled on 2026-11-27: "Ship Stage 40, MIR PHP next (Recommended)".
+
+- In Stage 40, PHP output runs a region in the companion when the region
+  has no host operation, leaves by fallthrough, `break` or `continue`, and
+  passes only numbers, `bool` values and strings. Host operations, other
+  region exits, other slot kinds, C-callable functions, and pointers,
+  foreign structs and unions, foreign strings and foreign layouts in safe
+  code report E0784 when the program is built for PHP. The diagnostic names
+  `--target native` and `--target debug`, which build every such form.
+- Stage 40c makes PHP output generate from validated MIR, with one PHP
+  emitter, and builds the companion's PHP host on it: each host operation
+  as generated PHP over the region frame, reverse edges for C-callable
+  functions, `return` and checked-error exits, the remaining slot kinds, and
+  the PHP forms of the boundary values. It removes those E0784 gates.
+- Acceptance criteria 3, 5, 7 and 8 are met in Stage 40 under the
+  interpreter, Cranelift and LLVM. Under PHP output, Stage 40 runs the
+  fixtures whose forms it builds and reports E0784 for the others; Stage 40c
+  completes those criteria under PHP output. Criterion 9 stays in Stage 40.
+
 ## Context
 
 Stage 40 is the second item of the approved execution sequence (plan §13).

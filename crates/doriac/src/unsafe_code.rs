@@ -19,15 +19,20 @@ use crate::types::{TypeArgumentRef, TypeRef};
 /// implement yet.
 pub const NOT_AVAILABLE_CODE: &str = "E0784";
 
-/// The E0784 diagnostic for a checked form the native targets build and the
-/// interpreter or PHP output does not: those run unsafe code, and take the
-/// target's C data model, through the native companion library (Decision
-/// 0148 sections 22 and 23).
+/// The E0784 diagnostic for a checked form the native and debug targets
+/// build and PHP output does not yet. The debug target runs unsafe code, and
+/// takes the target's C data model, through the native companion library
+/// (Decision 0148 sections 22 and 23). PHP output runs a region there when
+/// it needs no host operation; its other forms arrive with PHP output from
+/// validated MIR in Stage 40c (amendment of 2026-11-27).
 pub fn companion_form(span: Span, title: &str, message: impl Into<String>) -> Diagnostic {
     Diagnostic::new(NOT_AVAILABLE_CODE, message, span)
         .with_title(title)
         .with_explanation(
-            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target. The interpreter and PHP output run unsafe code, and take the target's C data model, through the native companion library. PHP output does not build this form there yet.",
+            "Unsafe code and the foreign function interface are part of Doria (Decision 0148). The program checks and builds for the native target, and the debug target runs it through the native companion library. PHP output runs unsafe code in the companion when that code calls no Doria code and passes only numbers, `bool` values and strings. PHP output does not build this form yet.",
+        )
+        .with_help(
+            "build the program with `--target native`, or run it with `--target debug`; both build this form",
         )
 }
 
