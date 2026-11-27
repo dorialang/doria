@@ -258,9 +258,8 @@ function main(): void
     assert!(
         diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "E0471"
-                && diagnostic
-                    .message
-                    .contains("destination of a property assignment")
+                && diagnostic.message
+                    == "`$box` cannot be given away while `$box->value` is being assigned"
         }),
         "unexpected diagnostics: {diagnostics:#?}"
     );

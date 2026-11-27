@@ -6983,7 +6983,7 @@ impl Checker<'_> {
     }
 
     fn use_binding(&mut self, name: &str, span: Span, scopes: &mut Scopes, mode: UseMode) {
-        self.use_binding_at_place(name, span, scopes, mode, None);
+        self.use_binding_at_place(name, span, span, scopes, mode, None);
     }
 
     /// The child pipe getter at `site`, if it is one.
@@ -7017,35 +7017,39 @@ impl Checker<'_> {
             .collect()
     }
 
+    /// Use the base of a place expression for `places`. `site` is the whole
+    /// place expression: conflicts on those places are reported there, while
+    /// the state of the base binding is reported at the binding itself.
     fn use_place_base(
         &mut self,
         expr: &Expr,
         scopes: &mut Scopes,
         mode: UseMode,
         places: &[BorrowPlace],
+        site: Span,
     ) {
         match expr {
             Expr::Variable { name, span } => {
-                self.use_binding_at_place(name, *span, scopes, mode, Some(places));
+                self.use_binding_at_place(name, *span, site, scopes, mode, Some(places));
             }
             Expr::This { span } if scopes.get("this").is_some() => {
-                self.use_binding_at_place("this", *span, scopes, mode, Some(places));
+                self.use_binding_at_place("this", *span, site, scopes, mode, Some(places));
             }
-            Expr::This { span } => {
+            Expr::This { .. } => {
                 for place in places {
-                    self.check_live_retained_conflict(place, mode, *span, scopes);
-                    self.check_active_borrow_conflict(place, mode, *span);
-                    self.check_assignment_write_conflict(place, mode, *span);
+                    self.check_live_retained_conflict(place, mode, site, scopes);
+                    self.check_active_borrow_conflict(place, mode, site);
+                    self.check_assignment_write_conflict(place, mode, site);
                 }
             }
-            Expr::Grouped { expr, .. } => self.use_place_base(expr, scopes, mode, places),
+            Expr::Grouped { expr, .. } => self.use_place_base(expr, scopes, mode, places, site),
             Expr::PropertyAccess { object, .. } if self.getter_signature(expr).is_none() => {
-                self.use_place_base(object, scopes, mode, places);
+                self.use_place_base(object, scopes, mode, places, site);
             }
             Expr::Index {
                 collection, index, ..
             } => {
-                self.use_place_base(collection, scopes, mode, places);
+                self.use_place_base(collection, scopes, mode, places, site);
                 self.use_expr(index, scopes, UseMode::Read);
             }
             _ => {
@@ -7056,10 +7060,13 @@ impl Checker<'_> {
         self.cleanup_expression_result(expr, scopes, None);
     }
 
+    /// `span` is the binding as written; `site` is the place expression that
+    /// uses it, where conflicts on `places` are reported.
     fn use_binding_at_place(
         &mut self,
         name: &str,
         span: Span,
+        site: Span,
         scopes: &mut Scopes,
         mode: UseMode,
         places: Option<&[BorrowPlace]>,
@@ -7071,7 +7078,7 @@ impl Checker<'_> {
                 .unwrap_or_default()
         });
         for root in &roots {
-            self.check_live_retained_conflict(root, mode, span, scopes);
+            self.check_live_retained_conflict(root, mode, site, scopes);
         }
         {
             let through = scopes
@@ -7079,18 +7086,24 @@ impl Checker<'_> {
                 .map(|binding| binding.id)
                 .into_iter()
                 .collect::<Vec<_>>();
-            if let Some(alias) = roots
-                .iter()
-                .find_map(|root| scopes.borrowed_from(root, &through, mode))
-            {
+            if let Some((root, alias)) = roots.iter().find_map(|root| {
+                scopes
+                    .borrowed_from(root, &through, mode)
+                    .map(|alias| (root, alias))
+            }) {
+                let used = if places.is_some() {
+                    self.display_borrow_place(root)
+                } else {
+                    format!("${name}")
+                };
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0477",
                         format!(
-                            "`${name}` cannot be used as {} while `${alias}` borrows from it",
+                            "`{used}` cannot be used as {} while `${alias}` borrows from it",
                             if mode == UseMode::Read { "readonly" } else { "writable" }
                         ),
-                        span,
+                        site,
                     )
                     .with_help(
                         "finish using the borrowed binding or place it in a shorter lexical block before mutating its owner",
@@ -7100,14 +7113,14 @@ impl Checker<'_> {
         }
         for root in &roots {
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                self.check_active_borrow_conflict(root, mode, span);
+                self.check_active_borrow_conflict(root, mode, site);
             } else if mode == UseMode::Give {
-                self.check_give_against_active_borrows(root, span);
+                self.check_give_against_active_borrows(root, site);
             }
         }
         let mut assignment_conflict = false;
         for root in &roots {
-            assignment_conflict |= self.check_assignment_write_conflict(root, mode, span);
+            assignment_conflict |= self.check_assignment_write_conflict(root, mode, site);
         }
         if assignment_conflict && mode == UseMode::Give {
             return;
@@ -7333,7 +7346,7 @@ impl Checker<'_> {
                 };
                 let places = self.borrow_root_keys(expr, scopes);
                 if !places.is_empty() {
-                    self.use_place_base(object, scopes, base_mode, &places);
+                    self.use_place_base(object, scopes, base_mode, &places, expr.span());
                 } else {
                     self.use_expr_with_pending_access(object, scopes, base_mode, false);
                 }
@@ -8692,7 +8705,13 @@ impl Checker<'_> {
                     },
                 );
             } else {
-                self.use_place_base(receiver, scopes, UseMode::Read, &pipe_places);
+                self.use_place_base(
+                    receiver,
+                    scopes,
+                    UseMode::Read,
+                    &pipe_places,
+                    receiver.span(),
+                );
             }
             self.activate_place_input_borrows(receiver, scopes);
             if execution == CallExecution::Never {
@@ -8781,7 +8800,7 @@ impl Checker<'_> {
                             "E0471",
                             format!(
                                 "`{}` cannot be borrowed and given away in the same call",
-                                display_borrow_root(&root)
+                                self.display_borrow_place(&root)
                             ),
                             arg.span(),
                         )
@@ -8928,7 +8947,7 @@ impl Checker<'_> {
                         "E0477",
                         format!(
                             "`{}` cannot be used as {} while `${alias}` borrows from it",
-                            display_borrow_root(root),
+                            self.display_borrow_place(root),
                             if mode == UseMode::Read { "readonly" } else { "writable" }
                         ),
                         span,
@@ -9219,54 +9238,76 @@ impl Checker<'_> {
         (!borrow.writable).then(|| ("returned borrow".to_string(), span))
     }
 
+    /// A place as source spells it: its owner, then each stored field it
+    /// reaches (`$this->buffer`, `$tree->first->left`). An opaque suffix shows
+    /// its known prefix, which is the place it covers.
+    fn display_borrow_place(&self, place: &BorrowPlace) -> String {
+        let mut display = display_place_owner(place);
+        for field in &place.fields {
+            let Some(((_, name), _)) = self
+                .retained
+                .properties
+                .iter()
+                .find(|(_, (id, _))| id == field)
+            else {
+                break;
+            };
+            display.push_str("->");
+            display.push_str(name);
+        }
+        display
+    }
+
     fn check_assignment_write_conflict(
         &mut self,
         root: &BorrowPlace,
         mode: UseMode,
         span: Span,
     ) -> bool {
-        if !self
+        let Some(destination) = self
             .active_assignment_writes
             .iter()
-            .any(|written| written.overlaps(root))
-        {
+            .find(|written| written.overlaps(root))
+        else {
             return false;
-        }
-        match mode {
-            UseMode::Give => self.diagnostics.push(
-                Diagnostic::new(
-                    "E0471",
-                    format!(
-                        "`{}` cannot be given away while it is the destination of a property assignment",
-                        display_borrow_root(root)
-                    ),
-                    span,
-                )
-                .with_help(
-                    "compute the replacement without giving away the object being assigned",
+        };
+        let used = self.display_borrow_place(root);
+        let destination = self.display_borrow_place(destination);
+        let explanation = format!(
+            "An assignment holds `{destination}` until its new value is computed. The value may read exactly `{destination}` and any separate field, but not a place that contains it or lies inside it. An element assignment holds its whole collection."
+        );
+        let (code, message, label, help) = match mode {
+            UseMode::Give => (
+                "E0471",
+                format!("`{used}` cannot be given away while `{destination}` is being assigned"),
+                "This Ownership Transfer Overlaps the Assigned Place",
+                format!(
+                    "compute the new value without giving away `{destination}` or the object that holds it"
                 ),
             ),
-            UseMode::Read | UseMode::Write => {
-                let requested = if mode == UseMode::Read {
-                    "readonly"
+            UseMode::Read | UseMode::Write => (
+                "E0477",
+                format!(
+                    "`{used}` cannot be used as {} while `{destination}` is being assigned",
+                    if mode == UseMode::Read { "readonly" } else { "writable" }
+                ),
+                if mode == UseMode::Read {
+                    "This Readonly Use Overlaps the Assigned Place"
                 } else {
-                    "writable"
-                };
-                self.diagnostics.push(
-                    Diagnostic::new(
-                        "E0477",
-                        format!(
-                            "`{}` cannot be used as {requested} while it is the destination of a property assignment",
-                            display_borrow_root(root)
-                        ),
-                        span,
-                    )
-                    .with_help(
-                        "finish computing the property value before using that property or its parent again",
-                    ),
-                );
-            }
-        }
+                    "This Writable Use Overlaps the Assigned Place"
+                },
+                format!(
+                    "compute the value into a local first, then assign that local to `{destination}`"
+                ),
+            ),
+        };
+        self.diagnostics.push(
+            Diagnostic::new(code, message, span)
+                .with_title("Assignment Value Uses Its Destination")
+                .with_primary_label(label)
+                .with_explanation(explanation)
+                .with_help(help),
+        );
         true
     }
 
@@ -9561,7 +9602,7 @@ impl Checker<'_> {
             UseMode::Write => "writable",
             UseMode::Give => unreachable!("active borrow cannot be a give"),
         };
-        let root_display = display_borrow_root(root);
+        let root_display = self.display_borrow_place(root);
         self.diagnostics.push(
             Diagnostic::new(
                 "E0477",
@@ -9593,7 +9634,7 @@ impl Checker<'_> {
                     "E0471",
                     format!(
                         "`{}` cannot be borrowed and given away in the same call",
-                        display_borrow_root(root)
+                        self.display_borrow_place(root)
                     ),
                     span,
                 )
@@ -10565,7 +10606,9 @@ fn binding_roots(binding: &Binding, name: &str) -> Vec<BorrowPlace> {
         .unwrap_or_else(|| vec![binding_identity_key(binding.id, name).into()])
 }
 
-fn display_borrow_root(place: &BorrowPlace) -> String {
+/// The binding, receiver, or static member a place starts from. Diagnostics
+/// name the whole place with `OwnershipChecker::display_borrow_place`.
+fn display_place_owner(place: &BorrowPlace) -> String {
     let root = place.owner.as_str();
     if root == "$this" {
         root.to_string()
