@@ -487,9 +487,8 @@ function select(Item $value, bool $present): ?Item {
     if ($present) { return $value; }
     return null;
 }
-function main(): void {}
 "#;
-    let mut program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    let mut program = doriac::lower_library_source_to_mir("borrows.doria", source).unwrap();
     doriac::mir_validation::validate_program(&program).unwrap();
     let function = program
         .functions
@@ -551,9 +550,8 @@ function select(Item $value, bool $present): ?Item {
     if ($present) { return $value; } else { return null; }
     finally { let $finalizer = new Item(); }
 }
-function main(): void {}
 "#;
-    let program = doriac::lower_source_to_mir("borrows.doria", source).unwrap();
+    let program = doriac::lower_library_source_to_mir("borrows.doria", source).unwrap();
     let function = program
         .functions
         .iter()
@@ -1636,6 +1634,93 @@ function main(): void {{ let writable $branch = new Branch(); route($branch); ec
         "route materializes one carrier for $branch->right"
     );
     doriac::mir_validation::validate_program(&program).map_err(|error| error.message)
+}
+
+#[test]
+fn assignment_destination_diagnostics_name_both_places() {
+    // Decision 0136 diagnostics name stored paths: the place the value uses and
+    // the place being assigned, under one stable title.
+    let source = |body: &str| {
+        format!(
+            r#"
+class Child {{ int $value; function __construct(int $initial) {{ $this->value = $initial; }} }}
+class Cell {{ writable int $value = 0; }}
+class Sink
+{{
+    writable int $total = 0;
+    writable int[] $buffer = [1, 2];
+    writable Cell $left = new Cell();
+    writable Child $child = new Child(1);
+    writable function run(): void {{ {body} }}
+}}
+function look(Cell $cell): int {{ return $cell->value; }}
+function bump(writable Sink $sink): int {{ return 1; }}
+function main(): void {{ let writable $sink = new Sink(); $sink->run(); }}
+"#
+        )
+    };
+    for (body, message, used) in [
+        (
+            "$this->buffer[0] = $this->buffer[1];",
+            "`$this->buffer` cannot be used as readonly while `$this->buffer` is being assigned",
+            "$this->buffer",
+        ),
+        (
+            "$this->left->value = look($this->left);",
+            "`$this->left` cannot be used as readonly while `$this->left->value` is being assigned",
+            "$this->left",
+        ),
+        (
+            "$this->child = new Child($this->child->value + 1);",
+            "`$this->child->value` cannot be used as readonly while `$this->child` is being assigned",
+            "$this->child->value",
+        ),
+        (
+            "$this->total = bump($this);",
+            "`$this` cannot be used as writable while `$this->total` is being assigned",
+            "$this",
+        ),
+        (
+            "let writable $items = [1, 2]; $items[0] = $items[1];",
+            "`$items` cannot be used as readonly while `$items` is being assigned",
+            "$items",
+        ),
+    ] {
+        let text = source(body);
+        let diagnostics =
+            doriac::check_source("stage21-destination-diagnostics.doria", &text).expect_err(body);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "E0477")
+            .unwrap_or_else(|| panic!("{body}: {diagnostics:#?}"));
+        assert_eq!(diagnostic.message, message, "{body}");
+        // The primary span is the place the message names.
+        assert_eq!(&text[diagnostic.span.start..diagnostic.span.end], used, "{body}");
+        assert_eq!(diagnostic.title, "Assignment Value Uses Its Destination", "{body}");
+        assert!(
+            diagnostic
+                .help
+                .as_deref()
+                .is_some_and(|help| help.starts_with("compute the value into a local first")),
+            "{body}: {diagnostic:#?}"
+        );
+    }
+
+    // Other ownership conflicts name the stored path as well.
+    let diagnostics = doriac::check_source(
+        "stage21-path-conflict.doria",
+        owned_field_case("touch($tree->first->left, $tree->first->left);"),
+    )
+    .expect_err("one place cannot be lent as writable twice");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0477"
+                && diagnostic
+                    .message
+                    .starts_with("`$tree->first->left` cannot be used as writable")),
+        "{diagnostics:#?}"
+    );
 }
 
 #[test]

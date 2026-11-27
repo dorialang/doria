@@ -1,0 +1,4 @@
+# Catalogued diagnostic codes that have no documentation entry yet
+# (Decision 0145). One code per line, in code order. A code leaves this list
+# in the change that adds its entry file. A new code never joins it: it
+# arrives with its entry.

@@ -1,0 +1,5 @@
+# PHP output stops at its first finding. For this package that is B2501,
+# the String intrinsic property `bytes`, so its E0784s for host operations
+# and C-callable functions are not reported. Collecting every finding
+# belongs to Stage 40c's PHP emitter from validated MIR.
+B2501

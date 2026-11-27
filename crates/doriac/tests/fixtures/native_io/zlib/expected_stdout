@@ -1,0 +1,19 @@
+bound true
+compress2 true
+smaller true
+uncompress true
+round trip true
+deflateInit_ true
+deflate true
+consumed true
+input address true
+output address true
+deflateEnd true
+stream round trip true
+counted deflate true
+allocations counted true
+every allocation released true
+foreign uncompress true
+foreign region true
+foreign buffer released
+Doria binds zlib. Doria binds zlib. Doria binds zlib. Doria binds zlib.

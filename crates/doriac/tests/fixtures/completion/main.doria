@@ -1,0 +1,11 @@
+namespace Doria\Tui;
+
+use Doria\Tui\Core\Application;
+
+const DEFAULT_NAME = "Doria";
+
+function main(): void
+{
+    let writable $app = new Application("Doria");
+    $app->run();
+}

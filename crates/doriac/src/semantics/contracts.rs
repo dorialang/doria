@@ -673,6 +673,7 @@ impl Checker<'_> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        self.require_unsafe_callable(span, required.method.declaration, method);
         let receiver = self.infer_expr_type(object, scopes, method_context);
         if matches!(self.types.kind(receiver), TypeKind::TypeParameter(_)) {
             self.call_targets
@@ -862,7 +863,12 @@ impl Checker<'_> {
             Diagnostic::new(
                 "E0760",
                 format!(
-                    "primitive `{}` cannot inhabit an interface-typed slot",
+                    "{} `{}` cannot inhabit an interface-typed slot",
+                    if matches!(self.types.kind(value), TypeKind::Enum(_)) {
+                        "enum"
+                    } else {
+                        "primitive"
+                    },
                     self.types.display(value)
                 ),
                 span,
@@ -873,10 +879,17 @@ impl Checker<'_> {
         true
     }
 
+    /// Values whose conformance is compiler-known have no vtable to erase
+    /// into: primitives, and enums, which declare no `implements` clause and
+    /// conform to the core contracts as primitives do (Decision 0096).
     pub(super) fn primitive_interface_erasure_is_forbidden(&self, value: TypeId) -> bool {
         matches!(
             self.types.kind(value),
-            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::String
+            TypeKind::Integer(_)
+                | TypeKind::Float(_)
+                | TypeKind::Bool
+                | TypeKind::String
+                | TypeKind::Enum(_)
         )
     }
 
@@ -922,6 +935,21 @@ impl Checker<'_> {
 
     pub(super) fn public_iterable_element(&mut self, ty: TypeId) -> Option<TypeId> {
         self.core_iteration_element(ty, "Iterable")
+    }
+
+    /// Whether `ty` is a class whose conformances checking already rejected
+    /// (E0752), so no contract of it, `Iterable` included, can be read.
+    /// Callers report nothing further about it: the conformance diagnostic
+    /// is the finding.
+    pub(super) fn conformances_rejected(&mut self, ty: TypeId) -> bool {
+        match self.types.kind(ty).clone() {
+            TypeKind::Class(class) => {
+                !self
+                    .class_interface_closure(&class, &mut HashSet::new())
+                    .valid
+            }
+            _ => false,
+        }
     }
 
     fn core_iteration_element(&mut self, ty: TypeId, contract: &str) -> Option<TypeId> {
@@ -1046,7 +1074,7 @@ impl Checker<'_> {
                 if direct {
                     self.exact_method_calls.insert((span, method.declaration));
                 }
-                self.record_method_effect_dependency(&method, direct);
+                self.record_method_effect_dependency(&method, direct, span);
                 (target, method)
             }
             TypeKind::TypeParameter(parameter) => {
@@ -1241,6 +1269,7 @@ impl Checker<'_> {
                 }
             }
         }
+        self.check_specialized_collection_keys(body);
     }
 
     pub(super) fn trait_declaration(&self, name: &str) -> Option<&crate::ast::TraitDecl> {
@@ -1494,7 +1523,7 @@ impl Checker<'_> {
                 ));
             }
             self.type_parameter_scopes.pop();
-            let valid = self.diagnostics.len() == before;
+            let valid = !self.errors_since(before);
             self.interface_definitions.insert(
                 declaration.name.clone(),
                 InterfaceDefinition {
@@ -2348,7 +2377,7 @@ impl Checker<'_> {
             return true;
         }
         match expr {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 self.prove_exact_result(expr, expected, bindings, visiting)
             }
             Expr::New { span, .. } => {
@@ -2768,7 +2797,7 @@ impl Checker<'_> {
                 name_span: declaration.name_span,
                 type_parameters: declaration.type_params,
                 uses: edges,
-                valid: self.diagnostics.len() == before,
+                valid: !self.errors_since(before),
             });
         }
         let mut completed = HashSet::new();
@@ -2814,8 +2843,7 @@ impl Checker<'_> {
                             declaration.declaration == edge.declaration && declaration.valid
                         })
                     });
-                    let valid =
-                        namespace_valid && self.diagnostics.len() == before && valid_dependencies;
+                    let valid = namespace_valid && !self.errors_since(before) && valid_dependencies;
                     self.contracts.compositions.push(CompositionFacts {
                         class: class.name.clone(),
                         span: composition.span,
@@ -2867,7 +2895,7 @@ impl Checker<'_> {
         }
         self.contract_type_depth -= 1;
         self.type_parameter_scopes.pop();
-        if self.diagnostics.len() != before {
+        if self.errors_since(before) {
             if let Some(facts) = self
                 .contracts
                 .traits
@@ -2982,7 +3010,7 @@ impl Checker<'_> {
                 }
             }
         }
-        self.diagnostics.len() == before
+        !self.errors_since(before)
     }
 
     fn check_trait_expression(&mut self, expression: &Expr) {

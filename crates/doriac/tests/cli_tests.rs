@@ -18,6 +18,65 @@ fn development_launcher_keeps_bundled_runtime_enabled() {
 }
 
 #[test]
+fn explain_prints_an_entry_lists_the_catalogue_and_names_what_is_wrong() {
+    let entry = Command::new(doriac_bin())
+        .args(["explain", "e0782"])
+        .output()
+        .expect("doriac binary should run");
+    assert_success("explain", entry.clone());
+    let text = String::from_utf8(entry.stdout).expect("explain output should be UTF-8");
+    assert!(
+        text.starts_with("E0782: Null-Coalescing Operand Is Never Null\n\nWhy\n"),
+        "{text}"
+    );
+    for part in [
+        "\nFix\n",
+        "\nExample\n",
+        "https://docs.dorialang.org/v2026.3.1/diagnostics/e0782",
+    ] {
+        assert!(text.contains(part), "{part:?} missing from {text}");
+    }
+
+    let export = Command::new(doriac_bin())
+        .args(["explain", "--all", "--format", "json"])
+        .output()
+        .expect("doriac binary should run");
+    assert_success("explain --all --format json", export.clone());
+    let document: serde_json::Value =
+        serde_json::from_slice(&export.stdout).expect("the export should be JSON");
+    assert_eq!(document["schemaVersion"], 1);
+    assert!(document["entries"]
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(|entry| entry["code"] == "E0782")));
+    assert!(document["codesWithoutEntry"].is_array());
+
+    for (arguments, expected) in [
+        (
+            vec!["explain", "Z9999"],
+            "`Z9999` is not a Doria diagnostic code",
+        ),
+        (vec!["explain"], "`doriac explain` needs a code"),
+        (vec!["explain", "E0782", "--all"], "takes a code or `--all`"),
+        (
+            vec!["explain", "E0782", "--format", "yaml"],
+            "unknown explain format `yaml`",
+        ),
+    ] {
+        let output = Command::new(doriac_bin())
+            .args(&arguments)
+            .output()
+            .expect("doriac binary should run");
+        assert!(!output.status.success(), "{arguments:?} should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.contains("doriac explain"),
+            "{arguments:?} should say what to run: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn version_uses_canonical_toolchain_calver() {
     let output = Command::new(doriac_bin())
         .arg("--version")
@@ -382,6 +441,154 @@ fn run_keeps_program_output_separate_from_the_structured_runtime_outcome() {
     assert!(!stderr.contains("Compilation Failed"));
 
     let _ = fs::remove_dir_all(temp_dir);
+}
+
+/// A warning (E0646, an unused closure capture) never stops a command:
+/// `check`, `compile`, `run`, `metadata` and `hir` succeed with status 0 and
+/// report the warning, and an error beside it still fails.
+#[test]
+fn warnings_are_reported_without_stopping_any_command() {
+    let temp_dir = temp_dir_path("warnings-do-not-stop");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        r#"function main(): void
+{
+    let $value = 1;
+    let $unused = fn() with ($value) => 1;
+    echo "ran\n";
+}
+"#,
+    )
+    .expect("source should be writable");
+    let run = |arguments: &[&str]| {
+        Command::new(doriac_bin())
+            .current_dir(&temp_dir)
+            .args(arguments)
+            .args(["--diagnostic-color", "never"])
+            .output()
+            .expect("doriac binary should run")
+    };
+
+    let check = run(&["check", "main.doria"]);
+    assert_success("check with a warning", check.clone());
+    assert_eq!(String::from_utf8_lossy(&check.stdout), "OK\n");
+    let stderr = String::from_utf8_lossy(&check.stderr);
+    assert!(stderr.contains("E0646"), "{stderr}");
+    assert!(
+        stderr.contains("Compilation Completed With Warnings"),
+        "{stderr}"
+    );
+
+    let json = run(&["check", "main.doria", "--diagnostic-format", "json"]);
+    assert_success("check json with a warning", json.clone());
+    let document: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("check json is one envelope");
+    let reported = document["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert_eq!(reported.len(), 1, "{document}");
+    assert_eq!(reported[0]["code"], "E0646");
+    assert_eq!(reported[0]["severity"], "warning");
+
+    let concise = run(&["check", "main.doria", "--diagnostic-format", "concise"]);
+    assert_success("check concise with a warning", concise.clone());
+    assert!(String::from_utf8_lossy(&concise.stderr).contains("E0646"));
+
+    let compile = run(&["compile", "main.doria", "--out", "main-bin"]);
+    assert_success("compile with a warning", compile.clone());
+    assert!(String::from_utf8_lossy(&compile.stderr).contains("E0646"));
+    assert!(temp_dir.join("main-bin").exists());
+
+    let executed = run(&["run", "main.doria"]);
+    assert_success("run with a warning", executed.clone());
+    assert_eq!(String::from_utf8_lossy(&executed.stdout), "ran\n");
+    assert!(String::from_utf8_lossy(&executed.stderr).contains("E0646"));
+
+    let metadata = run(&["metadata", "main.doria"]);
+    assert_success("metadata with a warning", metadata.clone());
+    let document: serde_json::Value =
+        serde_json::from_slice(&metadata.stdout).expect("metadata stays one JSON document");
+    assert_eq!(document["schemaVersion"], 1);
+    assert!(String::from_utf8_lossy(&metadata.stderr).contains("E0646"));
+
+    let hir = run(&["hir", "main.doria"]);
+    assert_success("hir with a warning", hir.clone());
+
+    fs::write(
+        temp_dir.join("broken.doria"),
+        r#"function main(): void
+{
+    let $value = 1;
+    let $unused = fn() with ($value) => 1;
+    let int $wrong = "text";
+}
+"#,
+    )
+    .expect("source should be writable");
+    for arguments in [
+        vec!["check", "broken.doria"],
+        vec!["compile", "broken.doria", "--out", "broken-bin"],
+        vec!["run", "broken.doria"],
+    ] {
+        let output = run(&arguments);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Compilation Failed"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+/// A panic raised inside a compiler-known module is reported at the user's
+/// call: `new Position(1, -2)` panics in the Term module, and the report
+/// names line 3 of `main.doria`. Each native profile is held to it.
+fn compiler_known_panic_is_reported_at_the_call(profile_arguments: &[&str]) {
+    let temp_dir = temp_dir_path(&format!("compiler-known-panic-{}", profile_arguments.len()));
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        "function main(): void\n{\n    let $at = new Doria\\Std\\Term\\Position(1, -2);\n    echo $at->row;\n}\n",
+    )
+    .expect("source should be writable");
+    let mut arguments = vec!["run", "main.doria"];
+    arguments.extend_from_slice(profile_arguments);
+    arguments.extend([
+        "--diagnostic-format",
+        "concise",
+        "--diagnostic-color",
+        "never",
+    ]);
+    let output = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(&arguments)
+        .output()
+        .expect("doriac binary should run");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+    assert_eq!(output.status.code(), Some(101), "{stderr}");
+    assert!(
+        stderr.starts_with("main.doria:3:15: Panic["),
+        "{profile_arguments:?}: {stderr}"
+    );
+    assert!(!stderr.contains("compiler-known"), "{stderr}");
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn a_compiler_known_panic_is_reported_at_the_call_in_native_output() {
+    compiler_known_panic_is_reported_at_the_call(&[]);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn a_compiler_known_panic_is_reported_at_the_call_in_release_output() {
+    if !host_linker_is_available() {
+        return;
+    }
+    compiler_known_panic_is_reported_at_the_call(&["--release"]);
 }
 
 #[test]

@@ -313,8 +313,13 @@ fn lower_foreach_in_scope(
             )?
         };
         let owned = user_local_type_owns_value(ty) && !ty.has_move_ownership();
-        let target =
-            context.declare_user_local_owned(&foreach.value_binding.name, false, ty, owned);
+        let target = context.declare_user_local_owned(
+            &foreach.value_binding.name,
+            context.binding_declared_at(foreach.value_binding.span),
+            false,
+            ty,
+            owned,
+        );
         value_binding = Some(target);
         context.push_statement(mir::Statement::AssignLocal { target, value });
         Ok(())

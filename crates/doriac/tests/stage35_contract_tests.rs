@@ -783,6 +783,85 @@ fn primitive_constrained_methods_keep_check_and_lowering_in_agreement() {
 }
 
 #[test]
+fn copy_enums_meet_core_contracts_and_mark_the_payload_key_boundary() {
+    let enums = "enum Focus { case Search; case List; } enum Cell { case Empty; case Glyph(string $text, int $width); } enum Sample { case Reading(float $value); }";
+    for (constraint, body, result, argument) in [
+        (
+            "Equatable<T>",
+            "$value->equals($value)",
+            "bool",
+            "Focus::List",
+        ),
+        (
+            "Equatable<T>",
+            "$value->equals($value)",
+            "bool",
+            "Sample::Reading(1.5)",
+        ),
+        (
+            "Comparable<T>",
+            "$value->compare($value)",
+            "Ordering",
+            "Focus::List",
+        ),
+        (
+            "Comparable<T>",
+            "$value->compare($value)",
+            "Ordering",
+            "Cell::Glyph(\"a\", 1)",
+        ),
+        ("Hashable", "$value->hash()", "uint64", "Focus::Search"),
+        (
+            "Hashable",
+            "$value->hash()",
+            "uint64",
+            "Cell::Glyph(\"a\", 1)",
+        ),
+    ] {
+        let source = format!("{enums} function inspect<T implements {constraint}>(T $value): {result} {{ return {body}; }} function main(): void {{ inspect({argument}); }}");
+        doriac::check_source("enum-contract.doria", &source)
+            .unwrap_or_else(|errors| panic!("{source}: {errors:?}"));
+        let mir = doriac::lower_source_to_mir("enum-contract.doria", &source).unwrap();
+        doriac::mir_interpreter::interpret(&mir).unwrap();
+    }
+
+    // A float payload has no hash and no total order, so neither has the enum.
+    for (constraint, body, result) in [
+        ("Hashable", "$value->hash()", "uint64"),
+        ("Comparable<T>", "$value->compare($value)", "Ordering"),
+    ] {
+        let source = format!("{enums} function inspect<T implements {constraint}>(T $value): {result} {{ return {body}; }} function main(): void {{ inspect(Sample::Reading(1.5)); }}");
+        assert!(
+            doriac::check_source("enum-contract.doria", &source).is_err(),
+            "{source}"
+        );
+    }
+
+    // Unit enums are keys and elements of every hashed and ordered collection.
+    let keys = format!("{enums} function main(): void {{ writable Set<Focus> $seen = Set::from([]); $seen->add(Focus::List); writable Dictionary<Focus, int> $counts = []; $counts[Focus::List] = 1; writable SortedSet<Focus> $sorted = SortedSet::from([]); $sorted->add(Focus::List); }}");
+    doriac::check_source("enum-keys.doria", &keys).unwrap_or_else(|errors| panic!("{errors:?}"));
+
+    // Enums with payloads as keys or elements are planned (E0783), directly
+    // and through a type parameter bound at a call or a class instance.
+    for body in [
+        "function main(): void { Set<Cell> $cells = Set::from([Cell::Empty]); }",
+        "function main(): void { writable Dictionary<Cell, int> $counts = []; $counts[Cell::Empty] = 1; }",
+        "function main(): void { SortedSet<Cell> $cells = SortedSet::from([Cell::Empty]); }",
+        "function distinct<T implements Hashable>(take T $value): int { writable Set<T> $seen = Set::from([]); $seen->add($value); return $seen->count; } function main(): void { distinct(Cell::Empty); }",
+        "class Ring<T implements Comparable<T>> { function __construct(SortedSet<T> $items) {} } function main(): void { let $ring = new Ring<Cell>(SortedSet::from([])); }",
+    ] {
+        let source = format!("{enums} {body}");
+        let errors = doriac::check_source("enum-payload-keys.doria", &source)
+            .expect_err("an enum with payload cases is not a collection key yet");
+        assert!(
+            errors.iter().any(|error| error.code == "E0783"
+                && error.title == "Enums With Payloads Cannot Be Collection Keys Yet"),
+            "{body}: {errors:?}"
+        );
+    }
+}
+
+#[test]
 fn trait_local_members_are_checked_without_composer_injection() {
     let valid = "trait Counter { writable int $value = 0; writable function increment(): void { $this->value++; } function read(): int { return $this->value; } } function main(): void {}";
     assert!(

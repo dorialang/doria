@@ -238,6 +238,10 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
         function_types: Vec::new(),
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
+        foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
+        c_entries: Vec::new(),
+        companion: Default::default(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -260,6 +264,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                binding: None,
                 owned: false,
             }],
             blocks: vec![
@@ -284,6 +289,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
                 },
             ],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         }],
         selected_entry: Some(FunctionId(0)),
@@ -950,6 +956,10 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
         function_types: Vec::new(),
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
+        foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
+        c_entries: Vec::new(),
+        companion: Default::default(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -972,6 +982,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                binding: None,
                 owned: false,
             }],
             blocks: vec![BasicBlock {
@@ -990,6 +1001,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
                 terminator: int_return(local_integer_expression(LocalId(0))),
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         }],
         selected_entry: Some(FunctionId(0)),
@@ -1206,7 +1218,7 @@ fn lowers_multiple_top_level_functions_in_declaration_order() {
 
 function main(): int
 {
-    return 42;
+    return 41 + helper();
 }
 "#,
     );
@@ -1224,7 +1236,8 @@ fn lowers_if_condition_to_branch_terminator() {
     let program = lower(
         r#"function main(): int
 {
-    if (40 + 2 == 42) {
+    let $value = 40;
+    if ($value + 2 == 42) {
         return 42;
     }
 
@@ -1233,6 +1246,8 @@ fn lowers_if_condition_to_branch_terminator() {
 "#,
     );
 
+    // A constant condition folds (Decision 0148 section 17), so a local
+    // keeps this comparison a branch.
     assert_eq!(
         program.functions[0].blocks[0].terminator,
         Terminator::Branch {
@@ -1243,7 +1258,7 @@ fn lowers_if_condition_to_branch_terminator() {
                     right_span: Default::default(),
                     ty: DEFAULT_INT,
                     op: IntegerBinaryOp::Add,
-                    left: Box::new(int_constant(40)),
+                    left: Box::new(local_integer_expression(LocalId(0))),
                     right: Box::new(int_constant(2)),
                 })),
                 right: Box::new(int_expression_value(int_constant(42))),
@@ -1271,9 +1286,12 @@ fn lowers_if_without_else_through_a_continuation_block() {
     );
     let blocks = &program.functions[0].blocks;
 
+    // The condition is constant true, so the implicit else side is never
+    // lowered (Decision 0148 section 17): its block stays unreachable.
     assert_eq!(blocks.len(), 4);
+    assert_eq!(blocks[0].terminator, Terminator::Jump(BlockId(1)));
     assert_eq!(blocks[1].terminator, Terminator::Jump(BlockId(3)));
-    assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
+    assert_eq!(blocks[2].terminator, Terminator::Unreachable);
     assert_eq!(
         blocks[3].terminator,
         int_return(local_integer_expression(LocalId(0)))
@@ -1285,7 +1303,8 @@ fn lowers_if_else_to_distinct_return_blocks() {
     let program = lower(
         r#"function main(): int
 {
-    if (true) {
+    let $value = 0;
+    if ($value == 0) {
         return 42;
     } else {
         return 0;
@@ -1346,7 +1365,7 @@ fn lowers_all_stage_11c_integer_comparisons() {
         (">=", CompareOp::GreaterEqual),
     ] {
         let source = format!(
-            "function main(): int\n{{\n    if (1 {operator} 1) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+            "function main(): int\n{{\n    let $value = 1;\n    if ($value {operator} 1) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
         );
         let program = lower(&source);
         let Terminator::Branch { condition, .. } = &program.functions[0].blocks[0].terminator
@@ -1365,18 +1384,18 @@ fn lowers_word_and_symbol_condition_operators_equivalently() {
     for (word, symbol) in [("and", "&&"), ("or", "||"), ("not", "!")] {
         let word_source = if word == "not" {
             format!(
-                "function main(): int\n{{\n    if ({word} false) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+                "function main(): int\n{{\n    let $flag = false;\n    if ({word} $flag) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
             )
         } else {
             format!(
-                "function main(): int\n{{\n    if (true {word} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+                "function main(): int\n{{\n    let $flag = true;\n    if ($flag {word} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
             )
         };
         let symbol_source = if symbol == "!" {
-            "function main(): int\n{\n    if (!false) {\n        return 42;\n    }\n\n    return 0;\n}\n".to_string()
+            "function main(): int\n{\n    let $flag = false;\n    if (!$flag) {\n        return 42;\n    }\n\n    return 0;\n}\n".to_string()
         } else {
             format!(
-                "function main(): int\n{{\n    if (true {symbol} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+                "function main(): int\n{{\n    let $flag = true;\n    if ($flag {symbol} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
             )
         };
 
@@ -1389,7 +1408,8 @@ fn lowers_word_and_symbol_condition_operators_equivalently() {
     let xor = lower(
         r#"function main(): int
 {
-    if (true xor false) {
+    let $flag = true;
+    if ($flag xor false) {
         return 42;
     }
 
@@ -1637,6 +1657,10 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
         function_types: Vec::new(),
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
+        foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
+        c_entries: Vec::new(),
+        companion: Default::default(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -1660,6 +1684,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
                 terminator: Terminator::Jump(BlockId(0)),
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         }],
         selected_entry: Some(FunctionId(0)),
@@ -3039,7 +3064,7 @@ function main(): int
 }
 
 #[test]
-fn stage_11f_interprets_call_arguments_and_preserves_caller_locals() {
+fn stage_11f_interprets_call_arguments_and_lends_writable_locals() {
     let argument_output = interpret(
         r#"function add(int $left, int $right): int
 {
@@ -3071,7 +3096,9 @@ function main(): int
 }
 "#,
     );
-    assert_eq!(caller_output.exit_status, 41);
+    // A writable parameter lends the caller's local (Andrew's ruling of
+    // 2026-11-21, "Writable always borrows").
+    assert_eq!(caller_output.exit_status, 42);
 }
 
 #[test]
@@ -3234,6 +3261,10 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
         function_types: Vec::new(),
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
+        foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
+        c_entries: Vec::new(),
+        companion: Default::default(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -3256,6 +3287,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                binding: None,
                 owned: false,
             }],
             blocks: vec![BasicBlock {
@@ -3272,6 +3304,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
                 terminator: int_return(local_integer_expression(LocalId(0))),
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         }],
         selected_entry: Some(FunctionId(0)),

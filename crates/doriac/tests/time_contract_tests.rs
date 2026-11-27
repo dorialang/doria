@@ -632,8 +632,8 @@ function probe(Delay $first, Delay $second, Deadline $deadline, Deadline $otherD
         panic("generic inline callback changed");
     }
     writable Deadline $replacement = $deadline;
-    if (replaceDeadline($replacement, $otherDeadline) != $otherDeadline || $replacement != $deadline) {
-        panic("wide writable parameter changed");
+    if (replaceDeadline($replacement, $otherDeadline) != $otherDeadline || $replacement != $otherDeadline) {
+        panic("wide writable parameter lost its write");
     }
     let $generic = new Box<Delay>($first);
     if (identity($first) != $first || $generic->value != $first) { panic("generic copy changed"); }
@@ -641,7 +641,9 @@ function probe(Delay $first, Delay $second, Deadline $deadline, Deadline $otherD
     if (Defaults::delay != null || Defaults::deadline != null || optionalDeadline() != null) {
         panic("static default changed");
     }
-    if ((optionalDeadline($deadline) ?? $deadline) != $deadline || replace($first, $second) != $second || keep($first) != $first) {
+    writable Delay $replaced = $first;
+    if ((optionalDeadline($deadline) ?? $deadline) != $deadline || replace($replaced, $second) != $second
+        || $replaced != $second || keep($first) != $first) {
         panic("parameter copy changed");
     }
     let $packet = Packet::Delay($first);
@@ -665,7 +667,13 @@ function probe(Delay $first, Delay $second, Deadline $deadline, Deadline $otherD
     }
 }
 function seed(): void {}
-function main(): void { seed(); echo "copy preserved\n"; }
+function main(): void {
+    seed();
+    echo "copy preserved\n";
+    let $reach = function(Delay $first, Delay $second, Deadline $deadline, Deadline $otherDeadline): void {
+        probe($first, $second, $deadline, $otherDeadline);
+    };
+}
 "#;
 
 // Opaque test-only constants exercise deterministic carrier boundaries without
@@ -940,12 +948,11 @@ fn mir_rejects_inline_identity_changes_and_heap_class_carriers() {
 
 #[test]
 fn mir_rejects_every_heap_carrier_for_inline_time_values() {
-    let valid = doriac::lower_source_to_mir(
+    let valid = doriac::lower_library_source_to_mir(
         "inline-heap-carriers.doria",
         r#"
 use Doria\Std\Time\{Duration, Deadline};
 function unused(Duration $duration, Deadline $deadline): void {}
-function main(): void {}
 "#,
     )
     .unwrap();

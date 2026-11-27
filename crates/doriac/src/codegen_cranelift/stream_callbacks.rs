@@ -138,7 +138,7 @@ pub(super) fn resolve_target(
     builder: &mut FunctionBuilder,
     module: &mut ObjectModule,
     program: &mir::Program,
-    functions: &[FuncId],
+    functions: &[Option<FuncId>],
     statics: &[DataId],
     plan: mir::StreamCallbackPlan,
     descriptor: Value,
@@ -152,8 +152,9 @@ pub(super) fn resolve_target(
                 .ok_or_else(|| malformed_mir("stream callback vtable is not declared"))?;
             let data = module.declare_data_in_func(id, builder.func);
             let vtable = builder.ins().symbol_value(pointer, data);
-            let function = *functions
+            let function = functions
                 .get(entry.0)
+                .and_then(|id| *id)
                 .ok_or_else(|| malformed_mir("stream callback entry is not declared"))?;
             return Ok((
                 CallTarget::Static(module.declare_func_in_func(function, builder.func)),
@@ -198,7 +199,7 @@ pub(super) fn define(
     module: &mut ObjectModule,
     program: &mir::Program,
     callbacks: &[Callback],
-    functions: &[FuncId],
+    functions: &[Option<FuncId>],
     statics: &[DataId],
 ) -> Result<(), BackendError> {
     for callback in callbacks {
@@ -241,7 +242,7 @@ fn emit(
     module: &mut ObjectModule,
     program: &mir::Program,
     plan: mir::StreamCallbackPlan,
-    functions: &[FuncId],
+    functions: &[Option<FuncId>],
     statics: &[DataId],
 ) -> Result<(), BackendError> {
     let entry = builder.create_block();
@@ -345,7 +346,7 @@ fn emit(
                         builder.ins().store(flags, args[2], slot, 0);
                         slot
                     }
-                    mir::Type::ByteRegion(_) => {
+                    mir::Type::Region(_) => {
                         let slot = scratch(builder, pointer, pointer.bytes() * 2, pointer.bytes());
                         builder.ins().store(flags, data, slot, 0);
                         builder
@@ -674,9 +675,11 @@ mod tests {
             .iter()
             .map(|function| {
                 let signature = function_signature(&mut module, &program, function).unwrap();
-                module
-                    .declare_function(&function_symbol(function), Linkage::Local, &signature)
-                    .unwrap()
+                Some(
+                    module
+                        .declare_function(&function_symbol(function), Linkage::Local, &signature)
+                        .unwrap(),
+                )
             })
             .collect::<Vec<_>>();
         let mut statics = program

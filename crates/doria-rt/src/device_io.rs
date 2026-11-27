@@ -421,6 +421,68 @@ pub(crate) unsafe fn write_stdout_at_process_end(bytes: &[u8]) {
     let _ = write_unclaimed(StandardStream::Stdout, bytes.as_ptr(), bytes.len());
 }
 
+/// Decision 0148 section 21: a process may start without a standard stream,
+/// as a Windows GUI program does or as a program whose parent closed one.
+/// Each absent stream is given the null device, so writing to it discards
+/// the bytes, reading it reports end of input, it is never interactive, and
+/// no file the program opens later takes its place. Every route to the
+/// stream then behaves by the same rule, so none checks for absence itself.
+/// Only a stream absent when the process started is given one: a stream
+/// the program or its host closes later stays closed, and its operations
+/// report that it is closed. Native process entry runs this before any Doria
+/// code with every stream in `absent_at_start`, since nothing has closed one
+/// yet; a host that loads the shared runtime later passes the streams it
+/// found absent when it started (bit 0 standard input, 1 output, 2 error).
+/// Every standard stream, for native process entry.
+pub(crate) const EVERY_STANDARD_STREAM: u32 = 0b111;
+
+pub(crate) unsafe fn provide_absent_streams(absent_at_start: u32) {
+    let streams = [
+        StandardStream::Stdin,
+        StandardStream::Stdout,
+        StandardStream::Stderr,
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(bit, _)| absent_at_start & (1 << bit) != 0)
+    .map(|(_, stream)| stream);
+    #[cfg(unix)]
+    for stream in streams {
+        let descriptor = descriptor(stream);
+        if libc::fcntl(descriptor, libc::F_GETFD) != -1
+            || crate::platform_io::last_system_code() != i64::from(libc::EBADF)
+        {
+            continue;
+        }
+        // `open` returns the lowest free descriptor, which is this one when
+        // the lower streams are present; otherwise it is moved here.
+        let opened = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if opened >= 0 && opened != descriptor {
+            libc::dup2(opened, descriptor);
+            libc::close(opened);
+        }
+    }
+    #[cfg(windows)]
+    for stream in streams {
+        if valid_handle(stream).is_some() {
+            continue;
+        }
+        const NUL: [u16; 4] = [b'N' as u16, b'U' as u16, b'L' as u16, 0];
+        let device = crate::win32::CreateFileW(
+            NUL.as_ptr(),
+            0x8000_0000 | 0x4000_0000,
+            1 | 2,
+            ptr::null(),
+            3,
+            0,
+            ptr::null_mut(),
+        );
+        if device != INVALID_HANDLE_VALUE {
+            crate::win32::SetStdHandle(standard_identifier(stream), device);
+        }
+    }
+}
+
 #[cfg(unix)]
 unsafe fn is_interactive_unclaimed(stream: StandardStream) -> bool {
     is_interactive_descriptor(descriptor(stream))
@@ -456,12 +518,17 @@ const fn classify_windows_write_error(error: Option<crate::platform_io::Failure>
 }
 
 #[cfg(windows)]
-fn handle(stream: StandardStream) -> *mut c_void {
-    let identifier = match stream {
+const fn standard_identifier(stream: StandardStream) -> u32 {
+    match stream {
         StandardStream::Stdin => STD_INPUT_HANDLE,
         StandardStream::Stdout => STD_OUTPUT_HANDLE,
         StandardStream::Stderr => STD_ERROR_HANDLE,
-    };
+    }
+}
+
+#[cfg(windows)]
+fn handle(stream: StandardStream) -> *mut c_void {
+    let identifier = standard_identifier(stream);
     // The typed identifier is valid; lookup does not dereference, close, or
     // perform I/O on the returned handle, which remains process-owned.
     unsafe { GetStdHandle(identifier) }

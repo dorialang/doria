@@ -1,5 +1,6 @@
 use crate::lexer::StringQuoteKind;
 use crate::source::{QualifiedNameRef, Span};
+pub use crate::types::ForeignAbi;
 use crate::types::TypeRef;
 
 pub mod transform;
@@ -7,6 +8,9 @@ pub mod visit;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
+    /// `declare(<key>: "<value>");` directives, which precede every other
+    /// source item (Decision 0148 section 25).
+    pub directives: Vec<DeclareDirective>,
     pub namespace: Option<NamespaceDecl>,
     pub imports: Vec<UseDecl>,
     pub includes: Vec<IncludeDecl>,
@@ -19,6 +23,12 @@ pub struct Program {
     /// target without duplicating the authored application for promoted
     /// constructor parameters.
     pub attributes: Vec<AttributeAttachment>,
+    /// Every `callee<A, B>(...)` whose type arguments are all plain or
+    /// namespaced names, which also reads as comparisons (Decision 0105,
+    /// Amendment: Type Arguments At The Call), with the reading this tree
+    /// gives it. Name resolution chooses each reading once; a tree whose
+    /// readings differ from that choice is parsed again with it.
+    pub call_candidates: Vec<CallCandidate>,
     pub items: Vec<Item>,
 }
 
@@ -80,6 +90,12 @@ pub enum AttributeTargetKind {
     Parameter,
     EnumCase,
     EnumPayloadField,
+    /// An `extern "C" { ... }` block (Decision 0148 section 18).
+    ExternBlock,
+    /// A function declared inside an `extern "C"` block.
+    ForeignFunction,
+    /// An `extern "C" struct` or `union` declaration.
+    ForeignAggregate,
 }
 
 impl AttributeTargetKind {
@@ -99,6 +115,9 @@ impl AttributeTargetKind {
             Self::Parameter => "parameter",
             Self::EnumCase => "enumCase",
             Self::EnumPayloadField => "enumPayloadField",
+            Self::ExternBlock => "externBlock",
+            Self::ForeignFunction => "foreignFunction",
+            Self::ForeignAggregate => "foreignAggregate",
         }
     }
 }
@@ -118,6 +137,97 @@ impl AttributeTargetRole {
             Self::PromotedProperty => "promotedProperty",
         }
     }
+}
+
+/// `declare(<key>: "<value>");`, a structured source directive (Decision 0028,
+/// grammar from Decision 0148 section 25). The key and value stay authored;
+/// semantic checking decides which keys and values exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclareDirective {
+    pub keyword_span: Span,
+    pub key: NameRef,
+    pub value: String,
+    pub value_span: Span,
+    pub semicolon_span: Span,
+    pub span: Span,
+}
+
+/// A `/** ... */` block immediately before a declaration (Decision 0148
+/// section 27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocComment {
+    pub span: Span,
+    /// The `@safety` section: the caller's obligations, when written.
+    pub safety: Option<DocSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocSection {
+    /// The tag through the end of its text.
+    pub span: Span,
+    /// The section's text with comment decoration removed.
+    pub text: String,
+}
+
+/// An `extern "C" { ... }` block. Its declarations follow it in
+/// [`Program::items`] as [`Item::Function`]s whose linkage names this block,
+/// because they resolve as free functions of the enclosing namespace
+/// (Decision 0148 section 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternBlock {
+    pub access: MemberAccess,
+    pub access_span: Option<Span>,
+    pub extern_span: Span,
+    pub abi: ForeignAbi,
+    pub open_brace_span: Span,
+    pub close_brace_span: Span,
+    pub documentation: Option<DocComment>,
+    /// The span of each declaration in the block, in source order.
+    pub declarations: Vec<Span>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ForeignAggregateKind {
+    Struct,
+    Union,
+}
+
+impl ForeignAggregateKind {
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Struct => "struct",
+            Self::Union => "union",
+        }
+    }
+}
+
+/// `extern "C" struct Name { ... }`, `extern "C" union Name { ... }`, or the
+/// incomplete `extern "C" struct Name;` (Decision 0148 sections 3 and 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAggregateDecl {
+    pub access: MemberAccess,
+    pub access_span: Option<Span>,
+    pub extern_span: Span,
+    pub abi: ForeignAbi,
+    pub kind: ForeignAggregateKind,
+    pub keyword_span: Span,
+    pub name: String,
+    pub name_span: Span,
+    /// `None` for an incomplete type declared without a body.
+    pub fields: Option<Vec<ForeignFieldDecl>>,
+    pub documentation: Option<DocComment>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignFieldDecl {
+    pub ty: TypeRef,
+    pub type_span: Span,
+    pub name: String,
+    pub name_span: Span,
+    pub default: Option<Expr>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +285,8 @@ pub enum Item {
     Trait(TraitDecl),
     Function(FunctionDecl),
     Constant(ConstDecl),
+    ExternBlock(ExternBlock),
+    ForeignAggregate(ForeignAggregateDecl),
     Statement(Stmt),
 }
 
@@ -431,6 +543,11 @@ pub struct FunctionDecl {
     pub consuming_span: Option<Span>,
     pub is_static: bool,
     pub static_span: Option<Span>,
+    /// `unsafe function`: every call needs an unsafe context; the body is an
+    /// ordinary context (Decision 0148 section 2).
+    pub unsafe_span: Option<Span>,
+    pub linkage: FunctionLinkage,
+    pub documentation: Option<Box<DocComment>>,
     pub name: String,
     pub name_span: Span,
     pub type_params: Vec<TypeParamDecl>,
@@ -454,10 +571,46 @@ impl FunctionDecl {
     }
 }
 
+/// How a function is reached from outside Doria (Decision 0148).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionLinkage {
+    Doria,
+    /// `extern "C" function name(...) { ... }`: a Doria function with the
+    /// target's C calling convention, reached by C through its address
+    /// (section 12).
+    CAbi {
+        extern_span: Span,
+        abi: Box<ForeignAbi>,
+    },
+    /// A declaration in the `extern "C"` block whose span this is (section
+    /// 15). Its body is [`FunctionBody::Foreign`].
+    Foreign {
+        block: Span,
+    },
+}
+
+impl FunctionLinkage {
+    pub const fn is_doria(&self) -> bool {
+        matches!(self, Self::Doria)
+    }
+
+    pub const fn is_foreign(&self) -> bool {
+        matches!(self, Self::Foreign { .. })
+    }
+
+    pub const fn is_c_abi(&self) -> bool {
+        matches!(self, Self::CAbi { .. })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionBody {
     Block(Block),
     Requirement {
+        semicolon_span: Span,
+    },
+    /// The bodyless declaration of a foreign symbol.
+    Foreign {
         semicolon_span: Span,
     },
     Intrinsic {
@@ -470,21 +623,23 @@ impl FunctionBody {
     pub fn as_block(&self) -> Option<&Block> {
         match self {
             Self::Block(block) => Some(block),
-            Self::Requirement { .. } | Self::Intrinsic { .. } => None,
+            Self::Requirement { .. } | Self::Foreign { .. } | Self::Intrinsic { .. } => None,
         }
     }
 
     pub fn as_block_mut(&mut self) -> Option<&mut Block> {
         match self {
             Self::Block(block) => Some(block),
-            Self::Requirement { .. } | Self::Intrinsic { .. } => None,
+            Self::Requirement { .. } | Self::Foreign { .. } | Self::Intrinsic { .. } => None,
         }
     }
 
     pub fn span(&self) -> Span {
         match self {
             Self::Block(block) => block.span,
-            Self::Requirement { semicolon_span } => *semicolon_span,
+            Self::Requirement { semicolon_span } | Self::Foreign { semicolon_span } => {
+                *semicolon_span
+            }
             Self::Intrinsic { span, .. } => *span,
         }
     }
@@ -503,6 +658,7 @@ pub enum CompilerIntrinsic {
     Time(crate::compiler_known_time::TimeFunction),
     Concurrency(crate::compiler_known_concurrency::ConcurrencyFunction),
     Term(crate::compiler_known_term::TermFunction),
+    Text(crate::compiler_known_text::TextFunction),
     Process(crate::compiler_known_stream::ProcessFunction),
 }
 
@@ -517,6 +673,7 @@ impl CompilerIntrinsic {
             Self::Time(_) => crate::compiler_known_time::SOURCE_ID,
             Self::Concurrency(_) => crate::compiler_known_concurrency::SOURCE_ID,
             Self::Term(_) => crate::compiler_known_term::SOURCE_ID,
+            Self::Text(_) => crate::compiler_known_text::SOURCE_ID,
         }
     }
 
@@ -532,7 +689,7 @@ impl CompilerIntrinsic {
             Self::Term(function) => {
                 function == crate::compiler_known_term::TermFunction::AwaitEvent
             }
-            Self::Time(_) | Self::TransferPlan(_) | Self::Concurrency(_) => false,
+            Self::Time(_) | Self::TransferPlan(_) | Self::Concurrency(_) | Self::Text(_) => false,
         }
     }
 
@@ -543,7 +700,7 @@ impl CompilerIntrinsic {
             Self::TransferPlan(implementation) => implementation.return_borrow(),
             Self::TransferGroup(implementation) => implementation.return_borrow(),
             Self::Process(function) => function.return_borrow(),
-            Self::Time(_) | Self::Concurrency(_) | Self::Term(_) => None,
+            Self::Time(_) | Self::Concurrency(_) | Self::Term(_) | Self::Text(_) => None,
         }
     }
 
@@ -556,7 +713,8 @@ impl CompilerIntrinsic {
             | Self::Time(_)
             | Self::Concurrency(_)
             | Self::Process(_)
-            | Self::Term(_) => Vec::new(),
+            | Self::Term(_)
+            | Self::Text(_) => Vec::new(),
         }
     }
 }
@@ -694,19 +852,42 @@ pub enum Stmt {
     Block(Block),
     VarDecl(VarDecl),
     Assignment(Assignment),
-    Echo { expr: Expr, span: Span },
-    Return { expr: Option<Expr>, span: Span },
+    Echo {
+        expr: Expr,
+        span: Span,
+    },
+    Return {
+        expr: Option<Expr>,
+        span: Span,
+    },
     Throw(ThrowStmt),
     Try(TryStmt),
     If(IfStmt),
     While(WhileStmt),
     DoWhile(DoWhileStmt),
     For(Box<ForStmt>),
-    Break { span: Span },
-    Continue { span: Span },
+    Break {
+        span: Span,
+    },
+    Continue {
+        span: Span,
+    },
     Foreach(Box<ForeachStmt>),
     Increment(IncrementStmt),
-    Expr { expr: Expr, span: Span },
+    Expr {
+        expr: Expr,
+        span: Span,
+    },
+    /// `unsafe { ... }`: a lexical block that is an unsafe context (Decision
+    /// 0148 section 2).
+    Unsafe(UnsafeBlock),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsafeBlock {
+    pub keyword_span: Span,
+    pub block: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1043,6 +1224,9 @@ pub enum Expr {
         object: Box<Expr>,
         method: String,
         member_span: Span,
+        /// `$value->method<T>(...)` (Decision 0105, Amendment: Type
+        /// Arguments At The Call).
+        type_arguments: Option<CallTypeArguments>,
         args: Vec<Argument>,
         argument_list_span: Span,
         null_safe: bool,
@@ -1055,6 +1239,9 @@ pub enum Expr {
     },
     FunctionCall {
         name: String,
+        /// `name<T>(...)` (Decision 0105, Amendment: Type Arguments At The
+        /// Call).
+        type_arguments: Option<CallTypeArguments>,
         args: Vec<Argument>,
         span: Span,
     },
@@ -1072,6 +1259,9 @@ pub enum Expr {
         method: String,
         member_span: Span,
         member_sigil_span: Option<Span>,
+        /// `Class::method<T>(...)` (Decision 0105, Amendment: Type Arguments
+        /// At The Call).
+        type_arguments: Option<CallTypeArguments>,
         args: Vec<Argument>,
         argument_list_span: Span,
         span: Span,
@@ -1124,6 +1314,13 @@ pub enum Expr {
     },
     When(Box<WhenExpression>),
     Closure(Box<ClosureExpression>),
+    /// `unsafe(<expression>)`: exactly that expression is an unsafe context,
+    /// and the form yields its value (Decision 0148 section 2).
+    Unsafe {
+        keyword_span: Span,
+        expr: Box<Expr>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1212,6 +1409,36 @@ pub enum InterpolatedStringPart {
     Expr(Expr),
 }
 
+/// The type arguments a call states, from `<` to `>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallTypeArguments {
+    pub arguments: Vec<TypeRef>,
+    pub span: Span,
+}
+
+/// One `callee<A, B>(...)` whose type arguments are all plain or namespaced
+/// names: identified by its `<`, with the names and the reading the tree
+/// that holds it gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallCandidate {
+    pub open_span: Span,
+    pub names: Vec<CandidateTypeName>,
+    pub read_as: CallReading,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateTypeName {
+    pub name: String,
+    pub span: Span,
+}
+
+/// How a [`CallCandidate`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallReading {
+    TypeArguments,
+    Comparison,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrayElement {
     pub key: Option<Expr>,
@@ -1277,7 +1504,8 @@ impl Expr {
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
             | Expr::Range { span, .. }
-            | Expr::Match { span, .. } => *span,
+            | Expr::Match { span, .. }
+            | Expr::Unsafe { span, .. } => *span,
             Expr::When(when) => when.span,
             Expr::Closure(closure) => closure.span,
         }

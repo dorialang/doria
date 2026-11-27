@@ -117,6 +117,14 @@ a version increment. A location whose source text is unavailable keeps its
 `source` and byte `span` and has a `null` `range` (call-path frames: `null`
 `line` and `column`).
 
+Only an error stops a command. A program whose findings are warnings and
+notes checks, compiles and runs, and every command exits as it would without
+them. `check` reports its warnings as its result: on stderr with the
+`Compilation Completed With Warnings` summary before `OK`, or in its JSON
+envelope. Every other command writes its warnings to stderr in the selected
+format, because stdout carries its own result: the output path, the program's
+output, or the metadata, HIR or MIR document.
+
 `--diagnostic-color auto` colors only an interactive stderr and honors
 `NO_COLOR`. `always` and `never` are explicit and testable.
 
@@ -140,6 +148,38 @@ direct-entry symbols and dispatch adapters are not additional authored calls.
 Shared MIR records adapter frame ownership explicitly; transparent entries retain
 the caller's source site. Closure names use their existing source identity, and
 method names use their nominal declaring class and member, not generated symbols.
+
+## Catalogue entries
+
+Every diagnostic code has a documentation entry in
+`crates/doria-diagnostic-catalogue/entries/<CODE>.md` (Decision 0145). An entry
+is what `doriac explain <code>` prints and what the website shows at the
+diagnostic's link. It documents the code as a whole; the message written where
+the code is raised stays specific to the program.
+
+- The title is Title Case with no closing period. Mark it `Title: fixed` when
+  the compiler raises the code under exactly that title, and `Title: varies`
+  when the compiler's title depends on the program.
+- `## Explanation` says what the code means in one to three short paragraphs.
+- `## Fix` names the concrete change, with real member and keyword names.
+- `## Example` is one small program whose first error is this code and which
+  contains no other mistake. For a runtime panic the program compiles and
+  panics with the code when run. A code that no program raises on demand has
+  a sentence in place of the program, beginning `No program raises this code
+  on demand`.
+- `Family:` names the entry's family from `entries/FAMILIES.txt`.
+- A code for a feature the compiler does not have yet says so without reading
+  as a rejection: `Availability: planned` when the feature is part of Doria
+  for the first full release, `Availability: later` when Doria reserves it
+  for a later one. A `later` entry states the reservation as the release's
+  rule, without `today` or `as before`.
+- A code that nothing raises any more is retired, not deleted: it moves to
+  `RETIRED_DIAGNOSTIC_CODES` and its number is never reused.
+- A new code arrives with its entry. A code never joins
+  `entries/WITHOUT_ENTRY.txt`; it only leaves it.
+
+The rules above for diagnostic prose apply to entries: plain Doria vocabulary,
+no compiler internals, no development stages.
 
 ## Review checklist
 

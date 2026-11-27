@@ -54,6 +54,9 @@ pub enum AttributeTarget {
         field_name: String,
         span: Span,
     },
+    /// An `extern "C" { ... }` block (Decision 0148 section 18). It declares
+    /// no global symbol; its source and position identify it.
+    ExternBlock { source: SourceIdentity, span: Span },
 }
 
 impl AttributeTarget {
@@ -100,6 +103,9 @@ impl AttributeTarget {
                 "enum-payload:{}:{case_index}:{field_index}",
                 enumeration.qualified_name
             ),
+            Self::ExternBlock { source, span } => {
+                format!("extern-block:{}:{}", source.0, span.start)
+            }
         }
     }
 }
@@ -945,6 +951,13 @@ pub fn metadata_type_name(ty: &ResolvedType) -> String {
         ResolvedType::Nullable(inner) => format!("?{}", metadata_type_name(inner)),
         ResolvedType::Bytes => "Bytes".to_string(),
         ResolvedType::ByteRegion(kind) => kind.source_name().to_string(),
+        ResolvedType::ArrayRegion(kind, element) => {
+            format!(
+                "{}<{}>",
+                kind.array_source_name(),
+                metadata_type_name(element)
+            )
+        }
         ResolvedType::Mixed => "mixed".to_string(),
         ResolvedType::Error => "Error".to_string(),
         ResolvedType::TypeParameter(name) => {
@@ -1023,6 +1036,7 @@ pub fn metadata_type_name(ty: &ResolvedType) -> String {
         ResolvedType::SharedHandle(kind, inner) => {
             format!("{}<{}>", kind.source_name(), metadata_type_name(inner))
         }
+        ResolvedType::Foreign(foreign) => foreign.display_with(metadata_type_name),
         ResolvedType::Unsupported => "Unknown".to_string(),
     }
 }
@@ -1061,6 +1075,8 @@ pub fn attribute_value_from_const(
                 fields,
             }
         }
+        // Attribute schemas admit no foreign struct or union type.
+        ConstValue::ForeignAggregate(_) => return None,
     };
     Some(AttributeValue {
         semantic_type,

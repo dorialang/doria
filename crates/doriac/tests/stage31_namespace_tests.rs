@@ -350,6 +350,7 @@ fn same_file_resolution_uses_canonical_package_owned_identities() {
         edition: Edition::Doria2026,
         package: PackageIdentity::named("acme/demo", Span::default()).unwrap(),
         source: SourceIdentity("src/main.doria".to_string()),
+        unsafe_policy: doriac::build_plan::UnsafePolicy::Allow,
     };
     let (_, analysis) = doriac::analyze_source_for_ide_with_context(
         "src/main.doria",
@@ -446,6 +447,7 @@ fn package_identity_and_namespace_are_independent() {
             edition: Edition::Doria2026,
             package: PackageIdentity::named(package, Span::default()).unwrap(),
             source: SourceIdentity(format!("{package}/main.doria")),
+            unsafe_policy: doriac::build_plan::UnsafePolicy::Allow,
         };
         doriac::analyze_source_for_ide_with_context(
             "main.doria",
@@ -506,6 +508,7 @@ function main(): void { let $user = new ModelUser(); }
         edition: Edition::Doria2026,
         package: PackageIdentity::SyntheticTooling("test-workspace".to_string()),
         source: SourceIdentity("app.doria".to_string()),
+        unsafe_policy: doriac::build_plan::UnsafePolicy::Allow,
     };
     let (_, analysis) =
         doriac::analyze_source_for_ide_with_context("app.doria", source, context).unwrap();
@@ -578,6 +581,7 @@ fn context_aware_api_preserves_existing_standalone_defaults() {
         edition: Edition::Doria2026,
         package: PackageIdentity::Named("acme/tool".to_string()),
         source: SourceIdentity("src/tool.doria".to_string()),
+        unsafe_policy: doriac::build_plan::UnsafePolicy::Allow,
     };
     let contextual = doriac::lower_source_with_context("test.doria", source, context.clone())
         .expect("context-aware lowering should work");
@@ -903,6 +907,7 @@ fn compiler_context_reaches_check_hir_mir_and_backend_emission() {
         edition: Edition::Doria2026,
         package: PackageIdentity::Named("acme/tool".to_string()),
         source: SourceIdentity("src/main.doria".to_string()),
+        unsafe_policy: doriac::build_plan::UnsafePolicy::Allow,
     };
     doriac::check_source_with_context("src/main.doria", source, context.clone())
         .expect("context-aware checking should succeed");

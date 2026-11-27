@@ -285,6 +285,7 @@ function main(): void {
     let $source = new CancellationSource();
     List<Held> $tokens = [Held::Token($source->token); 2];
     visit($tokens);
+    inspect(null);
 }
 "#,
     )
@@ -571,6 +572,7 @@ fn writable_class_aliases_cannot_escalate_readonly_source_access() {
             name: "alias".into(),
             owned: false,
             synthetic: true,
+            binding: None,
             ..owner.clone()
         });
         let value = match owner.ty {
@@ -639,10 +641,9 @@ class Key implements Hashable, Equatable<Key>, Comparable<Key>
     function compare(Key $other): Ordering {{ return Ordering::Equal; }}
 }}
 function inspect(writable {type_name} $items): void {{}}
-function main(): void {{}}
 "#
         );
-        let mut valid = doriac::lower_source_to_mir(
+        let mut valid = doriac::lower_library_source_to_mir(
             "core-collection-view-capability.doria",
             source,
         )
@@ -670,6 +671,7 @@ function main(): void {{}}
             writable: false,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         let target = LocalId(function.locals.len());
         function.locals.push(Local {
@@ -679,6 +681,7 @@ function main(): void {{}}
             writable: permits_writable_value,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         let entry = function.entry_block;
         function.blocks[entry.0].statements.extend([
@@ -803,6 +806,7 @@ function main(): void {{ let $holder = new Holder(); $holder->inspect(); }}
                 writable: true,
                 owned: false,
                 synthetic: true,
+                binding: None,
             });
             id
         };
@@ -839,6 +843,7 @@ function main(): void {{ let $holder = new Holder(); $holder->inspect(); }}
             writable: false,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         let view = append_view(function);
         function.blocks[entry.0].statements.splice(
@@ -1007,10 +1012,9 @@ fn unused_move_returns_cannot_erase_or_forge_their_borrow_contract() {
     ] {
         let source = format!(
             "class Book {{}}\n\
-             function first({input} $source, int $other): {output} {{ return {value}; }}\n\
-             function main(): void {{}}"
+             function first({input} $source, int $other): {output} {{ return {value}; }}"
         );
-        let program = doriac::lower_source_to_mir("unused-return-borrow.doria", &source)
+        let program = doriac::lower_library_source_to_mir("unused-return-borrow.doria", &source)
             .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
         doriac::mir_validation::validate_program(&program).unwrap();
         let first = program
@@ -1080,11 +1084,11 @@ fn collection_removal_returns_owned_values_without_borrowing_the_container() {
                  enum Parcel {{ case Item(Book $book); }}\n\
                  function remove(writable {collection} $source): {output} {{\n\
                      return $source->{operation};\n\
-                 }}\n\
-                 function main(): void {{}}"
+                 }}"
             );
-            let program = doriac::lower_source_to_mir("owned-removal-return.doria", &source)
-                .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
+            let program =
+                doriac::lower_library_source_to_mir("owned-removal-return.doria", &source)
+                    .unwrap_or_else(|errors| panic!("{source}\n{errors:#?}"));
             doriac::mir_validation::validate_program(&program)
                 .unwrap_or_else(|error| panic!("{source}\n{error:#?}"));
             let remove = program
@@ -1110,7 +1114,7 @@ fn collection_removal_returns_owned_values_without_borrowing_the_container() {
 
 #[test]
 fn nullable_callable_absence_is_neutral_but_conflicting_provenance_is_rejected() {
-    let mut program = doriac::lower_source_to_mir(
+    let mut program = doriac::lower_library_source_to_mir(
         "nullable-callable-provenance.doria",
         r#"
 class Source {
@@ -1119,7 +1123,6 @@ class Source {
 }
 function forward(?Source $source): ?function(): int { return $source?->make(); }
 function independent(): function(): int { return fn() => 0; }
-function main(): void {}
 "#,
     )
     .unwrap();
@@ -1203,10 +1206,10 @@ function capture({callback_type} $callback): function(): bool {{
 function forward({callback_type} $callback): function(): bool {{
     return capture($callback);
 }}
-function main(): void {{}}
 "#
         );
-        let program = doriac::lower_source_to_mir("callable-provenance.doria", &source).unwrap();
+        let program =
+            doriac::lower_library_source_to_mir("callable-provenance.doria", &source).unwrap();
         doriac::mir_validation::validate_program(&program).unwrap();
         let mut missing_provenance = program.clone();
         let forward = missing_provenance
@@ -1814,6 +1817,7 @@ function overlap(writable Box $left, Box $right): void {}
 function main(): void {
     let writable $owner = new Box();
     change($owner);
+    let $reach = function(writable Box $left, Box $right): void { overlap($left, $right); };
 }
 "#,
     )
@@ -2572,6 +2576,11 @@ function takeMove(take MoveResult $result): Box
 function main(): void throws Doria\Std\Io\IoError
 {
     echo copyLabel(CopyResult::Text("ready"));
+    let $reach = function(MoveResult $result, mixed $value, take MoveResult $owned): void {
+        let $moved = moveLabel($result);
+        let $mixed = mixedLabel($value);
+        let $taken = takeMove($owned);
+    };
 }
 "#;
     let valid = doriac::lower_source_to_mir("stage28-validation.doria", source)
@@ -3181,9 +3190,10 @@ function main(): void
     );
 
     let mut mixed_identity = valid;
-    let Rvalue::Mixed(MixedExpression::BoxValue(ValueExpression::Enum(EnumExpression::Case(
-        value,
-    )))) = assignment_rvalue(&mut mixed_identity, "boxed")
+    let Rvalue::Mixed(MixedExpression::BoxValue {
+        value: ValueExpression::Enum(EnumExpression::Case(value)),
+        ..
+    }) = assignment_rvalue(&mut mixed_identity, "boxed")
     else {
         panic!("expected mixed enum box");
     };
@@ -3346,6 +3356,7 @@ function repeat(): void
 function main(): void throws Doria\Std\Io\IoError
 {
     echo "{choose(true)}";
+    let $reach = function(bool $ready): void { gated($ready); repeat(); };
 }
 "#;
     let valid = doriac::lower_source_to_mir("stage28a-validation.doria", source)
@@ -4268,6 +4279,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -4387,6 +4399,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
             writable: false,
             owned: true,
             synthetic: false,
+            binding: None,
         }],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4410,6 +4423,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -4433,6 +4447,7 @@ fn shared_validator_enforces_grouped_local_invariants() {
             writable: false,
             owned: false,
             synthetic: false,
+            binding: None,
         })
         .collect();
     valid.functions[0].blocks[0].statements = vec![Statement::AssignLocalGroup {
@@ -4555,6 +4570,7 @@ fn shared_validator_rejects_confused_string_intrinsic_collection_shapes() {
         ty: Type::Collection(CollectionTypeId(0)),
         writable: false,
         synthetic: true,
+        binding: None,
         owned: true,
     });
     program.functions[0].blocks[0].statements = vec![
@@ -4590,6 +4606,7 @@ fn shared_validator_rejects_wrong_nullable_string_intrinsic_representation() {
         ty: Type::NullableString,
         writable: false,
         synthetic: true,
+        binding: None,
         owned: true,
     });
     program.functions[0].blocks[0]
@@ -4631,6 +4648,7 @@ fn shared_validator_rejects_consuming_string_intrinsic_collection_inputs() {
         ty: Type::Collection(CollectionTypeId(0)),
         writable: false,
         synthetic: false,
+        binding: None,
         owned: true,
     });
     program.functions[0].blocks[0].statements = vec![
@@ -4908,6 +4926,7 @@ fn shared_validator_enforces_sequence_fill_shape() {
         writable: false,
         owned: true,
         synthetic: false,
+        binding: None,
     });
     program.functions[0].blocks[0].statements = vec![
         Statement::AssignLocal {
@@ -4970,20 +4989,22 @@ fn shared_validator_requires_exact_is_proof_for_mixed_payload_reads() {
         writable: false,
         owned: true,
         synthetic: false,
+        binding: None,
     });
     program.functions[0].blocks[0]
         .statements
         .push(Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Mixed(doriac::mir::MixedExpression::BoxValue(
-                ValueExpression::Integer(doriac::mir::IntegerExpression::Use {
+            value: Rvalue::Mixed(doriac::mir::MixedExpression::BoxValue {
+                value: ValueExpression::Integer(doriac::mir::IntegerExpression::Use {
                     ty: IntegerType::Int64,
                     operand: Operand::Scalar(ScalarValue::Integer(IntegerValue::from_bits(
                         IntegerType::Int64,
                         1,
                     ))),
                 }),
-            )),
+                tag: doriac::mir::MixedTag::Integer(IntegerType::Int64),
+            }),
         });
     program.functions[0].blocks[0].terminator = Terminator::Return(Rvalue::Value(
         ValueExpression::Integer(doriac::mir::IntegerExpression::Use {
@@ -5011,6 +5032,7 @@ fn shared_validator_limits_explicit_string_drops_to_synthetic_temporaries() {
         ty: Type::String,
         writable: false,
         synthetic: true,
+        binding: None,
         owned: false,
     });
     program.functions[0].blocks[0].statements = vec![
@@ -5149,6 +5171,7 @@ fn shared_validator_rejects_scalar_string_assignment_mixing() {
         ty: Type::String,
         writable: true,
         synthetic: false,
+        binding: None,
         owned: false,
     });
     program.functions[0].blocks[0]
@@ -5191,6 +5214,7 @@ fn shared_validator_rejects_nullable_rvalue_assigned_to_plain_string() {
         ty: Type::String,
         writable: true,
         synthetic: false,
+        binding: None,
         owned: false,
     });
     program.functions[0].blocks[0]
@@ -5319,6 +5343,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
                 ))),
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         });
     }
@@ -5430,6 +5455,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5487,6 +5513,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
                 ty: Type::String,
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -5496,6 +5523,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5573,6 +5601,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5633,6 +5662,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5683,6 +5713,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5776,6 +5807,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -5805,6 +5837,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
                 writable: false,
                 owned: false,
                 synthetic: false,
+                binding: None,
             },
             class_local(1, ClassId(0)),
         ],
@@ -5814,6 +5847,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -5908,6 +5942,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -5933,6 +5968,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -5958,6 +5994,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6021,6 +6058,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
                 ty: Type::String,
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -6030,6 +6068,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -6055,6 +6094,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
             terminator: Terminator::Unreachable,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6135,6 +6175,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
                 ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -6144,6 +6185,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6169,6 +6211,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
             writable: false,
             synthetic: false,
+            binding: None,
             owned: false,
         },
         borrowed_class_local(1, ClassId(0)),
@@ -6248,6 +6291,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6409,6 +6453,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6595,6 +6640,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6676,6 +6722,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -6865,6 +6912,7 @@ fn shared_validator_requires_class_properties_in_construction_order() {
         ty: Type::String,
         writable: false,
         synthetic: false,
+        binding: None,
         owned: false,
     });
     let Statement::AssignLocal {
@@ -6946,6 +6994,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         writable: false,
         owned: false,
         synthetic: false,
+        binding: None,
     };
     program.functions.push(Function {
         id: FunctionId(1),
@@ -7002,6 +7051,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
             },
         ],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -7386,6 +7436,7 @@ fn shared_validator_rejects_whole_receiver_uses_but_not_disjoint_fields_in_prope
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let Statement::AssignProperty { value, .. } = &mut program.functions[0].blocks[0].statements[0]
@@ -7631,6 +7682,9 @@ function main(): void {
     );
     let constructor = &mut program.functions[class.constructor.unwrap().0];
     let input = constructor.params[1];
+    // A retained writable source lends its caller's place, as a `borrow
+    // writable` promoted parameter does.
+    constructor.parameter_modes[1] = mir::FunctionParameterMode::Writable;
     constructor.blocks[constructor.entry_block.0]
         .statements
         .insert(
@@ -7685,6 +7739,7 @@ function main(): void {
         writable: false,
         owned: false,
         synthetic: true,
+        binding: None,
     });
     let entry = &mut main.blocks[main.entry_block.0];
     let construction = entry.statements.iter().position(|statement| {
@@ -7761,6 +7816,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let error = doriac::mir_validation::validate_program(&parameter)
@@ -7791,6 +7847,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
             terminator: Terminator::Unreachable,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let error = doriac::mir_validation::validate_program(&returned)
@@ -7827,6 +7884,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     doriac::mir_validation::validate_program(&valid)
@@ -7896,6 +7954,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -7944,6 +8003,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -7984,6 +8044,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8059,6 +8120,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -8090,6 +8152,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8152,6 +8215,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8274,6 +8338,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
             })),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let error = doriac::mir_validation::validate_program(&returned)
@@ -8398,6 +8463,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
                 ty: Type::NullableClass(ClassId(1)),
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -8407,6 +8473,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8509,6 +8576,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
             ty: Type::SharedReference(doriac::mir::SharedPayload::Class(ClassId(0))),
             writable: false,
             synthetic: false,
+            binding: None,
             owned: false,
         }],
         blocks: vec![BasicBlock {
@@ -8526,6 +8594,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
             )),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -8543,6 +8612,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         ty: Type::WeakReference(doriac::mir::SharedPayload::Class(ClassId(0))),
         writable: false,
         synthetic: false,
+        binding: None,
         owned: true,
     });
     program.functions[0].blocks[0]
@@ -8600,6 +8670,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
             ty: Type::WeakReference(doriac::mir::SharedPayload::Class(ClassId(0))),
             writable: false,
             synthetic: false,
+            binding: None,
             owned: false,
         }],
         blocks: vec![BasicBlock {
@@ -8617,6 +8688,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
             )),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     let error = doriac::mir_validation::validate_program(&acquire)
@@ -8715,6 +8787,10 @@ fn valid_void_program() -> Program {
         function_types: Vec::new(),
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
+        foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
+        c_entries: Vec::new(),
+        companion: Default::default(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -8738,6 +8814,7 @@ fn valid_void_program() -> Program {
                 terminator: Terminator::ReturnVoid,
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         }],
         selected_entry: Some(FunctionId(0)),
@@ -8756,6 +8833,8 @@ fn class_program() -> Program {
             arguments: Vec::new(),
             source_span: Default::default(),
             is_open: false,
+            constructed: true,
+            implementations_reached: true,
             parent: None,
             ancestors: Vec::new(),
             virtual_methods: Vec::new(),
@@ -8778,6 +8857,7 @@ fn class_local(index: usize, class: ClassId) -> Local {
         ty: Type::Class(class),
         writable: false,
         synthetic: false,
+        binding: None,
         owned: true,
     }
 }
@@ -8854,6 +8934,7 @@ fn class_new_program() -> Program {
                 ty: Type::String,
                 writable: false,
                 synthetic: false,
+                binding: None,
                 owned: false,
             },
         ],
@@ -8863,6 +8944,7 @@ fn class_new_program() -> Program {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program
@@ -8935,6 +9017,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     program.functions.push(Function {
@@ -8960,6 +9043,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
     (program, child)

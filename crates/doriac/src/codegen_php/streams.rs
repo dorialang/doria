@@ -1818,7 +1818,7 @@ function regionLoop(int $iterations): int {
     }
     return $sum;
 }
-function main(): void {}
+function main(): void { let $reach0 = regionLoop(0); }
 "#,
         );
         let script = format!(
@@ -1985,7 +1985,15 @@ function carriers(Duration $duration, Deadline $deadline, RegistrationKey<Readab
     ReadTransferKey $read, WriteTransferKey $write, WatchKey $watch, WatchSource $watched,
     StandardInput $input, StandardOutput $output, StandardError $error, CancellationToken $token,
     TransferGroup $group): void {}
-function main(): void {}
+function main(): void {
+    let $reach = function(Duration $duration, Deadline $deadline, RegistrationKey<ReadableFile> $registration,
+        ReadTransferKey $read, WriteTransferKey $write, WatchKey $watch, WatchSource $watched,
+        StandardInput $input, StandardOutput $output, StandardError $error, CancellationToken $token,
+        TransferGroup $group): void {
+        carriers($duration, $deadline, $registration, $read, $write, $watch, $watched, $input,
+            $output, $error, $token, $group);
+    };
+}
 "#,
         );
         assert!(!contents(&php).contains("__doriaWaitWords"));
@@ -2091,7 +2099,10 @@ function hotRead(int $iterations): int {
     }
     return $sum;
 }
-function main(): void {}
+function main(): void {
+    let $erased = hotErasedRead(0);
+    let $direct = hotRead(0);
+}
 "#,
         );
         let BackendOutput::TextWithRuntime { contents, .. } = &mut php else {
@@ -2263,7 +2274,7 @@ function hotWindows(int $iterations): int {
         || $destination[3] != 99) { panic("window destination changed"); }
     return $sum;
 }
-function main(): void {}
+function main(): void { let $reach0 = hotCompletions(0); let $reach1 = hotWindows(0); }
 "#,
         );
         let mut script = String::from(
@@ -2445,7 +2456,15 @@ function check{name}({ty} $value): void {{
 }}
 "#));
         }
-        source.push_str("function main(): void {}\n");
+        // The script calls each check directly; main reaches them through
+        // function values, since nothing here builds the inline values.
+        source.push_str("function main(): void {\n");
+        for (name, ty, _) in families {
+            source.push_str(&format!(
+                "    let $check{name} = function({ty} $value): void {{ check{name}($value); }};\n"
+            ));
+        }
+        source.push_str("}\n");
         let mut php = compile("inline-operand-snapshots.doria", &source);
         let mut script = String::from("\n$source = file_get_contents(__FILE__);\n");
         for (name, _, width) in families {
@@ -2744,7 +2763,13 @@ class AdapterFailure implements Error {
 function failAdapter(): void throws AdapterFailure { throw new AdapterFailure("original adapter error"); }
 function getDropCount(): int { return AdapterFailure::drops; }
 function observeIoError(IoError $error): void {}
-function main(): void { let $set = new ReadinessSet(); }
+function main(): void {
+    let $set = new ReadinessSet();
+    let $reach = function(): int {
+        try { failAdapter(); } catch (AdapterFailure) {}
+        return getDropCount();
+    };
+}
 "#,
         );
         let BackendOutput::TextWithRuntime { contents, .. } = &mut php else {
@@ -2857,7 +2882,17 @@ function retire(writable ReadinessSet $set, RegistrationKey<Ready> $key): Ready 
 }
 function bump(writable Ready $stream): void { $stream->count++; }
 function dropCount(): int { return Drops::count; }
-function main(): void {}
+function main(): void {
+    let $reach = function(writable ReadinessSet $set, RegistrationKey<Ready> $key, writable Ready $stream): int {
+        let $made = makeSet();
+        let $admitted = admit($set, makeStream());
+        let $read = readMember($set, $key);
+        let $written = writeMember($set, $key);
+        let $retired = retire($set, $key);
+        bump($stream);
+        return dropCount();
+    };
+}
 "#,
         );
         let BackendOutput::TextWithRuntime { contents, .. } = &mut php else {
@@ -3056,7 +3091,7 @@ function members(): ReadinessSet {
     $set->register(File::openReadWrite("input", FileCreation::OpenExisting, FileWriteMode::Positioned));
     return $set;
 }
-function main(): void {}
+function main(): void { let $reach = function(): ReadinessSet { return members(); }; }
 "#,
         );
         let BackendOutput::TextWithRuntime { contents, .. } = &mut php else {
@@ -3453,8 +3488,9 @@ function main(): void throws IoError {
         let BackendOutput::TextWithRuntime { contents, .. } = &mut php else {
             panic!("file transfer fixture must use native bytes");
         };
-        // A writable Copy parameter changes its local copy, not its caller.
-        // Exercise the private borrowed-slot carrier separately from that contract.
+        // A writable Copy parameter lends its caller's byte (Andrew's ruling of
+        // 2026-11-21, "Writable always borrows"). Exercise the borrowed-slot
+        // carrier directly as well.
         contents.push_str(
             r#"
 $owner = __DoriaBytes::fromArray([65, 66, 67], 0, 0, "");
@@ -3474,10 +3510,10 @@ echo $cell->value . "\n";
         };
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
-        assert_eq!(output.stdout, b"65 68 67\n90\n91\n");
+        assert_eq!(output.stdout, b"65 90 67\n90\n91\n");
         assert_eq!(
             std::fs::read(fixture.0.join("projection.bin")).unwrap(),
-            b"ADC"
+            b"AZC"
         );
     }
 

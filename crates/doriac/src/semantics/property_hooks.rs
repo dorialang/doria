@@ -251,7 +251,7 @@ impl Checker<'_> {
         context: Option<&MethodContext>,
     ) {
         let target = match target {
-            Expr::Grouped { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
                 return self.check_setter_argument(expr, value, scopes, context)
             }
             _ => target,
@@ -681,6 +681,7 @@ impl Checker<'_> {
             method,
             self.exact_method_calls
                 .contains(&(span, method.declaration)),
+            span,
         );
         let declaring_type = self.types.resolved(declaring_type);
         let target = match &declaring_type {

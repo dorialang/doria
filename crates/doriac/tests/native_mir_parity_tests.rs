@@ -6,11 +6,15 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use doriac::backend::NativeProfile;
+use doriac::backend::{BackendOutput, BackendTarget, CompileOptions, NativeProfile};
+use doriac::native_link::NativeLinking;
 
 #[path = "common/execution_directory.rs"]
 mod execution_directory;
+#[path = "common/fixture_linking.rs"]
+mod fixture_linking;
 use execution_directory::ExecutionDirectory;
+use fixture_linking::read_linking;
 
 const MANIFEST: &str = include_str!("fixtures/native_parity_examples.txt");
 const NATIVE_CLOSURE_MANIFEST: &str = include_str!("fixtures/native_closures/manifest.txt");
@@ -76,7 +80,7 @@ function main(): void
             NativeProfile::Release => "LLVM",
         };
         let native = compile_and_run(&mir, profile, name, backend, &fixture);
-        assert_matches_interpreter(name, backend, profile, &interpreted, &native);
+        assert_matches_interpreter(name, backend, Some(profile), &interpreted, &native);
     }
 }
 
@@ -96,7 +100,9 @@ fn release_panic_projection_preserves_output_and_omits_only_frames() {
 #[test]
 fn manifest_covers_every_native_example() {
     let workspace = workspace_root();
-    let manifest = manifest_paths();
+    let (in_packages, manifest): (BTreeSet<_>, BTreeSet<_>) = manifest_paths()
+        .into_iter()
+        .partition(|path| package_root(&workspace, path).is_some());
     let native_directory = workspace.join("examples/native");
     let examples = fs::read_dir(native_directory)
         .expect("native examples directory should be readable")
@@ -118,36 +124,28 @@ fn manifest_covers_every_native_example() {
         .collect::<BTreeSet<_>>();
 
     assert_eq!(manifest, examples);
+
+    // Every foreign function interface example package runs too, through
+    // its entry source.
+    let packages = fs::read_dir(workspace.join("examples/ffi"))
+        .expect("foreign function interface examples should be readable")
+        .map(|entry| entry.expect("example package should be readable").path())
+        .filter(|path| path.join("Baton.toml").is_file())
+        .collect::<BTreeSet<_>>();
+    let covered = in_packages
+        .iter()
+        .filter_map(|path| package_root(&workspace, path))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(covered, packages);
 }
 
 #[test]
 fn interpreter_matches_every_durable_io_fixture() {
     let workspace = workspace_root();
     for relative_path in manifest_paths() {
-        let path = workspace.join(&relative_path);
-        let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("failed to read parity source {relative_path}: {error}")
-        });
-        let hir =
-            doriac::lower_source(relative_path.clone(), source).unwrap_or_else(|diagnostics| {
-                panic!("frontend rejected parity source {relative_path}: {diagnostics:#?}")
-            });
-        let mir = doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
-            panic!("MIR rejected parity source {relative_path}: {diagnostics:#?}")
-        });
+        let mir = lower_manifest_entry(&workspace, &relative_path);
         let fixture = IoFixture::load(&workspace, &relative_path);
-        let interpreted = doriac::mir_interpreter::interpret_with_io(
-            &mir,
-            doriac::mir_interpreter::MirIo {
-                stdin: fixture.stdin.clone(),
-                files: fixture.files.clone(),
-                args: fixture.args.clone(),
-                ..doriac::mir_interpreter::MirIo::default()
-            },
-        )
-        .unwrap_or_else(|error| {
-            panic!("interpreter rejected parity source {relative_path}: {error}")
-        });
+        let interpreted = fixture.interpret(&mir, &relative_path);
         fixture.assert_expected(&relative_path, &interpreted);
     }
 }
@@ -188,31 +186,9 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
 
     let workspace = workspace_root();
     for relative_path in shard(manifest_paths()) {
-        let path = workspace.join(&relative_path);
-        let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("failed to read parity source {relative_path}: {error}")
-        });
-        let hir = doriac::lower_source(relative_path.clone(), source.clone()).unwrap_or_else(
-            |diagnostics| {
-                panic!("frontend rejected parity source {relative_path}: {diagnostics:#?}")
-            },
-        );
-        let mir = doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
-            panic!("MIR rejected parity source {relative_path}: {diagnostics:#?}")
-        });
+        let mir = lower_manifest_entry(&workspace, &relative_path);
         let fixture = IoFixture::load(&workspace, &relative_path);
-        let interpreted = doriac::mir_interpreter::interpret_with_io(
-            &mir,
-            doriac::mir_interpreter::MirIo {
-                stdin: fixture.stdin.clone(),
-                files: fixture.files.clone(),
-                args: fixture.args.clone(),
-                ..doriac::mir_interpreter::MirIo::default()
-            },
-        )
-        .unwrap_or_else(|error| {
-            panic!("interpreter rejected parity source {relative_path}: {error}")
-        });
+        let interpreted = fixture.interpret(&mir, &relative_path);
         fixture.assert_expected(&relative_path, &interpreted);
 
         for &profile in NativeProfile::AVAILABLE {
@@ -221,8 +197,107 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
                 NativeProfile::Release => ("LLVM", "LLVM release"),
             };
             let native = compile_and_run(&mir, profile, &relative_path, backend, &fixture);
-            assert_matches_interpreter(&relative_path, label, profile, &interpreted, &native);
+            assert_matches_interpreter(&relative_path, label, Some(profile), &interpreted, &native);
         }
+    }
+}
+
+/// The help every E0784 for PHP output carries.
+const NATIVE_TARGETS_HELP: &str =
+    "build the program with `--target native`, or run it with `--target debug`; both build this form";
+
+/// PHP output of every fixture whose `php_output` file states it (Decision
+/// 0148, amendment of 2026-11-27): `runs` builds the program for PHP and
+/// matches the interpreter's stdout, stderr, status and file effects;
+/// a diagnostic code reports that code and no other, and an E0784 names
+/// the targets that build the program.
+#[test]
+fn php_output_runs_or_reports_the_fixtures_that_state_it() {
+    let workspace = workspace_root();
+    let php_runs = php_with_ffi_is_available();
+    for relative_path in manifest_paths() {
+        let fixture = IoFixture::load(&workspace, &relative_path);
+        let Some(expected) = fixture.php_output.clone() else {
+            continue;
+        };
+        let source = fs::read_to_string(workspace.join(&relative_path)).unwrap_or_else(|error| {
+            panic!("failed to read parity source {relative_path}: {error}")
+        });
+        let compiled = doriac::compile_source_with_options(
+            relative_path.clone(),
+            source,
+            CompileOptions {
+                linking: fixture.linking.clone(),
+                ..CompileOptions::new(BackendTarget::Php)
+            },
+        );
+        match expected {
+            PhpOutput::Reports(code) => {
+                let Err(diagnostics) = compiled else {
+                    panic!("PHP output should report {code} for {relative_path}");
+                };
+                assert!(
+                    !diagnostics.is_empty()
+                        && diagnostics.iter().all(|diagnostic| diagnostic.code == code
+                            && (code != "E0784" || diagnostic.helps == [NATIVE_TARGETS_HELP])),
+                    "{relative_path}: {diagnostics:#?}"
+                );
+            }
+            PhpOutput::Runs => {
+                let output = compiled.unwrap_or_else(|diagnostics| {
+                    panic!("PHP output should build {relative_path}: {diagnostics:#?}")
+                });
+                if !php_runs {
+                    let message = format!("PHP with FFI is unavailable to run {relative_path}");
+                    if std::env::var_os("CI").is_some() {
+                        panic!("{message}; CI must not skip PHP output parity");
+                    }
+                    eprintln!("{message}; skipping its PHP run");
+                    continue;
+                }
+                let mir = lower_manifest_entry(&workspace, &relative_path);
+                let interpreted = fixture.interpret(&mir, &relative_path);
+                let php = publish_and_run_php(output, &relative_path, &fixture);
+                assert_matches_interpreter(&relative_path, "PHP output", None, &interpreted, &php);
+            }
+        }
+    }
+}
+
+fn php_with_ffi_is_available() -> bool {
+    Command::new("php")
+        .args(["-r", "exit(class_exists('FFI') ? 0 : 1);"])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Publishes PHP output, with its runtime and any companion library, into
+/// its own directory and runs it in a directory seeded with the fixture's
+/// files.
+fn publish_and_run_php(
+    output: BackendOutput,
+    relative_path: &str,
+    fixture: &IoFixture,
+) -> NativeRun {
+    let artifacts = ExecutionDirectory::new();
+    let script = artifacts.path().join("program.php");
+    doriac::backend::publish_output(&script, output).unwrap_or_else(|error| {
+        panic!("failed to publish PHP output for {relative_path}: {error:?}")
+    });
+    let working_directory = ExecutionDirectory::new();
+    fixture.seed_native_files(working_directory.path(), relative_path);
+    let mut command = Command::new("php");
+    command.arg(&script);
+    let output = run_command(
+        command,
+        working_directory.path(),
+        &fixture.stdin,
+        &fixture.args,
+    )
+    .unwrap_or_else(|error| panic!("failed to run PHP output for {relative_path}: {error}"));
+    NativeRun {
+        output,
+        files: read_tree(working_directory.path()),
     }
 }
 
@@ -283,7 +358,7 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_native_closures() {
                 NativeProfile::Release => "LLVM",
             };
             let native = compile_and_run(&mir, profile, &name, backend, &fixture);
-            assert_matches_interpreter(&name, backend, profile, &interpreted, &native);
+            assert_matches_interpreter(&name, backend, Some(profile), &interpreted, &native);
         }
     }
 }
@@ -434,6 +509,9 @@ fn assert_closed_output_pipe(
     assert!(output.stderr.is_empty(), "{backend} {name} wrote stderr");
 }
 
+/// Links `mir` with the fixture's link facts, publishes the executable
+/// with the runtime files its foreign libraries load into its own
+/// directory, and runs it in a directory seeded with the fixture's files.
 fn compile_and_run(
     mir: &doriac::mir::Program,
     profile: NativeProfile,
@@ -441,22 +519,32 @@ fn compile_and_run(
     backend: &str,
     fixture: &IoFixture,
 ) -> NativeRun {
-    let bytes = doriac::codegen_native::generate_executable(mir, profile).unwrap_or_else(|error| {
-        panic!("{backend} backend rejected parity source {relative_path}: {error:?}")
-    });
-    let working_directory = ExecutionDirectory::new();
-    fixture.seed_native_files(working_directory.path(), relative_path);
-    let executable = working_directory.path().join(if cfg!(windows) {
+    let executable =
+        doriac::codegen_native::generate_linked_executable(mir, profile, &fixture.linking)
+            .unwrap_or_else(|error| {
+                panic!("{backend} backend rejected parity source {relative_path}: {error:?}")
+            });
+    let artifacts = ExecutionDirectory::new();
+    let program = artifacts.path().join(if cfg!(windows) {
         "program.exe"
     } else {
         "program"
     });
-    fs::write(&executable, bytes).unwrap_or_else(|error| {
-        panic!("failed to write {backend} parity executable for {relative_path}: {error}")
+    doriac::backend::publish_output(
+        &program,
+        BackendOutput::Executable {
+            extension: String::new(),
+            bytes: executable.bytes,
+            runtime_files: executable.runtime_files,
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!("failed to publish {backend} parity executable for {relative_path}: {error:?}")
     });
-    make_executable(&executable);
+    let working_directory = ExecutionDirectory::new();
+    fixture.seed_native_files(working_directory.path(), relative_path);
     let output = run_native_executable(
-        &executable,
+        &program,
         working_directory.path(),
         &fixture.stdin,
         &fixture.args,
@@ -464,19 +552,18 @@ fn compile_and_run(
     .unwrap_or_else(|error| {
         panic!("failed to run {backend} parity executable for {relative_path}: {error}")
     });
-    let mut files = read_tree(working_directory.path());
-    files.remove(if cfg!(windows) {
-        "program.exe"
-    } else {
-        "program"
-    });
-    NativeRun { output, files }
+    NativeRun {
+        output,
+        files: read_tree(working_directory.path()),
+    }
 }
 
+/// Compares a run with the interpreter's. A release-profile panic report
+/// may omit call-path frames.
 fn assert_matches_interpreter(
     relative_path: &str,
     backend: &str,
-    profile: NativeProfile,
+    profile: Option<NativeProfile>,
     interpreted: &doriac::mir_interpreter::InterpreterIoOutput,
     native: &NativeRun,
 ) {
@@ -490,7 +577,7 @@ fn assert_matches_interpreter(
         native.output.stdout, interpreted.output.stdout,
         "stdout mismatch for {relative_path} ({backend})"
     );
-    if profile == NativeProfile::Release && interpreted.output.exit_status == 101 {
+    if profile == Some(NativeProfile::Release) && interpreted.output.exit_status == 101 {
         assert!(
             release_stderr_is_projection(&interpreted.output.stderr, &native.output.stderr),
             "stderr mismatch for {relative_path} ({backend})\nexpected projection of: {:?}\nactual: {:?}",
@@ -581,6 +668,57 @@ fn manifest_paths() -> BTreeSet<String> {
         .collect()
 }
 
+/// The root of the Baton package a manifest entry belongs to: its nearest
+/// directory with a `Baton.toml`, inside the workspace.
+fn package_root(workspace: &Path, relative_path: &str) -> Option<PathBuf> {
+    workspace
+        .join(relative_path)
+        .ancestors()
+        .skip(1)
+        .take_while(|directory| directory.starts_with(workspace) && *directory != workspace)
+        .find(|directory| directory.join("Baton.toml").is_file())
+        .map(Path::to_path_buf)
+}
+
+fn lower_manifest_entry(workspace: &Path, relative_path: &str) -> doriac::mir::Program {
+    let source = fs::read_to_string(workspace.join(relative_path))
+        .unwrap_or_else(|error| panic!("failed to read parity source {relative_path}: {error}"));
+    let hir =
+        doriac::lower_source(relative_path.to_string(), source).unwrap_or_else(|diagnostics| {
+            panic!("frontend rejected parity source {relative_path}: {diagnostics:#?}")
+        });
+    doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
+        panic!("MIR rejected parity source {relative_path}: {diagnostics:#?}")
+    })
+}
+
+/// A fixture's `php_output` file: `runs` or one diagnostic code, after any
+/// `#` comment lines.
+fn read_php_output(path: &Path) -> Option<PhpOutput> {
+    let bytes = read_optional(path)?;
+    let text = std::str::from_utf8(&bytes).map(|text| {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    Some(match text.as_deref() {
+        Ok("runs") => PhpOutput::Runs,
+        Ok(code)
+            if code.len() == 5
+                && code.starts_with(|first: char| first.is_ascii_uppercase())
+                && code[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            PhpOutput::Reports(code.to_string())
+        }
+        _ => panic!(
+            "{} should contain `runs` or a diagnostic code such as `E0784`",
+            path.display()
+        ),
+    })
+}
+
 fn native_closure_fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_closures")
 }
@@ -646,8 +784,18 @@ fn run_native_executable(
     stdin: &[u8],
     args: &[String],
 ) -> io::Result<Output> {
+    run_command(Command::new(executable), cwd, stdin, args)
+}
+
+/// Runs `command` with `args` in `cwd`, feeding it `stdin`.
+fn run_command(
+    mut command: Command,
+    cwd: &Path,
+    stdin: &[u8],
+    args: &[String],
+) -> io::Result<Output> {
     let mut child = doriac::native_process::spawn(
-        Command::new(executable)
+        command
             .args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -704,17 +852,74 @@ struct IoFixture {
     expected_stdout: Option<Vec<u8>>,
     expected_stderr: Option<Vec<u8>>,
     expected_status: Option<i32>,
+    /// The link facts of the native libraries the program names, from the
+    /// fixture's `link` file (Decision 0148 section 18). The interpreter's
+    /// companion library and every native profile link with them.
+    linking: NativeLinking,
+    /// What PHP output does with the program, from the fixture's
+    /// `php_output` file; a fixture without one is not built for PHP here.
+    php_output: Option<PhpOutput>,
+}
+
+/// What PHP output does with a fixture's program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PhpOutput {
+    /// `runs`: it builds and runs as the interpreter does.
+    Runs,
+    /// A diagnostic code, such as `E0784`: building for PHP reports that
+    /// code and no other.
+    Reports(String),
 }
 
 impl IoFixture {
+    /// The fixture of a manifest entry: `native_io/<name>`, where `<name>`
+    /// is the entry's file stem, or the package directory's name for an
+    /// entry inside a Baton package. Paths in its `link` file are relative
+    /// to the package root, or to the entry's directory.
     fn load(workspace: &Path, relative_path: &str) -> Self {
-        let stem = Path::new(relative_path)
-            .file_stem()
-            .expect("parity source should have a file stem");
+        let source = workspace.join(relative_path);
+        let package = package_root(workspace, relative_path);
+        let name = match &package {
+            Some(root) => root.file_name(),
+            None => source.file_stem(),
+        }
+        .expect("parity source should have a fixture name");
         let root = workspace
             .join("crates/doriac/tests/fixtures/native_io")
-            .join(stem);
-        Self::load_root(&root)
+            .join(name);
+        let directory = package.unwrap_or_else(|| {
+            source
+                .parent()
+                .expect("parity source should have a directory")
+                .to_path_buf()
+        });
+        Self {
+            linking: read_linking(&root.join("link"), &directory),
+            php_output: read_php_output(&root.join("php_output")),
+            ..Self::load_root(&root)
+        }
+    }
+
+    /// Runs `mir` in the interpreter with the fixture's input, files,
+    /// arguments and link facts.
+    fn interpret(
+        &self,
+        mir: &doriac::mir::Program,
+        relative_path: &str,
+    ) -> doriac::mir_interpreter::InterpreterIoOutput {
+        doriac::mir_interpreter::interpret_with_io(
+            mir,
+            doriac::mir_interpreter::MirIo {
+                stdin: self.stdin.clone(),
+                files: self.files.clone(),
+                args: self.args.clone(),
+                linking: self.linking.clone(),
+                ..doriac::mir_interpreter::MirIo::default()
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("interpreter rejected parity source {relative_path}: {error}")
+        })
     }
 
     fn load_root(root: &Path) -> Self {
@@ -744,6 +949,7 @@ impl IoFixture {
             expected_stdout: read_optional(&root.join("expected_stdout")),
             expected_stderr: read_optional(&root.join("expected_stderr")),
             expected_status,
+            ..Self::default()
         }
     }
 

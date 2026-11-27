@@ -258,9 +258,8 @@ function main(): void
     assert!(
         diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "E0471"
-                && diagnostic
-                    .message
-                    .contains("destination of a property assignment")
+                && diagnostic.message
+                    == "`$box` cannot be given away while `$box->value` is being assigned"
         }),
         "unexpected diagnostics: {diagnostics:#?}"
     );
@@ -468,7 +467,9 @@ fn borrowed_this_cannot_initialize_a_new_owner() {
 }
 
 #[test]
-fn writable_move_promotion_fix_replaces_writable_with_take() {
+fn writable_move_promotion_fix_inserts_take_and_keeps_the_property_writable() {
+    // Decision 0083, 2026-11-20: the fix used to replace `writable` with
+    // `take`, which made the property readonly. It now inserts `take`.
     let source = "class Person {} class Team { function __construct(writable Person $manager) {} }";
     let diagnostics = doriac::check_source("writable-promotion.doria", source)
         .expect_err("writable promotion must transfer ownership instead");
@@ -476,9 +477,39 @@ fn writable_move_promotion_fix_replaces_writable_with_take() {
         .iter()
         .find(|diagnostic| diagnostic.code == "E0468")
         .expect("promotion diagnostic");
-    let fix = diagnostic.fix.as_ref().expect("replacement fix");
-    assert_eq!(fix.replacement, "take");
-    assert_eq!(&source[fix.span.start..fix.span.end], "writable");
+    let fix = diagnostic.fix.as_ref().expect("insertion fix");
+    assert_eq!(fix.replacement, "take ");
+    assert_eq!(fix.span.start, fix.span.end);
+    assert_eq!(fix.span.start, source.find("writable Person").unwrap());
+}
+
+#[test]
+fn promoted_parameters_may_take_ownership_of_a_writable_property() {
+    for modifiers in ["take writable", "writable take"] {
+        let source = format!(
+            r#"
+class Person {{ function __construct(writable int $age) {{}} }}
+class Team
+{{
+    function __construct(internal {modifiers} List<Person> $members) {{}}
+    writable function welcome(take Person $person): void {{ $this->members->add($person); }}
+}}
+function main(): void
+{{
+    let writable $team = new Team([]);
+    $team->welcome(new Person(30));
+}}
+"#
+        );
+        doriac::check_source("promoted-take-writable.doria", source)
+            .unwrap_or_else(|errors| panic!("{modifiers}: {errors:#?}"));
+    }
+    let readonly = doriac::check_source(
+        "promoted-take.doria",
+        "class Person {} class Team { function __construct(take List<Person> $members) {} writable function clear(): void { $this->members->clear(); } }",
+    )
+    .expect_err("a promoted take property without writable stays readonly");
+    assert!(readonly.iter().any(|diagnostic| diagnostic.code == "E0201"));
 }
 
 #[test]

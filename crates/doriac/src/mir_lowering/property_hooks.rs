@@ -179,7 +179,7 @@ impl SetterPlace {
         target: &hir::Expr,
         context: &mut LoweringContext<'_>,
     ) -> DiagnosticResult<Option<Self>> {
-        let target = unparenthesized_place(target);
+        let target = unparenthesized_place(target, context);
         let Some(calls) = context
             .semantic_info
             .property_accessor_calls

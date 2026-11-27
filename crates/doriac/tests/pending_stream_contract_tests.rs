@@ -632,10 +632,10 @@ function phase({request} $request): void {{
     $callback();
 }}
 function inspect(function({request}): void $callback): void {{}}
-function main(): void {{ let $values = [1, 2]; }}
+function values(): void {{ let $values = [1, 2]; }}
 "#
         );
-        let original = doriac::lower_source_to_mir("request-mir.doria", source).unwrap();
+        let original = doriac::lower_library_source_to_mir("request-mir.doria", source).unwrap();
         doriac::mir_validation::validate_program(&original).unwrap();
         let class = original
             .classes

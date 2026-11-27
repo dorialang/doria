@@ -6,7 +6,6 @@ function replace(writable Packet $value): int { $value = Packet::Number(13); ret
 function inspectTake(take Packet $value): int { return read($value); }
 function replaceGeneric<T>(writable T $value, take T $replacement): void { $value = $replacement; }
 function replaceOptional(writable ?Packet $value): bool { $value = Packet::Number(7); return $value != null; }
-function replaceDefault(writable Packet $value = Packet::Number(3)): int { $value = Packet::Number(17); return read($value); }
 function append(writable List<int> $values): void { $values->add(9); }
 interface Editor { function replace(writable Packet $value): int; }
 open class Base implements Editor {
@@ -22,19 +21,21 @@ class Owner {
 function erased(Editor $editor, writable Packet $value): int { return $editor->replace($value); }
 function main(): void {
     let writable $value = Packet::Number(4);
-    if (replace($value) != 13 || read($value) != 4) { panic("free Copy parameter"); }
+    if (replace($value) != 13 || read($value) != 13) { panic("free Copy parameter"); }
+    $value = Packet::Number(4);
     if (inspectTake($value) != 4 || read($value) != 4) { panic("take Copy parameter"); }
     replaceGeneric($value, Packet::Number(15));
-    if (read($value) != 4) { panic("generic Copy parameter"); }
+    if (read($value) != 15) { panic("generic Copy parameter"); }
     let $editor = new Derived();
-    if ($editor->replace($value) != 22 || read($value) != 4) { panic("virtual Copy parameter"); }
-    if (erased($editor, $value) != 22 || read($value) != 4) { panic("erased Copy parameter"); }
-    if (Derived::replaceStatic(value: $value) != 23 || read($value) != 4) { panic("named static Copy parameter"); }
+    if ($editor->replace($value) != 22 || read($value) != 22) { panic("virtual Copy parameter"); }
+    $value = Packet::Number(4);
+    if (erased($editor, $value) != 22 || read($value) != 22) { panic("erased Copy parameter"); }
+    if (Derived::replaceStatic(value: $value) != 23 || read($value) != 23) { panic("named static Copy parameter"); }
+    $value = Packet::Number(4);
     let $owner = new Owner($value);
     if (read($owner->value) != 4 || read($value) != 4) { panic("promoted Copy parameter"); }
-    ?Packet $absent = null;
-    if (!replaceOptional($absent) || $absent != null) { panic("nullable Copy parameter"); }
-    if (replaceDefault() != 17) { panic("default Copy parameter"); }
+    writable ?Packet $absent = null;
+    if (!replaceOptional($absent) || $absent == null) { panic("nullable Copy parameter"); }
     let $callback = function(writable Packet $argument): int { $argument = Packet::Number(24); return read($argument); };
     if ($callback($value) != 24 || read($value) != 24) { panic("writable callback borrow ABI"); }
     let writable $number = 1;

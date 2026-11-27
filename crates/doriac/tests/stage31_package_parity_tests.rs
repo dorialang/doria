@@ -94,7 +94,10 @@ fn assert_native_output(
     working_directory: &Path,
     expected_stdout: &[u8],
 ) {
-    let BackendOutput::Executable { bytes, extension } = output else {
+    let BackendOutput::Executable {
+        bytes, extension, ..
+    } = output
+    else {
         panic!("{backend} backend must emit an executable");
     };
     let executable = temporary_path(fixture, &extension);

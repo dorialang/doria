@@ -108,7 +108,7 @@ fn validate_function(
             } => Some((result, continuation)),
             _ => None,
         };
-        for successor in terminator_targets(&block.terminator) {
+        for successor in block.terminator.targets() {
             let mut edge = live.clone();
             if let Some((result, success)) = result {
                 if successor == success && pending.contains(&result) {

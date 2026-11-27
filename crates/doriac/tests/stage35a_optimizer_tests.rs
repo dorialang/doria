@@ -99,7 +99,14 @@ function change(writable Number $value): void { $value->value++; }
 function copyText(Text $value): string { return $value->value; }
 function nullable(?Number $value): void {}
 function dynamic(Base $value): void {}
-function main(): void { let writable $number = new Number(); change($number); echo read($number); }
+function main(): void {
+    let writable $number = new Number();
+    change($number);
+    echo read($number);
+    echo copyText(new Text());
+    nullable(null);
+    dynamic(new Base());
+}
 "#,
     );
     let facts = mir_validation::optimization_facts(&program);
@@ -249,7 +256,10 @@ fn stack_class_budget_is_cumulative_and_pointer_metadata_excludes_escaping_value
 class Large {{ {properties} }}
 class Number {{ int $value = 1; }}
 function identity(take Number $value): Number {{ return $value; }}
-function main(): void {{ let $one = new Large(); let $two = new Large(); echo $one->p0 + $two->p1; }}
+function main(): void {{
+    let $one = new Large(); let $two = new Large(); echo $one->p0 + $two->p1;
+    let $reach = function(take Number $value): void {{ let $same = identity($value); }};
+}}
 "#
     );
     let program = program(&source);

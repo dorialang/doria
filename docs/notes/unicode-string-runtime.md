@@ -23,6 +23,10 @@ It performs no implicit normalization. Canonically equivalent but differently
 encoded strings remain distinct under equality, search, and replacement.
 `byteLength` and `isEmpty` read the private runtime String header in O(1);
 grapheme-aware operations traverse UTF-8 without permanent per-string caches.
+`displayWidth` (Decision 0146) counts ASCII text without segmenting it and
+otherwise sums the width of each grapheme cluster. `graphemes` (Decision
+0147) finds one cluster boundary per step, with an ASCII step that skips the
+segmenter, and copies each cluster's bytes only when the cursor reaches it.
 
 The PHP compatibility backend refuses this surface when it cannot preserve the
 same contract without optional extensions. PHP behavior never defines Doria

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::diagnostics::Diagnostic;
+use crate::foreign::ForeignType;
 use crate::source::Span;
 use crate::types::{TypeId, TypeKind, TypeRegistry};
 
@@ -91,6 +92,45 @@ pub(crate) fn infer_type_parameter_bindings(
             let _ = pattern;
         }
         (TypeKind::Nullable(pattern), _) => {
+            infer_type_parameter_bindings(
+                types,
+                diagnostics,
+                callee,
+                pattern,
+                actual,
+                span,
+                bindings,
+                from_context,
+            );
+        }
+        // A pointer unifies through its pointee with a pointer of the same
+        // access, and a typed array region through its element with a region
+        // of the same kind (Decision 0148 section 3, amendment of 2026-11-21).
+        (
+            TypeKind::Foreign(ForeignType::Pointer {
+                access: pattern_access,
+                pointee: pattern,
+            }),
+            TypeKind::Foreign(ForeignType::Pointer {
+                access: actual_access,
+                pointee: actual,
+            }),
+        ) if pattern_access == actual_access => {
+            infer_type_parameter_bindings(
+                types,
+                diagnostics,
+                callee,
+                pattern,
+                actual,
+                span,
+                bindings,
+                from_context,
+            );
+        }
+        (
+            TypeKind::ArrayRegion(pattern_kind, pattern),
+            TypeKind::ArrayRegion(actual_kind, actual),
+        ) if pattern_kind == actual_kind => {
             infer_type_parameter_bindings(
                 types,
                 diagnostics,

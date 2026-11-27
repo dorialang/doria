@@ -14,6 +14,7 @@ function main(): void
     let $text = " Dória 👍🏾 ";
     int $length = $text->length;
     int $byteLength = $text->byteLength;
+    int $displayWidth = $text->displayWidth;
     bool $empty = $text->isEmpty;
     Bytes $bytes = $text->bytes;
 
@@ -92,14 +93,14 @@ fn deferred_and_removed_string_surfaces_have_structured_guidance() {
 function main(): void
 {
     let $text = "Doria";
-    let $graphemes = $text->graphemes;
+    let $codePoints = $text->codePoints;
     String::compare("a", "b");
 }
 "#,
     );
     assert!(deferred.iter().any(|diagnostic| {
         diagnostic.kind == DiagnosticKind::UnsupportedDevelopmentSurface
-            && diagnostic.message.contains("grapheme")
+            && diagnostic.message.contains("codePoints")
     }));
     assert!(deferred.iter().any(|diagnostic| {
         diagnostic.kind == DiagnosticKind::UnsupportedDevelopmentSurface
@@ -270,9 +271,9 @@ fn foreign_string_spellings_offer_a_rename_only_when_the_arguments_fit() {
             Some("String::slice"),
         ),
         // A named argument carries PHP's parameter name, which the
-        // companion operation does not declare.
+        // companion operation does not declare. The count alone would fit.
         (
-            r#"function main(): void { strtolower(string: "A"); }"#,
+            r#"function main(): void { substr("abc", offset: 1); }"#,
             None,
         ),
         // PHP's second argument, the characters to strip, has no place in
@@ -288,6 +289,14 @@ fn foreign_string_spellings_offer_a_rename_only_when_the_arguments_fit() {
         (r#"function main(): void { str_pad("a", 5); }"#, None),
         (r#"function main(): void { strlen("a"); }"#, None),
     ] {
+        // A case that failed earlier, in the parser for example, would pass
+        // a "no rename" expectation without testing anything.
+        assert!(
+            diagnostics(source)
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0461"),
+            "{source} must reach the string spelling diagnostic"
+        );
         assert_eq!(rename(source).as_deref(), expected, "{source}");
     }
 }
@@ -326,4 +335,146 @@ function main(): void
             "String::padStart($text, $length, $padding)",
         ]
     );
+}
+
+/// The String surface table is the checker's only source: every executable
+/// member type-checks with the declared result type, and every pending member
+/// reports E0304. A member that needs an unsafe context is written in one.
+#[test]
+fn string_surface_table_matches_the_checker() {
+    use doriac::string_surface::{StringMemberKind, StringValueType, STRING_MEMBERS};
+
+    fn argument(ty: StringValueType) -> &'static str {
+        match ty {
+            StringValueType::String => "\"a\"",
+            StringValueType::Int => "1",
+            StringValueType::Bool => "true",
+            StringValueType::Bytes => "\"a\"->bytes",
+            StringValueType::NullableInt => "null",
+            StringValueType::NullableString => "null",
+            StringValueType::StringList => "[\"a\"]",
+            StringValueType::CStringPointer => "$cText->pointer",
+            StringValueType::Utf16Pointer => "$utf16Text->pointer",
+            other => panic!("no sample argument for {other:?}"),
+        }
+    }
+
+    for member in STRING_MEMBERS {
+        let expression = match member.kind {
+            StringMemberKind::Property => format!("$text->{}", member.name),
+            StringMemberKind::Companion => {
+                let arguments = member
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.default.is_none())
+                    .map(|parameter| argument(parameter.ty))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("String::{}({arguments})", member.name)
+            }
+        };
+        let expression = if member.unsafe_operation.is_some() {
+            format!("unsafe({expression})")
+        } else {
+            expression
+        };
+        let declaration = match member.result {
+            StringValueType::ByteRegion
+            | StringValueType::StringIterable
+            | StringValueType::Ordering
+            | StringValueType::Undecided => "let".to_string(),
+            result => result.source().to_string(),
+        };
+        let source = format!(
+            "use Doria\\Std\\Ffi\\{{CString, Utf16String}};\n\
+             function main(): void\n{{\n    let $text = \"a\";\n    \
+             let $cText = CString::from($text);\n    \
+             let $utf16Text = Utf16String::from($text);\n    \
+             {declaration} $value = {expression};\n}}\n"
+        );
+        let result = doriac::check_source("surface.doria", &source);
+        if member.is_executable() {
+            assert!(
+                result.is_ok(),
+                "`{}` should type-check as {declaration}: {:#?}",
+                member.spelling(),
+                result.err()
+            );
+        } else {
+            let diagnostics = result.expect_err("a pending member is reported");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0304"),
+                "pending `{}` should report E0304: {diagnostics:#?}",
+                member.spelling()
+            );
+        }
+    }
+}
+
+/// `$text->graphemes` is an `Iterable<string>`, and the classes behind it are
+/// compiler-private: authored source cannot name them (Decision 0147).
+#[test]
+fn graphemes_is_an_iterable_view_whose_classes_cannot_be_named() {
+    let source = r#"
+function count(Iterable<string> $items): int
+{
+    writable int $total = 0;
+    foreach ($items as string $item) {
+        $total++;
+    }
+    return $total;
+}
+
+function main(): void
+{
+    let $text = "a👍🏾b";
+    Iterable<string> $view = $text->graphemes;
+    int $total = count($view);
+    foreach ($text->graphemes as string $grapheme) {
+        int $width = $grapheme->displayWidth;
+    }
+}
+"#;
+    doriac::lower_source_to_mir("graphemes.doria", source)
+        .expect("$text->graphemes type-checks and lowers as Iterable<string>");
+
+    for name in [
+        "Doria\\Std\\Text\\GraphemeView",
+        "Doria\\Std\\Text\\GraphemeCursor",
+    ] {
+        let source =
+            format!("function main(): void\n{{\n    let $value = new {name}(\"a\");\n}}\n");
+        assert!(
+            doriac::check_source("private.doria", &source).is_err(),
+            "authored source must not reach `{name}`"
+        );
+    }
+}
+
+/// A program that does no I/O can walk graphemes: the view's interface slots
+/// bring the I/O identities the checker needs, although no authored name
+/// refers to them.
+#[test]
+fn graphemes_compile_in_programs_without_io() {
+    for (name, source) in [
+        (
+            "function",
+            "function cells(string $text): int\n{\n    writable int $total = 0;\n    foreach ($text->graphemes as string $g) {\n        $total += $g->displayWidth;\n    }\n    return $total;\n}\n\nfunction main(): int\n{\n    return cells(\"a\");\n}\n",
+        ),
+        (
+            "library method",
+            "class Line\n{\n    function __construct(internal string $text) {}\n\n    function cells(): int\n    {\n        writable int $total = 0;\n        foreach ($this->text->graphemes as string $g) {\n            $total += $g->displayWidth;\n        }\n        return $total;\n    }\n}\n",
+        ),
+    ] {
+        // A library has no `main` to lower, so it is checked; a program is
+        // lowered to MIR as well.
+        let result = if source.contains("function main") {
+            doriac::lower_source_to_mir("no-io.doria", source).map(|_| ())
+        } else {
+            doriac::check_source("no-io.doria", source).map(|_| ())
+        };
+        result.unwrap_or_else(|diagnostics| panic!("{name}: {diagnostics:#?}"));
+    }
 }

@@ -173,6 +173,10 @@ struct Parameter {
     generic: bool,
     take: bool,
     writable: bool,
+    /// The argument is the caller's writable place, lent for the call: every
+    /// `writable` parameter except a promoted constructor parameter, where
+    /// `writable` makes the property writable (Decision 0083).
+    lends: bool,
     borrow: bool,
 }
 
@@ -213,6 +217,7 @@ impl Signature {
                     generic: resolved_type_requires_conservative_move(&parameter.ty),
                     take: parameter.ownership_mode == crate::types::FunctionTypeParameterMode::Take,
                     writable: parameter.ownership_mode == crate::types::FunctionTypeParameterMode::Writable,
+                    lends: parameter.ownership_mode == crate::types::FunctionTypeParameterMode::Writable,
                     borrow: false,
                 })
                 .collect(),
@@ -265,6 +270,7 @@ fn writable_shared_constructor_signature() -> Signature {
             generic: true,
             take: true,
             writable: false,
+            lends: false,
             borrow: false,
         }],
         returns_move_type: true,
@@ -370,7 +376,9 @@ pub(crate) fn returned_retained_provenance(
                 Stmt::Assignment(assignment) => {
                     record_assignment(assignment, binding_resolution, sources)
                 }
-                Stmt::Block(block) => collect_sources(block, binding_resolution, sources),
+                Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                    collect_sources(block, binding_resolution, sources)
+                }
                 Stmt::If(statement) => {
                     if let Some(given) = &statement.given {
                         collect_sources(&given.block, binding_resolution, sources);
@@ -856,14 +864,16 @@ pub(crate) fn returned_retained_provenance(
                     };
                     *found = Some(found.map_or(candidate, |current| merge(current, candidate)));
                 }
-                Stmt::Block(block) => visit_block(
-                    block,
-                    function,
-                    closures,
-                    binding_resolution,
-                    sources,
-                    found,
-                ),
+                Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                    visit_block(
+                        block,
+                        function,
+                        closures,
+                        binding_resolution,
+                        sources,
+                        found,
+                    )
+                }
                 Stmt::If(statement) => {
                     visit_block(
                         &statement.then_block,
@@ -1108,13 +1118,40 @@ impl RetainedLoan {
 struct BorrowPlace {
     owner: String,
     fields: Vec<crate::class_layout::PropertyId>,
+    /// Fields of a foreign struct or union reached after `fields`, by name,
+    /// and `ELEMENT` for an element of a collection of Copy values. These
+    /// values contain no properties, so this path only ever extends the end
+    /// of `fields`; owned storage, which tracks property paths, never needs
+    /// it.
+    foreign_fields: Vec<String>,
     projectable: bool,
 }
+
+/// The `foreign_fields` component naming a collection element.
+const ELEMENT_PLACE: &str = "[]";
 
 impl BorrowPlace {
     fn overlaps(&self, other: &Self) -> bool {
         self.owner == other.owner
             && (self.fields.starts_with(&other.fields) || other.fields.starts_with(&self.fields))
+            && (self.fields != other.fields
+                || self.foreign_fields.starts_with(&other.foreign_fields)
+                || other.foreign_fields.starts_with(&self.foreign_fields))
+    }
+
+    /// Whether this place is `other` or contains it.
+    fn contains(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && other.fields.starts_with(&self.fields)
+            && (self.fields != other.fields
+                || other.foreign_fields.starts_with(&self.foreign_fields))
+    }
+
+    fn project_foreign(mut self, field: &str) -> Self {
+        if self.projectable {
+            self.foreign_fields.push(field.to_owned());
+        }
+        self
     }
 
     fn opaque(mut self) -> Self {
@@ -1123,10 +1160,22 @@ impl BorrowPlace {
     }
 
     fn project(mut self, property: crate::class_layout::PropertyId) -> Self {
+        if !self.foreign_fields.is_empty() {
+            self.projectable = false;
+        }
         if self.projectable {
             self.fields.push(property);
         }
         self
+    }
+
+    /// An element of the collection this place holds. Every index is the
+    /// same element place, since checking does not know which one a
+    /// position names: elements overlap each other and the collection
+    /// contains them, while a field inside an element is disjoint from its
+    /// sibling fields (Decision 0148 section 7, amended 2026-11-21).
+    fn project_element(self) -> Self {
+        self.project_foreign(ELEMENT_PLACE)
     }
 
     fn extend(&mut self, fields: &[crate::class_layout::PropertyId]) {
@@ -1141,6 +1190,7 @@ impl From<String> for BorrowPlace {
         Self {
             owner,
             fields: Vec::new(),
+            foreign_fields: Vec::new(),
             projectable: true,
         }
     }
@@ -2169,6 +2219,7 @@ fn check_selected_program(
                                         generic,
                                         take: move_type,
                                         writable: false,
+                                        lends: false,
                                         borrow: false,
                                     }
                                 })
@@ -2180,7 +2231,11 @@ fn check_selected_program(
                     );
                 }
             }
-            Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {}
+            Item::Interface(_)
+            | Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_)
+            | Item::Statement(_) => {}
         }
     }
     retained_analysis.add_template_fields(&properties);
@@ -2213,6 +2268,7 @@ fn check_selected_program(
         active_assignment_writes: HashSet::new(),
         active_assignment_targets: HashSet::new(),
         active_borrows: Vec::new(),
+        unsafe_pins: Vec::new(),
         when_result_modes: Vec::new(),
         conditional_borrow_sources: HashMap::new(),
         flow_facts,
@@ -2368,7 +2424,11 @@ fn check_selected_program(
                     }
                 }
             }
-            Item::Enum(_) | Item::Interface(_) | Item::Constant(_) => {}
+            Item::Enum(_)
+            | Item::Interface(_)
+            | Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_) => {}
             Item::Statement(statement) => {
                 if top_level_falls_through {
                     top_level_falls_through = checker
@@ -2476,6 +2536,9 @@ pub(crate) fn closure_borrow_function(
         consuming_span: None,
         is_static: true,
         static_span: None,
+        unsafe_span: None,
+        linkage: crate::ast::FunctionLinkage::Doria,
+        documentation: None,
         name: "<closure>".to_string(),
         name_span: closure.keyword_span,
         type_params,
@@ -3047,7 +3110,9 @@ fn statement_return_borrow(
     borrow: &mut Option<ReturnBorrow>,
 ) -> Option<bool> {
     match statement {
-        Stmt::Block(block) => block_return_borrow(block, function, resolve_call, shadowed, borrow),
+        Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+            block_return_borrow(block, function, resolve_call, shadowed, borrow)
+        }
         Stmt::Return {
             expr: Some(expr), ..
         } => {
@@ -3218,7 +3283,9 @@ fn expr_return_borrow(
             | ReturnBorrowLookup::OwnedValue
             | ReturnBorrowLookup::ResolvedArgument { .. } => None,
         },
-        Expr::Grouped { expr, .. } => expr_return_borrow(expr, function, resolve_call, shadowed),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+            expr_return_borrow(expr, function, resolve_call, shadowed)
+        }
         Expr::When(_) | Expr::Match { .. } => match resolve_call(expr) {
             ReturnBorrowLookup::Resolved(borrow) => borrow,
             _ => None,
@@ -3298,7 +3365,7 @@ fn coalesced_return_borrow(
 }
 
 fn ungroup_expr(mut expr: &Expr) -> &Expr {
-    while let Expr::Grouped { expr: inner, .. } = expr {
+    while let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
         expr = inner;
     }
     expr
@@ -3422,7 +3489,7 @@ fn signature(
                                 move_nominal_names,
                                 receiver_class,
                             ) || symbolic))
-                            || crate::types::ByteRegionKind::from_source_name(&param.ty.name)
+                            || crate::types::ByteRegionKind::from_region_name(&param.ty.name)
                                 .is_some(),
                         symbolic,
                     )
@@ -3433,7 +3500,7 @@ fn signature(
         .filter(|_| {
             function.return_type.as_ref().is_some_and(|ty| {
                 type_ref_is_move_type_with_nominals(ty, classes, move_nominal_names, receiver_class)
-                    || crate::types::ByteRegionKind::from_source_name(&ty.name).is_some()
+                    || crate::types::ByteRegionKind::from_region_name(&ty.name).is_some()
                     || type_ref_has_any_ownership_parameter(
                         ty,
                         &function.type_params,
@@ -3445,7 +3512,7 @@ fn signature(
             function
                 .return_type
                 .as_ref()
-                .and_then(|ty| crate::types::ByteRegionKind::from_source_name(&ty.name))
+                .and_then(|ty| crate::types::ByteRegionKind::from_region_name(&ty.name))
                 .map_or(borrow, |kind| ReturnBorrow {
                     source: borrow.source,
                     kind: ReturnBorrowKind::Retained,
@@ -3474,6 +3541,9 @@ fn signature(
                 ),
                 take: param.take,
                 writable: param.writable,
+                lends: param.writable
+                    && (!(function.name == "__construct" && param.constructor_role.is_promoted())
+                        || param.borrow_span.is_some()),
                 borrow: param.borrow_span.is_some(),
             })
             .collect(),
@@ -3548,6 +3618,16 @@ struct ActiveBorrow {
     root: BorrowPlace,
     mode: UseMode,
     span: Span,
+}
+
+/// The places pointers formed inside one unsafe context pin until the
+/// context ends (Decision 0148 section 7).
+#[derive(Debug, Default)]
+struct UnsafePins {
+    /// The lexical depth of the context's own scope. A binding declared
+    /// deeper is destroyed before the context ends.
+    depth: usize,
+    pins: Vec<ActiveBorrow>,
 }
 
 #[derive(Debug, Clone)]
@@ -3654,6 +3734,8 @@ struct Checker<'a> {
     active_assignment_writes: HashSet<BorrowPlace>,
     active_assignment_targets: HashSet<String>,
     active_borrows: Vec<ActiveBorrow>,
+    /// Innermost last; a closure body starts with none.
+    unsafe_pins: Vec<UnsafePins>,
     when_result_modes: Vec<UseMode>,
     conditional_borrow_sources: HashMap<Span, ConditionalBorrowSources>,
     flow_facts: &'a FactsByUse,
@@ -4059,7 +4141,14 @@ impl Checker<'_> {
                         &[],
                     ),
                     mixed,
-                    borrowed_place: !param.take,
+                    // A promoted writable Copy parameter is the constructor's own
+                    // copy; `writable` makes its property writable (Decision 0083).
+                    borrowed_place: !param.take
+                        && !(param.writable
+                            && copy_parameter
+                            && function.name == "__construct"
+                            && param.constructor_role.is_promoted()
+                            && param.borrow_span.is_none()),
                     borrow_root: None,
                     borrow_parents: Vec::new(),
                     writeback_homes: Vec::new(),
@@ -4258,6 +4347,15 @@ impl Checker<'_> {
     ) -> Flow {
         match statement {
             Stmt::Block(block) => self.check_block(block, scopes, return_move_type, true),
+            Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+                self.unsafe_pins.push(UnsafePins {
+                    depth: scopes.lexical_depth() + 1,
+                    pins: Vec::new(),
+                });
+                let flow = self.check_block(block, scopes, return_move_type, true);
+                self.unsafe_pins.pop();
+                flow
+            }
             Stmt::VarDecl(decl) => {
                 let declaration_name = decl
                     .bindings
@@ -4882,7 +4980,10 @@ impl Checker<'_> {
                         .is_some_and(|property| property.move_type || property.mixed);
                     let retained_value = self.prepare_retained_value(&assignment.value, scopes);
                     let mut valid_function_storage = true;
-                    if let Some(value) = retained_value.as_ref() {
+                    if let Some(value) = retained_value
+                        .as_ref()
+                        .filter(|_| !self.stores_into_foreign_field(&assignment.target))
+                    {
                         let stores_on_receiver = matches!(
                             ungroup_expr(&assignment.target),
                             Expr::PropertyAccess { object, .. }
@@ -5294,6 +5395,15 @@ impl Checker<'_> {
                         increment.target.span(),
                         scopes,
                     );
+                    // An increment replaces the value it updates.
+                    if let Some(pin) = self.breaking_pin(&root, UseMode::Write) {
+                        self.report_broken_pin(
+                            &root,
+                            UseMode::Write,
+                            pin.span,
+                            increment.target.span(),
+                        );
+                    }
                 }
                 self.use_expr(&increment.target, scopes, UseMode::Read);
                 Flow::fallthrough()
@@ -5598,7 +5708,15 @@ impl Checker<'_> {
         return_move_type: bool,
     ) -> Flow {
         let borrow_depth = self.active_borrows.len();
-        self.activate_place_borrow(&statement.iterable, UseMode::Read, scopes);
+        // A writable value binding names an element of the collection, so the
+        // body holds the collection's exclusive borrow (Decisions 0100, 0132):
+        // nothing else may read or write it until the body is left.
+        let mode = if statement.value_binding.writable {
+            UseMode::Write
+        } else {
+            UseMode::Read
+        };
+        self.activate_place_borrow(&statement.iterable, mode, scopes);
         scopes.push();
         if let Some(first_binding) = &statement.first_binding {
             self.declare_foreach_binding(first_binding, scopes);
@@ -5756,7 +5874,7 @@ impl Checker<'_> {
     ) {
         self.use_expr(target, scopes, UseMode::Write);
         let mut ungrouped_target = target;
-        while let Expr::Grouped { expr, .. } = ungrouped_target {
+        while let Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } = ungrouped_target {
             ungrouped_target = expr;
         }
         let tracked_target = matches!(
@@ -5926,10 +6044,23 @@ impl Checker<'_> {
                             ),
                         );
                     }
-                    if let Some(conflict) = self.active_borrows.iter().find(|borrow| {
-                        borrow.root.overlaps(root_key)
-                            && (access == BorrowAccess::Writable || borrow.mode == UseMode::Write)
-                    }) {
+                    let capture_mode = if access == BorrowAccess::Writable {
+                        UseMode::Write
+                    } else {
+                        UseMode::Read
+                    };
+                    let conflict = self
+                        .active_borrows
+                        .iter()
+                        .rev()
+                        .find(|borrow| {
+                            borrow.root.overlaps(root_key)
+                                && (access == BorrowAccess::Writable
+                                    || borrow.mode == UseMode::Write)
+                        })
+                        .cloned()
+                        .or_else(|| self.breaking_pin(root_key, capture_mode));
+                    if let Some(conflict) = conflict {
                         invalid = true;
                         self.diagnostics.push(
                             Diagnostic::new(
@@ -6050,11 +6181,18 @@ impl Checker<'_> {
                         ),
                     );
                 }
-                if let Some(conflict) = self
+                let conflict = self
                     .active_borrows
                     .iter()
+                    .rev()
                     .find(|borrow| root_keys.iter().any(|key| borrow.root.overlaps(key)))
-                {
+                    .cloned()
+                    .or_else(|| {
+                        root_keys
+                            .iter()
+                            .find_map(|key| self.breaking_pin(key, UseMode::Give))
+                    });
+                if let Some(conflict) = conflict {
                     invalid = true;
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -6191,7 +6329,9 @@ impl Checker<'_> {
             Expr::Variable { name, .. } => scopes
                 .get(name)
                 .and_then(|binding| binding.retained_value.clone()),
-            Expr::Grouped { expr, .. } => self.retained_value_from_expr(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.retained_value_from_expr(expr, scopes)
+            }
             Expr::Array { elements, .. } => {
                 let mut stored: Option<RetainedValueState> = None;
                 for element in elements {
@@ -6852,7 +6992,7 @@ impl Checker<'_> {
             scopes.1.put(target, values, scopes.lexical_depth());
             return;
         }
-        if let Expr::Grouped { expr: inner, .. } = expr {
+        if let Expr::Grouped { expr: inner, .. } | Expr::Unsafe { expr: inner, .. } = expr {
             let values = self.cleanup_take_expr(inner, scopes);
             scopes.1.put(target, values, scopes.lexical_depth());
             return;
@@ -6975,7 +7115,7 @@ impl Checker<'_> {
     }
 
     fn use_binding(&mut self, name: &str, span: Span, scopes: &mut Scopes, mode: UseMode) {
-        self.use_binding_at_place(name, span, scopes, mode, None);
+        self.use_binding_at_place(name, span, span, scopes, mode, None);
     }
 
     /// The child pipe getter at `site`, if it is one.
@@ -7009,35 +7149,41 @@ impl Checker<'_> {
             .collect()
     }
 
+    /// Use the base of a place expression for `places`. `site` is the whole
+    /// place expression: conflicts on those places are reported there, while
+    /// the state of the base binding is reported at the binding itself.
     fn use_place_base(
         &mut self,
         expr: &Expr,
         scopes: &mut Scopes,
         mode: UseMode,
         places: &[BorrowPlace],
+        site: Span,
     ) {
         match expr {
             Expr::Variable { name, span } => {
-                self.use_binding_at_place(name, *span, scopes, mode, Some(places));
+                self.use_binding_at_place(name, *span, site, scopes, mode, Some(places));
             }
             Expr::This { span } if scopes.get("this").is_some() => {
-                self.use_binding_at_place("this", *span, scopes, mode, Some(places));
+                self.use_binding_at_place("this", *span, site, scopes, mode, Some(places));
             }
-            Expr::This { span } => {
+            Expr::This { .. } => {
                 for place in places {
-                    self.check_live_retained_conflict(place, mode, *span, scopes);
-                    self.check_active_borrow_conflict(place, mode, *span);
-                    self.check_assignment_write_conflict(place, mode, *span);
+                    self.check_live_retained_conflict(place, mode, site, scopes);
+                    self.check_active_borrow_conflict(place, mode, site);
+                    self.check_assignment_write_conflict(place, mode, site);
                 }
             }
-            Expr::Grouped { expr, .. } => self.use_place_base(expr, scopes, mode, places),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.use_place_base(expr, scopes, mode, places, site)
+            }
             Expr::PropertyAccess { object, .. } if self.getter_signature(expr).is_none() => {
-                self.use_place_base(object, scopes, mode, places);
+                self.use_place_base(object, scopes, mode, places, site);
             }
             Expr::Index {
                 collection, index, ..
             } => {
-                self.use_place_base(collection, scopes, mode, places);
+                self.use_place_base(collection, scopes, mode, places, site);
                 self.use_expr(index, scopes, UseMode::Read);
             }
             _ => {
@@ -7048,10 +7194,13 @@ impl Checker<'_> {
         self.cleanup_expression_result(expr, scopes, None);
     }
 
+    /// `span` is the binding as written; `site` is the place expression that
+    /// uses it, where conflicts on `places` are reported.
     fn use_binding_at_place(
         &mut self,
         name: &str,
         span: Span,
+        site: Span,
         scopes: &mut Scopes,
         mode: UseMode,
         places: Option<&[BorrowPlace]>,
@@ -7063,7 +7212,7 @@ impl Checker<'_> {
                 .unwrap_or_default()
         });
         for root in &roots {
-            self.check_live_retained_conflict(root, mode, span, scopes);
+            self.check_live_retained_conflict(root, mode, site, scopes);
         }
         {
             let through = scopes
@@ -7071,18 +7220,24 @@ impl Checker<'_> {
                 .map(|binding| binding.id)
                 .into_iter()
                 .collect::<Vec<_>>();
-            if let Some(alias) = roots
-                .iter()
-                .find_map(|root| scopes.borrowed_from(root, &through, mode))
-            {
+            if let Some((root, alias)) = roots.iter().find_map(|root| {
+                scopes
+                    .borrowed_from(root, &through, mode)
+                    .map(|alias| (root, alias))
+            }) {
+                let used = if places.is_some() {
+                    self.display_borrow_place(root)
+                } else {
+                    format!("${name}")
+                };
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0477",
                         format!(
-                            "`${name}` cannot be used as {} while `${alias}` borrows from it",
+                            "`{used}` cannot be used as {} while `${alias}` borrows from it",
                             if mode == UseMode::Read { "readonly" } else { "writable" }
                         ),
-                        span,
+                        site,
                     )
                     .with_help(
                         "finish using the borrowed binding or place it in a shorter lexical block before mutating its owner",
@@ -7092,14 +7247,14 @@ impl Checker<'_> {
         }
         for root in &roots {
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                self.check_active_borrow_conflict(root, mode, span);
+                self.check_active_borrow_conflict(root, mode, site);
             } else if mode == UseMode::Give {
-                self.check_give_against_active_borrows(root, span);
+                self.check_give_against_active_borrows(root, site);
             }
         }
         let mut assignment_conflict = false;
         for root in &roots {
-            assignment_conflict |= self.check_assignment_write_conflict(root, mode, span);
+            assignment_conflict |= self.check_assignment_write_conflict(root, mode, site);
         }
         if assignment_conflict && mode == UseMode::Give {
             return;
@@ -7248,6 +7403,14 @@ impl Checker<'_> {
                 self.use_binding("this", *span, scopes, mode);
             }
             Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
+            Expr::Unsafe { expr, .. } => {
+                self.unsafe_pins.push(UnsafePins {
+                    depth: scopes.lexical_depth(),
+                    pins: Vec::new(),
+                });
+                self.use_expr(expr, scopes, mode);
+                self.unsafe_pins.pop();
+            }
             // Extraction gives away the whole consumed receiver: its other
             // fields are destroyed at once, so no later use of it remains valid.
             Expr::PropertyAccess {
@@ -7257,10 +7420,15 @@ impl Checker<'_> {
             } => self.use_expr(object, scopes, UseMode::Give),
             Expr::PropertyAccess {
                 object,
+                property,
                 span,
                 null_safe,
                 ..
             } => {
+                if let Some(writable) = self.region_pointer_member(object, property) {
+                    self.form_region_pointer(object, writable, *span, scopes);
+                    return;
+                }
                 if let Some(signature) = self.getter_signature(expr) {
                     let execution = self.method_call_execution(*null_safe, object);
                     self.use_call_args(*span, Some(object), &[], &signature, execution, scopes);
@@ -7325,14 +7493,16 @@ impl Checker<'_> {
                 };
                 let places = self.borrow_root_keys(expr, scopes);
                 if !places.is_empty() {
-                    self.use_place_base(object, scopes, base_mode, &places);
+                    self.use_place_base(object, scopes, base_mode, &places, expr.span());
                 } else {
                     self.use_expr_with_pending_access(object, scopes, base_mode, false);
                 }
                 self.active_assignment_writes
                     .extend(suspended_assignment_writes);
             }
-            Expr::FunctionCall { name, args, span } => {
+            Expr::FunctionCall {
+                name, args, span, ..
+            } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
                 self.use_call_args(*span, None, args, &signature, CallExecution::Always, scopes);
                 self.record_exceptional_exits(*span, scopes);
@@ -7442,6 +7612,11 @@ impl Checker<'_> {
                 span,
                 ..
             } => {
+                if let Some(access) = crate::pointer_intrinsics::formation(qualifier, method) {
+                    self.form_pointer(access, args, *span, scopes);
+                    self.record_exceptional_exits(*span, scopes);
+                    return;
+                }
                 if matches!(
                     qualifier,
                     ast::StaticQualifier::Class(class_name)
@@ -7519,7 +7694,7 @@ impl Checker<'_> {
                         let mode = self.use_owned_expression(key, scopes);
                         self.activate_place_input_borrows(key, scopes);
                         if mode == UseMode::Read {
-                            self.activate_borrow(key, mode, scopes);
+                            self.record_checked_borrow(key, mode, scopes);
                         }
                     }
                     let mode = self.use_owned_expression(&element.value, scopes);
@@ -7532,7 +7707,7 @@ impl Checker<'_> {
                     }
                     self.activate_place_input_borrows(&element.value, scopes);
                     if mode == UseMode::Read {
-                        self.activate_borrow(&element.value, mode, scopes);
+                        self.record_checked_borrow(&element.value, mode, scopes);
                     }
                 }
                 self.active_borrows.truncate(borrow_depth);
@@ -7548,7 +7723,7 @@ impl Checker<'_> {
                     );
                 }
                 self.activate_place_input_borrows(value, scopes);
-                self.activate_borrow(value, UseMode::Read, scopes);
+                self.record_checked_borrow(value, UseMode::Read, scopes);
                 self.use_read_with_place_borrow(count, scopes);
                 self.active_borrows.truncate(borrow_depth);
             }
@@ -7682,7 +7857,10 @@ impl Checker<'_> {
                     self.acquire_closure(closure, scopes);
                 }
                 if self.closure_values.contains_key(&closure_id) {
+                    // An unsafe context does not extend into a closure body.
+                    let pins = std::mem::take(&mut self.unsafe_pins);
                     self.analyze_closure_body(closure, scopes);
+                    self.unsafe_pins = pins;
                 }
             }
             Expr::CallableCall {
@@ -7945,7 +8123,7 @@ impl Checker<'_> {
         let retained_scrutinee = self.retained_value_from_expr(scrutinee, scopes);
         let borrow_root = self.borrow_source_root(scrutinee, scopes);
         if !consuming {
-            self.activate_place_borrow(scrutinee, UseMode::Read, scopes);
+            self.record_checked_borrow(scrutinee, UseMode::Read, scopes);
         }
 
         let mut remaining = scopes.clone();
@@ -8590,7 +8768,7 @@ impl Checker<'_> {
             }
             self.activate_place_input_borrows(&argument.value, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                self.activate_borrow(&argument.value, mode, scopes);
+                self.record_checked_borrow(&argument.value, mode, scopes);
             }
             self.activate_retained_value_borrows(&argument.value, scopes);
         }
@@ -8684,7 +8862,13 @@ impl Checker<'_> {
                     },
                 );
             } else {
-                self.use_place_base(receiver, scopes, UseMode::Read, &pipe_places);
+                self.use_place_base(
+                    receiver,
+                    scopes,
+                    UseMode::Read,
+                    &pipe_places,
+                    receiver.span(),
+                );
             }
             self.activate_place_input_borrows(receiver, scopes);
             if execution == CallExecution::Never {
@@ -8773,7 +8957,7 @@ impl Checker<'_> {
                             "E0471",
                             format!(
                                 "`{}` cannot be borrowed and given away in the same call",
-                                display_borrow_root(&root)
+                                self.display_borrow_place(&root)
                             ),
                             arg.span(),
                         )
@@ -8817,7 +9001,7 @@ impl Checker<'_> {
             }
             self.activate_place_input_borrows(arg, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                self.activate_borrow(arg, mode, scopes);
+                self.record_checked_borrow(arg, mode, scopes);
             }
             self.activate_retained_value_borrows(arg, scopes);
         }
@@ -8865,6 +9049,22 @@ impl Checker<'_> {
         let through = self.borrow_input_bindings(expr, scopes);
         for root in self.borrow_root_keys(expr, scopes) {
             self.activate_borrow_root(root, mode, expr.span(), &through, scopes);
+        }
+    }
+
+    /// Records the loan an expression keeps after its use: a call argument
+    /// or receiver, an operand, an element or a scrutinee. The use, in the
+    /// same mode, already checked that access against every live loan,
+    /// retained value and assignment destination, so the access is checked
+    /// once and each conflict is reported once. Later accesses still meet
+    /// the recorded loan.
+    fn record_checked_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
+        for root in self.borrow_root_keys(expr, scopes) {
+            self.active_borrows.push(ActiveBorrow {
+                root,
+                mode,
+                span: expr.span(),
+            });
         }
     }
 
@@ -8920,7 +9120,7 @@ impl Checker<'_> {
                         "E0477",
                         format!(
                             "`{}` cannot be used as {} while `${alias}` borrows from it",
-                            display_borrow_root(root),
+                            self.display_borrow_place(root),
                             if mode == UseMode::Read { "readonly" } else { "writable" }
                         ),
                         span,
@@ -8942,7 +9142,9 @@ impl Checker<'_> {
             }
         }
         match expr {
-            Expr::Grouped { expr, .. } | Expr::PropertyAccess { object: expr, .. } => {
+            Expr::Grouped { expr, .. }
+            | Expr::Unsafe { expr, .. }
+            | Expr::PropertyAccess { object: expr, .. } => {
                 self.activate_place_input_borrows(expr, scopes);
             }
             _ => self.activate_nested_property_borrows(expr, scopes),
@@ -8958,21 +9160,18 @@ impl Checker<'_> {
         }
         match expr {
             Expr::PropertyAccess { object, .. } => {
-                let through = self.borrow_input_bindings(expr, scopes);
                 for root in self.borrow_root_keys(expr, scopes) {
                     if !self.active_assignment_writes.contains(&root) {
-                        self.activate_borrow_root(
+                        self.active_borrows.push(ActiveBorrow {
                             root,
-                            UseMode::Read,
-                            expr.span(),
-                            &through,
-                            scopes,
-                        );
+                            mode: UseMode::Read,
+                            span: expr.span(),
+                        });
                     }
                 }
                 self.activate_place_input_borrows(object, scopes);
             }
-            Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } | Expr::Unary { expr, .. } => {
                 self.activate_nested_property_borrows(expr, scopes);
             }
             Expr::Binary {
@@ -9082,7 +9281,7 @@ impl Checker<'_> {
                 .is_some_and(|borrow| borrow.source == BorrowSource::Receiver);
             if !result_continues_receiver_borrow {
                 if let Some(mode @ (UseMode::Read | UseMode::Write)) = signature.receiver {
-                    self.activate_borrow(receiver, mode, scopes);
+                    self.record_checked_borrow(receiver, mode, scopes);
                 }
             }
         }
@@ -9109,7 +9308,7 @@ impl Checker<'_> {
                         .is_some_and(|borrow| borrow.source == BorrowSource::Parameter(param))
                 });
             if matches!(mode, UseMode::Read | UseMode::Write) && !result_continues_argument_borrow {
-                self.activate_borrow(arg, mode, scopes);
+                self.record_checked_borrow(arg, mode, scopes);
             }
         }
     }
@@ -9117,7 +9316,7 @@ impl Checker<'_> {
     fn use_read_with_place_borrow(&mut self, expr: &Expr, scopes: &mut Scopes) {
         self.use_expr(expr, scopes, UseMode::Read);
         self.activate_place_input_borrows(expr, scopes);
-        self.activate_borrow(expr, UseMode::Read, scopes);
+        self.record_checked_borrow(expr, UseMode::Read, scopes);
     }
 
     fn check_writable_move_argument(&mut self, expr: &Expr, scopes: &Scopes) {
@@ -9138,7 +9337,9 @@ impl Checker<'_> {
             return self.readonly_return_borrow_path(&signature, expr.span());
         }
         match expr {
-            Expr::Grouped { expr, .. } => self.readonly_writable_path(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.readonly_writable_path(expr, scopes)
+            }
             Expr::Index { collection, .. } => self.readonly_writable_path(collection, scopes),
             // Direct bindings are checked by `use_expr` in write mode. This
             // helper supplies the path-sensitive checks that mode cannot see.
@@ -9211,54 +9412,76 @@ impl Checker<'_> {
         (!borrow.writable).then(|| ("returned borrow".to_string(), span))
     }
 
+    /// A place as source spells it: its owner, then each stored field it
+    /// reaches (`$this->buffer`, `$tree->first->left`). An opaque suffix shows
+    /// its known prefix, which is the place it covers.
+    fn display_borrow_place(&self, place: &BorrowPlace) -> String {
+        let mut display = display_place_owner(place);
+        for field in &place.fields {
+            let Some(((_, name), _)) = self
+                .retained
+                .properties
+                .iter()
+                .find(|(_, (id, _))| id == field)
+            else {
+                break;
+            };
+            display.push_str("->");
+            display.push_str(name);
+        }
+        display
+    }
+
     fn check_assignment_write_conflict(
         &mut self,
         root: &BorrowPlace,
         mode: UseMode,
         span: Span,
     ) -> bool {
-        if !self
+        let Some(destination) = self
             .active_assignment_writes
             .iter()
-            .any(|written| written.overlaps(root))
-        {
+            .find(|written| written.overlaps(root))
+        else {
             return false;
-        }
-        match mode {
-            UseMode::Give => self.diagnostics.push(
-                Diagnostic::new(
-                    "E0471",
-                    format!(
-                        "`{}` cannot be given away while it is the destination of a property assignment",
-                        display_borrow_root(root)
-                    ),
-                    span,
-                )
-                .with_help(
-                    "compute the replacement without giving away the object being assigned",
+        };
+        let used = self.display_borrow_place(root);
+        let destination = self.display_borrow_place(destination);
+        let explanation = format!(
+            "An assignment holds `{destination}` until its new value is computed. The value may read exactly `{destination}` and any separate field, but not a place that contains it or lies inside it. An element assignment holds its whole collection."
+        );
+        let (code, message, label, help) = match mode {
+            UseMode::Give => (
+                "E0471",
+                format!("`{used}` cannot be given away while `{destination}` is being assigned"),
+                "This Ownership Transfer Overlaps the Assigned Place",
+                format!(
+                    "compute the new value without giving away `{destination}` or the object that holds it"
                 ),
             ),
-            UseMode::Read | UseMode::Write => {
-                let requested = if mode == UseMode::Read {
-                    "readonly"
+            UseMode::Read | UseMode::Write => (
+                "E0477",
+                format!(
+                    "`{used}` cannot be used as {} while `{destination}` is being assigned",
+                    if mode == UseMode::Read { "readonly" } else { "writable" }
+                ),
+                if mode == UseMode::Read {
+                    "This Readonly Use Overlaps the Assigned Place"
                 } else {
-                    "writable"
-                };
-                self.diagnostics.push(
-                    Diagnostic::new(
-                        "E0477",
-                        format!(
-                            "`{}` cannot be used as {requested} while it is the destination of a property assignment",
-                            display_borrow_root(root)
-                        ),
-                        span,
-                    )
-                    .with_help(
-                        "finish computing the property value before using that property or its parent again",
-                    ),
-                );
-            }
-        }
+                    "This Writable Use Overlaps the Assigned Place"
+                },
+                format!(
+                    "compute the value into a local first, then assign that local to `{destination}`"
+                ),
+            ),
+        };
+        self.diagnostics.push(
+            Diagnostic::new(code, message, span)
+                .with_title("Assignment Value Uses Its Destination")
+                .with_primary_label(label)
+                .with_explanation(explanation)
+                .with_help(help),
+        );
         true
     }
 
@@ -9405,7 +9628,9 @@ impl Checker<'_> {
                     BorrowSourceRoot::Place(binding_identity_key(binding.id, name).into())
                 })
             }),
-            Expr::Grouped { expr: object, .. } => self.borrow_source_root(object, scopes),
+            Expr::Grouped { expr: object, .. } | Expr::Unsafe { expr: object, .. } => {
+                self.borrow_source_root(object, scopes)
+            }
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -9422,6 +9647,9 @@ impl Checker<'_> {
                 object, property, ..
             } => {
                 let root = self.borrow_source_root(object, scopes)?;
+                if self.resolved_type(object).is_some_and(is_foreign_aggregate) {
+                    return Some(root.map_places(|place| place.project_foreign(property)));
+                }
                 let stored = self
                     .resolved_type(object)
                     .and_then(resolved_type_class)
@@ -9438,9 +9666,24 @@ impl Checker<'_> {
                     None => place.opaque(),
                 }))
             }
-            Expr::Index { collection, .. } => self
-                .borrow_source_root(collection, scopes)
-                .map(|root| root.map_places(BorrowPlace::opaque)),
+            // An element of Copy values is a place inside its collection,
+            // which a pin on one element field leaves the other fields of.
+            // An element that owns its value stays the whole collection.
+            Expr::Index { collection, .. } => {
+                let copy_element = self.resolved_type(expr).is_some_and(|ty| {
+                    !resolved_type_is_move_type(ty, &self.move_enum_names)
+                        && !resolved_type_requires_conservative_move(ty)
+                });
+                self.borrow_source_root(collection, scopes).map(|root| {
+                    root.map_places(|place| {
+                        if copy_element {
+                            place.project_element()
+                        } else {
+                            place.opaque()
+                        }
+                    })
+                })
+            }
             Expr::CallableCall { args, span, .. } => {
                 let call = self.callable_value_calls.get(span)?;
                 let function = non_null_function_type(&call.function_type)?;
@@ -9502,7 +9745,9 @@ impl Checker<'_> {
             Expr::Variable { name, .. } => scopes
                 .get(name)
                 .map(|binding| binding_identity_key(binding.id, name)),
-            Expr::Grouped { expr, .. } => self.assignment_place_key(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.assignment_place_key(expr, scopes)
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => self
@@ -9533,6 +9778,10 @@ impl Checker<'_> {
             self.check_give_against_active_borrows(root, span);
             return;
         }
+        if let Some(pin) = self.breaking_pin(root, mode) {
+            self.report_broken_pin(root, mode, pin.span, span);
+            return;
+        }
         let Some(existing) = self
             .active_borrows
             .iter()
@@ -9553,7 +9802,7 @@ impl Checker<'_> {
             UseMode::Write => "writable",
             UseMode::Give => unreachable!("active borrow cannot be a give"),
         };
-        let root_display = display_borrow_root(root);
+        let root_display = self.display_borrow_place(root);
         self.diagnostics.push(
             Diagnostic::new(
                 "E0477",
@@ -9572,20 +9821,257 @@ impl Checker<'_> {
         );
     }
 
+    /// `Pointer::to($place)` or `WritablePointer::to($place)`: the place is read, or
+    /// written as an assignment target is, then pinned until the innermost enclosing
+    /// unsafe context ends (Decision 0148 section 7). Within the context it
+    /// cannot be moved or replaced (`breaking_pin`). Forming a pointer
+    /// neither moves nor replaces its place, so it never conflicts with a
+    /// pin, including one on the same place.
+    fn form_pointer(
+        &mut self,
+        access: crate::foreign::PointerAccess,
+        args: &[Argument],
+        span: Span,
+        scopes: &mut Scopes,
+    ) {
+        let Some(place) = args.first().map(|argument| &argument.value) else {
+            return;
+        };
+        let mode = match access {
+            crate::foreign::PointerAccess::Read => UseMode::Read,
+            crate::foreign::PointerAccess::Write => UseMode::Write,
+        };
+        let roots = self.borrow_root_keys(place, scopes);
+        // The place itself is used, as an assignment target is: a
+        // `WritablePointer::to` place must be writable.
+        let pins = std::mem::take(&mut self.unsafe_pins);
+        self.use_expr(place, scopes, mode);
+        self.unsafe_pins = pins;
+        let Some(context) = self.unsafe_pins.last() else {
+            // Checking reports a formation outside an unsafe context.
+            return;
+        };
+        let context_depth = context.depth;
+        if let Some((name, binding)) = pointer_place_root(place)
+            .and_then(|name| scopes.get(name).map(|binding| (name, binding)))
+        {
+            if binding.scope_depth > context_depth {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0762",
+                        format!(
+                            "`${name}` is destroyed at the end of its block, before the unsafe context that pins it ends"
+                        ),
+                        place.span(),
+                    )
+                    .with_title("Value Cannot Outlive Borrowed Source")
+                    .with_explanation(
+                        "A pointer to a Doria place is valid until the innermost enclosing unsafe context ends, and the place stays in place for that long.",
+                    )
+                    .with_help("declare the local before the unsafe context, or form the pointer in an unsafe context inside its block"),
+                );
+                return;
+            }
+        }
+        let context = self
+            .unsafe_pins
+            .last_mut()
+            .expect("an unsafe context is active");
+        for root in roots {
+            if !context.pins.iter().any(|pin| pin.root == root) {
+                context.pins.push(ActiveBorrow { root, mode, span });
+            }
+        }
+    }
+
+    /// `Some(writable)` when `$object->property` forms a pointer to a
+    /// region's storage: `pointer` (`false`) or `writablePointer` (`true`).
+    fn region_pointer_member(&self, object: &Expr, property: &str) -> Option<bool> {
+        let ty = self.resolved_type(object)?;
+        let ty = match ty {
+            ResolvedType::Nullable(inner) => inner.as_ref(),
+            ty => ty,
+        };
+        crate::byte_intrinsics::member(ty, property)
+            .filter(|member| {
+                member.kind == crate::byte_intrinsics::ByteMemberKind::Property
+                    && member.unsafe_operation.is_some()
+            })
+            .map(|member| member.receiver_mode == Some(crate::symbols::ReceiverMode::Writable))
+    }
+
+    /// `$region->pointer` or `$region->writablePointer` (Decision 0148
+    /// section 7): the region is read, or used with writable access, and the
+    /// region and the storage it borrows are pinned until the innermost
+    /// enclosing unsafe context ends, as `Pointer::to` pins its place. The
+    /// storage, not the region descriptor, is what the pointer addresses, so
+    /// the storage must outlive the context.
+    fn form_region_pointer(
+        &mut self,
+        region: &Expr,
+        writable: bool,
+        span: Span,
+        scopes: &mut Scopes,
+    ) {
+        let (mode, access) = if writable {
+            (UseMode::Write, BorrowAccess::Writable)
+        } else {
+            (UseMode::Read, BorrowAccess::Readonly)
+        };
+        let mut roots = self.borrow_root_keys(region, scopes);
+        let loans = self.reborrow_source_loans(region, scopes, access);
+        for loan in &loans {
+            for (place, _) in loan.places() {
+                roots.push(place.clone());
+            }
+        }
+        let pins = std::mem::take(&mut self.unsafe_pins);
+        self.use_expr(region, scopes, mode);
+        self.unsafe_pins = pins;
+        let Some(context) = self.unsafe_pins.last() else {
+            // Checking reports a formation outside an unsafe context.
+            return;
+        };
+        let context_depth = context.depth;
+        // A `CString` or `Utf16String` is its own storage (Decision 0148
+        // section 9): the value, not a loan, must outlive the context.
+        let owned_string = self
+            .resolved_type(region)
+            .and_then(crate::foreign_strings::encoding_of);
+        if let Some(encoding) = owned_string {
+            let short = encoding.short_name();
+            let destroyed = match pointer_place_root(region) {
+                None => Some(format!(
+                    "this `{short}` is a temporary value, destroyed at the end of its statement, before the unsafe context that pins it ends"
+                )),
+                Some(name) => scopes
+                    .get(name)
+                    .filter(|binding| binding.scope_depth > context_depth)
+                    .map(|_| {
+                        format!(
+                            "`${name}` is destroyed at the end of its block, before the unsafe context that pins it ends"
+                        )
+                    }),
+            };
+            if let Some(message) = destroyed {
+                self.diagnostics.push(
+                    Diagnostic::new("E0762", message, region.span())
+                        .with_title("Value Cannot Outlive Borrowed Source")
+                        .with_explanation(format!(
+                            "A pointer to a `{short}` is valid until the innermost enclosing unsafe context ends, and the `{short}` stays in place and alive for that long."
+                        ))
+                        .with_help(format!(
+                            "keep the `{short}` in a local declared before the unsafe context, or in the unsafe context itself"
+                        )),
+                );
+                return;
+            }
+        }
+        if let Some(loan) = loans.iter().find(|loan| loan.source_depth > context_depth) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0762",
+                    "the storage this region borrows is destroyed before the unsafe context that pins it ends",
+                    region.span(),
+                )
+                .with_title("Value Cannot Outlive Borrowed Source")
+                .with_explanation(
+                    "A pointer to a region's storage is valid until the innermost enclosing unsafe context ends, and the storage stays in place for that long.",
+                )
+                .with_related(loan.capture_span, "The Region Borrows This Storage")
+                .with_help("keep the storage in a local declared before the unsafe context, or form the pointer in an unsafe context inside the storage's block"),
+            );
+            return;
+        }
+        let context = self
+            .unsafe_pins
+            .last_mut()
+            .expect("an unsafe context is active");
+        for root in roots {
+            if !context.pins.iter().any(|pin| pin.root == root) {
+                context.pins.push(ActiveBorrow { root, mode, span });
+            }
+        }
+    }
+
+    /// The pin that `mode` on `place` would break (Decision 0148 section 7,
+    /// amended 2026-11-16). A pin keeps its value in place and alive, so
+    /// giving away an overlapping value conflicts, and so does `writable`
+    /// access to the pinned value or a value containing it: an assignment
+    /// replaces the value, and a `writable` argument or receiver lets the
+    /// callee replace it. Reads, and writes to a field or element inside
+    /// the pinned value, do not conflict.
+    fn breaking_pin(&self, place: &BorrowPlace, mode: UseMode) -> Option<ActiveBorrow> {
+        self.unsafe_pins
+            .iter()
+            .rev()
+            .flat_map(|context| context.pins.iter().rev())
+            .find(|pin| match mode {
+                UseMode::Read => false,
+                UseMode::Write => place.contains(&pin.root),
+                UseMode::Give => pin.root.overlaps(place),
+            })
+            .cloned()
+    }
+
+    fn report_broken_pin(&mut self, place: &BorrowPlace, mode: UseMode, pin: Span, span: Span) {
+        // A call checks a given-away argument before it uses it, and an
+        // assignment checks its target and the variable it starts from: one
+        // site breaks a pin once.
+        let overlapping = |other: Span| {
+            other.source == span.source && other.start < span.end && span.start < other.end
+        };
+        if self.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0477"
+                && overlapping(diagnostic.span)
+                && diagnostic.related.iter().any(|related| related.span == pin)
+        }) {
+            return;
+        }
+        let root_display = self.display_borrow_place(place);
+        let (message, label) = if mode == UseMode::Give {
+            (
+                format!("`{root_display}` cannot be given away while a pointer pins it"),
+                "This Gives Away The Pinned Value",
+            )
+        } else {
+            (
+                format!("`{root_display}` cannot be replaced or lent as writable while a pointer pins it"),
+                "This Can Replace The Pinned Value",
+            )
+        };
+        self.diagnostics.push(
+            Diagnostic::new("E0477", message, span)
+                .with_title("Pinned Value Cannot Be Moved Or Replaced")
+                .with_primary_label(label)
+                .with_explanation(
+                    "A pointer to a Doria place keeps the value in place and alive until the innermost enclosing unsafe context ends. Inside the context the program may read the value and write its fields, but it cannot give the value away, replace it, or pass `writable` access to it.",
+                )
+                .with_related(pin, "Pointer Formed Here")
+                .with_help(
+                    "write through the pointer or to one of the value's fields, or make the change after the unsafe context ends",
+                ),
+        );
+    }
+
     fn check_give_against_active_borrows(&mut self, root: &BorrowPlace, span: Span) {
-        if let Some(existing) = self
+        if let Some(pin) = self.breaking_pin(root, UseMode::Give) {
+            self.report_broken_pin(root, UseMode::Give, pin.span, span);
+            return;
+        }
+        let existing = self
             .active_borrows
             .iter()
             .rev()
             .find(|borrow| borrow.root.overlaps(root))
-            .cloned()
-        {
+            .cloned();
+        if let Some(existing) = existing {
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0471",
                     format!(
                         "`{}` cannot be borrowed and given away in the same call",
-                        display_borrow_root(root)
+                        self.display_borrow_place(root)
                     ),
                     span,
                 )
@@ -9656,7 +10142,9 @@ impl Checker<'_> {
         }
         match expr {
             Expr::Variable { name, .. } => scopes.get(name).is_some(),
-            Expr::Grouped { expr, .. } => self.expr_is_move_value(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_is_move_value(expr, scopes)
+            }
             Expr::Array { .. } => true,
             Expr::ArrayRepeat { .. } => true,
             Expr::New { class_type, .. } => self.classes.contains(&class_type.name),
@@ -9701,6 +10189,9 @@ impl Checker<'_> {
                         if (class_name == "Set" && method == "from")
                             || (class_name == "Bytes"
                                 && matches!(method.as_str(), "fromArray" | "allocate"))
+                            || (crate::foreign::ForeignStringEncoding::from_source_name(class_name)
+                                .is_some()
+                                && matches!(method.as_str(), "from" | "tryFrom"))
                 ) {
                     return true;
                 }
@@ -9799,7 +10290,9 @@ impl Checker<'_> {
             return false;
         }
         match expr {
-            Expr::Grouped { expr, .. } => self.expr_returns_borrow(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_returns_borrow(expr, scopes)
+            }
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -9893,7 +10386,9 @@ impl Checker<'_> {
             return signature.return_borrow.is_some_and(matches_kind);
         }
         match expr {
-            Expr::Grouped { expr, .. } => self.expr_has_return_contract(expr, scopes, kind),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_has_return_contract(expr, scopes, kind)
+            }
             Expr::FunctionCall { name, .. } => self
                 .signatures
                 .get(name)
@@ -9949,7 +10444,9 @@ impl Checker<'_> {
 
     fn expr_is_mixed_collection_index(&self, expr: &Expr, scopes: &Scopes) -> bool {
         match expr {
-            Expr::Grouped { expr, .. } => self.expr_is_mixed_collection_index(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_is_mixed_collection_index(expr, scopes)
+            }
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .is_some_and(|collection| collection.value_mixed),
@@ -9960,12 +10457,27 @@ impl Checker<'_> {
     fn expr_is_mixed_value(&self, expr: &Expr, scopes: &Scopes) -> bool {
         match expr {
             Expr::Variable { name, .. } => scopes.get(name).is_some_and(|binding| binding.mixed),
-            Expr::Grouped { expr, .. } => self.expr_is_mixed_value(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_is_mixed_value(expr, scopes)
+            }
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .is_some_and(|collection| collection.value_mixed),
             _ => false,
         }
+    }
+
+    /// Whether `target` is a field of a foreign struct or union (Decision
+    /// 0148 section 6). A foreign aggregate is an inline Copy value that
+    /// carries no source, so a construction of one retains nothing of its
+    /// arguments; a field store is the same copy into its storage, a
+    /// fixed-length array field copying the elements of a region (amended
+    /// 2026-11-17), and keeps no loan of the stored value either.
+    fn stores_into_foreign_field(&self, target: &Expr) -> bool {
+        let Expr::PropertyAccess { object, .. } = ungroup_expr(target) else {
+            return false;
+        };
+        self.resolved_type(object).is_some_and(is_foreign_aggregate)
     }
 
     fn assignment_property_info<'a>(
@@ -9974,7 +10486,9 @@ impl Checker<'_> {
         scopes: &Scopes,
     ) -> Option<&'a PropertyInfo> {
         match target {
-            Expr::Grouped { expr, .. } => self.assignment_property_info(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.assignment_property_info(expr, scopes)
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => {
@@ -10049,7 +10563,7 @@ impl Checker<'_> {
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .and_then(|collection| collection.value_class),
-            Expr::Grouped { expr, .. } => self.expr_class(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => self.expr_class(expr, scopes),
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -10154,7 +10668,9 @@ impl Checker<'_> {
             Expr::Index { collection, .. } => self
                 .expr_collection_info(collection, scopes)
                 .and_then(|info| info.value_collection.map(|nested| *nested)),
-            Expr::Grouped { expr, .. } => self.expr_collection_info(expr, scopes),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                self.expr_collection_info(expr, scopes)
+            }
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -10465,6 +10981,7 @@ impl Checker<'_> {
                                 generic: false,
                                 take: move_type,
                                 writable: false,
+                                lends: false,
                                 borrow: false,
                             }
                         })
@@ -10520,7 +11037,9 @@ impl Checker<'_> {
                 }));
         if param.take && move_type {
             UseMode::Give
-        } else if param.writable && move_type {
+        } else if param.writable && (move_type || param.lends) {
+            // A writable argument of any type lends the caller's place
+            // (Andrew's ruling of 2026-11-21, "Writable always borrows").
             UseMode::Write
         } else {
             UseMode::Read
@@ -10528,10 +11047,20 @@ impl Checker<'_> {
     }
 }
 
+/// The local a pointer formation addresses, through fields and properties.
+fn pointer_place_root(place: &Expr) -> Option<&str> {
+    match place {
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => pointer_place_root(expr),
+        Expr::PropertyAccess { object, .. } => pointer_place_root(object),
+        Expr::Variable { name, .. } => Some(name),
+        _ => None,
+    }
+}
+
 fn variable_name(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Variable { name, .. } => Some(name),
-        Expr::Grouped { expr, .. } => variable_name(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => variable_name(expr),
         _ => None,
     }
 }
@@ -10557,7 +11086,9 @@ fn binding_roots(binding: &Binding, name: &str) -> Vec<BorrowPlace> {
         .unwrap_or_else(|| vec![binding_identity_key(binding.id, name).into()])
 }
 
-fn display_borrow_root(place: &BorrowPlace) -> String {
+/// The binding, receiver, or static member a place starts from. Diagnostics
+/// name the whole place with `OwnershipChecker::display_borrow_place`.
+fn display_place_owner(place: &BorrowPlace) -> String {
     let root = place.owner.as_str();
     if root == "$this" {
         root.to_string()
@@ -10594,7 +11125,9 @@ fn statements_use_variable(statements: &[Stmt], name: &str) -> bool {
 
 fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
     match statement {
-        Stmt::Block(block) => statements_use_variable(&block.statements, name),
+        Stmt::Block(block) | Stmt::Unsafe(crate::ast::UnsafeBlock { block, .. }) => {
+            statements_use_variable(&block.statements, name)
+        }
         Stmt::VarDecl(declaration) => expr_uses_variable(&declaration.initializer, name),
         Stmt::Assignment(assignment) => {
             expr_uses_variable(&assignment.target, name)
@@ -10749,6 +11282,7 @@ fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
         | Expr::MethodCall { object, .. }
         | Expr::IsType { expr: object, .. }
         | Expr::Grouped { expr: object, .. }
+        | Expr::Unsafe { expr: object, .. }
         | Expr::Unary { expr: object, .. } => {
             expr_uses_variable(object, name)
                 || matches!(expr, Expr::MethodCall { args, .. } if arguments_use_variable(args, name))
@@ -10863,6 +11397,17 @@ fn type_ref_class_name(
     .then(|| ty.name.clone())
 }
 
+/// A foreign struct or union value, or a nullable one.
+fn is_foreign_aggregate(ty: &crate::types::ResolvedType) -> bool {
+    match ty {
+        crate::types::ResolvedType::Foreign(foreign) => {
+            matches!(**foreign, crate::foreign::ForeignType::Aggregate(_))
+        }
+        crate::types::ResolvedType::Nullable(inner) => is_foreign_aggregate(inner),
+        _ => false,
+    }
+}
+
 fn resolved_type_class(ty: &crate::types::ResolvedType) -> Option<&str> {
     match ty {
         crate::types::ResolvedType::Class(class) if class.inline_copy_type().is_none() => {
@@ -10917,8 +11462,12 @@ pub(crate) fn resolved_type_is_move_type(
     move_enum_names: &MoveEnums,
 ) -> bool {
     match ty {
-        crate::types::ResolvedType::ByteRegion(kind) => kind.is_writable(),
+        crate::types::ResolvedType::ByteRegion(kind)
+        | crate::types::ResolvedType::ArrayRegion(kind, _) => kind.is_writable(),
         crate::types::ResolvedType::Class(class) => class.inline_copy_type().is_none(),
+        crate::types::ResolvedType::Foreign(foreign) => {
+            matches!(**foreign, crate::foreign::ForeignType::OwnedString(_))
+        }
         crate::types::ResolvedType::Bytes
         | crate::types::ResolvedType::Mixed
         | crate::types::ResolvedType::Error
@@ -10991,6 +11540,17 @@ fn resolved_collection_info(
 ) -> Option<CollectionInfo> {
     use crate::types::ResolvedType;
     let (family, value) = match ty {
+        ResolvedType::Foreign(foreign)
+            if matches!(**foreign, crate::foreign::ForeignType::OwnedString(_)) =>
+        {
+            return Some(CollectionInfo {
+                family: CollectionFamily::ForeignString,
+                value_move: false,
+                value_mixed: false,
+                value_class: None,
+                value_collection: None,
+            });
+        }
         ResolvedType::Bytes => {
             return Some(CollectionInfo {
                 family: CollectionFamily::Bytes,
@@ -11043,6 +11603,14 @@ fn type_ref_collection_info(
 ) -> Option<CollectionInfo> {
     if ty.name == "Bytes" && ty.arguments.is_empty() {
         return Some(bytes_collection_info());
+    }
+    if crate::foreign::ForeignStringEncoding::from_source_name(&ty.name).is_some()
+        && ty.arguments.is_empty()
+    {
+        return Some(CollectionInfo {
+            family: CollectionFamily::ForeignString,
+            ..bytes_collection_info()
+        });
     }
     let (family, value) = match ty.name.as_str() {
         "[]" if ty.type_argument_count() == 1 => {
@@ -11131,11 +11699,12 @@ fn type_ref_is_move_type_with_nominals(
     // Every Stage 25a handle and access object is a move type (record 0106):
     // plain assignment transfers the handle and never silently retains.
     ty.function.is_some()
-        || crate::types::ByteRegionKind::from_source_name(&ty.name)
+        || crate::types::ByteRegionKind::from_region_name(&ty.name)
             .is_some_and(crate::types::ByteRegionKind::is_writable)
         || crate::types::SharedHandleKind::from_source_name(&ty.name).is_some()
         || type_ref_class_name(ty, classes, receiver_class).is_some()
         || move_nominal_names.contains(&ty.name)
+        || crate::foreign::ForeignStringEncoding::from_source_name(&ty.name).is_some()
         || matches!(
             ty.name.as_str(),
             "mixed"
@@ -11165,7 +11734,7 @@ fn non_null_function_type(
 pub(crate) fn constant_bool(expr: &Expr) -> Option<bool> {
     match expr {
         Expr::Bool { value, .. } => Some(*value),
-        Expr::Grouped { expr, .. } => constant_bool(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => constant_bool(expr),
         Expr::Unary {
             op: ast::UnaryOp::Not,
             expr,
@@ -11206,7 +11775,7 @@ pub(crate) fn constant_bool(expr: &Expr) -> Option<bool> {
 fn is_panic_expr(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { name, .. } => name == "panic",
-        Expr::Grouped { expr, .. } => is_panic_expr(expr),
+        Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => is_panic_expr(expr),
         _ => false,
     }
 }

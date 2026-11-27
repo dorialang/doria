@@ -135,13 +135,44 @@ fn main() {
             &output,
             &runtime_abi_version,
             &build_commit,
-            false,
+            RuntimeBuild::Static,
         );
         println!(
             "cargo:rustc-env=DORIA_RT_BUILT_{}_PATH={}",
             profile.to_ascii_uppercase(),
             output.display()
         );
+    }
+    // A Windows program with foreign code links the C runtime (Decision 0148
+    // section 20), so a Windows compiler also carries a CRT-hosted archive
+    // of each profile, built without the freestanding support symbols the
+    // CRT then provides. Its own target directory keeps the two feature
+    // sets from rebuilding each other.
+    if target.contains("windows") {
+        let crt_target_dir = runtime_target_dir.with_file_name("doria-rt-crt");
+        for profile in ["debug", "release"] {
+            let output = out_dir
+                .join("doria-rt")
+                .join(format!("{profile}-crt"))
+                .join(filename);
+            build_runtime_profile(
+                &cargo,
+                &runtime_manifest,
+                &crt_target_dir,
+                &target,
+                profile,
+                filename,
+                &output,
+                &runtime_abi_version,
+                &build_commit,
+                RuntimeBuild::CrtHosted,
+            );
+            println!(
+                "cargo:rustc-env=DORIA_RT_BUILT_{}_CRT_PATH={}",
+                profile.to_ascii_uppercase(),
+                output.display()
+            );
+        }
     }
     let shared_filename = if target.contains("windows") {
         "doria_rt.dll"
@@ -164,7 +195,7 @@ fn main() {
         &shared_output,
         &runtime_abi_version,
         &build_commit,
-        true,
+        RuntimeBuild::Shared,
     );
     println!(
         "cargo:rustc-env=DORIA_RT_BUILT_SHARED_PATH={}",
@@ -192,6 +223,27 @@ fn runtime_target_dir(out_dir: &Path) -> PathBuf {
     target_or_triple_dir.join("doria-rt")
 }
 
+/// One kind of runtime artifact the compiler carries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeBuild {
+    /// The static archive, with the freestanding Windows support symbols.
+    Static,
+    /// The Windows static archive for programs that link the C runtime.
+    CrtHosted,
+    /// The shared library native-backed PHP output loads.
+    Shared,
+}
+
+impl RuntimeBuild {
+    const fn feature_set(self) -> &'static str {
+        match self {
+            Self::Static => "[\"standalone-windows-support\"]",
+            Self::CrtHosted => "[]",
+            Self::Shared => "[\"hosted-shared-runtime\"]",
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_runtime_profile(
     cargo: &OsString,
@@ -203,8 +255,9 @@ fn build_runtime_profile(
     output: &Path,
     runtime_abi_version: &str,
     build_commit: &str,
-    shared: bool,
+    build: RuntimeBuild,
 ) {
+    let shared = build == RuntimeBuild::Shared;
     let mut command = Command::new(cargo);
     command
         .arg(if shared { "rustc" } else { "build" })
@@ -246,6 +299,9 @@ fn build_runtime_profile(
             "--features",
             "hosted-shared-runtime",
         ]);
+    }
+    if build == RuntimeBuild::CrtHosted {
+        command.arg("--no-default-features");
     }
     if profile == "release" {
         command.arg("--release");
@@ -310,7 +366,7 @@ fn build_runtime_profile(
         profile,
         archive.len(),
         &sha256_hex(&archive),
-        shared,
+        build,
     );
     std::fs::write(&metadata_path, document).unwrap_or_else(|error| {
         panic!(
@@ -336,7 +392,7 @@ fn runtime_metadata_document(
     profile: &str,
     bytes: usize,
     sha256: &str,
-    shared: bool,
+    build: RuntimeBuild,
 ) -> String {
     format!(
         concat!(
@@ -347,7 +403,7 @@ fn runtime_metadata_document(
             "  \"targetTriple\": \"{}\",\n",
             "  \"profile\": \"{}\",\n",
             "  \"artifactKind\": \"{}\",\n",
-            "  \"featureSet\": [\"{}\"],\n",
+            "  \"featureSet\": {},\n",
             "  \"bytes\": {},\n",
             "  \"sha256\": \"{}\"\n",
             "}}\n"
@@ -357,12 +413,12 @@ fn runtime_metadata_document(
         escape_json(runtime_revision),
         escape_json(target_triple),
         escape_json(profile),
-        if shared { "shared" } else { "static" },
-        if shared {
-            "hosted-shared-runtime"
+        if build == RuntimeBuild::Shared {
+            "shared"
         } else {
-            "standalone-windows-support"
+            "static"
         },
+        build.feature_set(),
         bytes,
         escape_json(sha256),
     )

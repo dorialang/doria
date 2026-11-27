@@ -22,6 +22,16 @@ pub enum BackendOutput {
         contents: String,
         runtime: Box<SharedRuntimeDependency>,
     },
+    /// PHP output of a program with unsafe regions: the generated PHP, the
+    /// shared runtime it loads, and the native companion library its
+    /// regions run in, built beside it as `<stem>.native.<ext>` with its
+    /// sidecar when the output is published (Decision 0148 section 23).
+    TextWithCompanion {
+        extension: String,
+        contents: String,
+        runtime: Box<SharedRuntimeDependency>,
+        companion: Box<CompanionBuild>,
+    },
     Binary {
         extension: String,
         bytes: Vec<u8>,
@@ -29,10 +39,22 @@ pub enum BackendOutput {
     Executable {
         extension: String,
         bytes: Vec<u8>,
+        /// The runtime files of the native libraries it links, published
+        /// beside it (Decision 0148 section 19).
+        runtime_files: Vec<PathBuf>,
     },
     Artifact {
         path: PathBuf,
     },
+}
+
+/// What a host output builds its native companion library from: the
+/// validated MIR of its program, the native profile and the link inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionBuild {
+    pub program: mir::Program,
+    pub profile: NativeProfile,
+    pub linking: crate::native_link::NativeLinking,
 }
 
 /// Publish compiler output and its verified dependencies through one CLI/library boundary.
@@ -52,8 +74,40 @@ pub fn publish_output(out_path: &Path, output: BackendOutput) -> Result<(), Back
             runtime.publish(directory)?;
             write_output(out_path, contents.as_bytes())
         }
+        BackendOutput::TextWithCompanion {
+            contents,
+            runtime,
+            companion,
+            ..
+        } => {
+            runtime.publish(directory)?;
+            let stem = out_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    BackendError::new(format!(
+                        "the PHP output path `{}` has no file name for its companion library",
+                        out_path.display()
+                    ))
+                })?;
+            crate::native_companion::publish(
+                &companion.program,
+                companion.profile,
+                &companion.linking,
+                directory,
+                stem,
+            )?;
+            write_output(out_path, contents.as_bytes())
+        }
         BackendOutput::Binary { bytes, .. } => write_output(out_path, &bytes),
-        BackendOutput::Executable { bytes, .. } => {
+        BackendOutput::Executable {
+            bytes,
+            runtime_files,
+            ..
+        } => {
+            for file in &runtime_files {
+                publish_runtime_file(file, directory)?;
+            }
             write_output(out_path, &bytes)?;
             #[cfg(unix)]
             {
@@ -86,6 +140,30 @@ pub fn publish_output(out_path: &Path, output: BackendOutput) -> Result<(), Back
 /// observe a partly written output. As with an in-place write, a symlinked
 /// destination replaces the file it points to, and an existing file's
 /// permissions carry over.
+/// Copies a native library's runtime file into the executable's directory,
+/// where the executable loads it.
+pub(crate) fn publish_runtime_file(file: &Path, directory: &Path) -> Result<(), BackendError> {
+    let name = file.file_name().ok_or_else(|| {
+        BackendError::new(format!(
+            "runtime file `{}` has no file name",
+            file.display()
+        ))
+    })?;
+    let destination = directory.join(name);
+    if std::fs::canonicalize(file).ok() == std::fs::canonicalize(&destination).ok()
+        && destination.exists()
+    {
+        return Ok(());
+    }
+    let bytes = std::fs::read(file).map_err(|error| {
+        BackendError::new(format!(
+            "failed to read runtime file `{}`: {error}",
+            file.display()
+        ))
+    })?;
+    write_output(&destination, &bytes)
+}
+
 fn write_output(path: &Path, bytes: &[u8]) -> Result<(), BackendError> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let destination = match std::fs::symlink_metadata(path) {
@@ -190,24 +268,28 @@ impl NativeProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileOptions {
     pub target: BackendTarget,
     pub native_profile: NativeProfile,
+    /// The link inputs of the native libraries the program names
+    /// (Decision 0148 section 18).
+    pub linking: crate::native_link::NativeLinking,
 }
 
 impl CompileOptions {
-    pub const fn new(target: BackendTarget) -> Self {
+    pub fn new(target: BackendTarget) -> Self {
         Self {
             target,
             native_profile: NativeProfile::Fast,
+            linking: crate::native_link::NativeLinking::default(),
         }
     }
 
-    pub const fn native(native_profile: NativeProfile) -> Self {
+    pub fn native(native_profile: NativeProfile) -> Self {
         Self {
-            target: BackendTarget::Native,
             native_profile,
+            ..Self::new(BackendTarget::Native)
         }
     }
 }
@@ -261,15 +343,25 @@ impl Backend for PhpBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
-        let mir = if program.semantic_info.closures.is_empty()
-            && program.semantic_info.callable_value_calls.is_empty()
-        {
-            None
-        } else {
-            Some(lower_validated_mir(program)?)
-        };
-        codegen_php::generate_artifact(program, mir.as_ref())
+        emit_php(program, &crate::native_link::NativeLinking::default())
     }
+}
+
+/// PHP output. A program with unsafe regions runs them in the native
+/// companion library, built with `linking` (Decision 0148 section 23).
+fn emit_php(
+    program: &hir::Program,
+    linking: &crate::native_link::NativeLinking,
+) -> Result<BackendOutput, BackendError> {
+    let mir = if program.semantic_info.closures.is_empty()
+        && program.semantic_info.callable_value_calls.is_empty()
+        && program.semantic_info.unsafe_contexts.is_empty()
+    {
+        None
+    } else {
+        Some(lower_validated_mir(program)?)
+    };
+    codegen_php::generate_artifact(program, mir.as_ref(), linking)
 }
 
 pub struct NativeBackend;
@@ -280,18 +372,25 @@ impl Backend for NativeBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
-        emit_native(program, NativeProfile::Fast)
+        emit_native(
+            program,
+            NativeProfile::Fast,
+            &crate::native_link::NativeLinking::default(),
+        )
     }
 }
 
 fn emit_native(
     program: &hir::Program,
     native_profile: NativeProfile,
+    linking: &crate::native_link::NativeLinking,
 ) -> Result<BackendOutput, BackendError> {
     let mir = lower_validated_mir(program)?;
+    let executable = codegen_native::generate_linked_executable(&mir, native_profile, linking)?;
     Ok(BackendOutput::Executable {
         extension: native_executable_extension().to_string(),
-        bytes: codegen_native::generate_executable(&mir, native_profile)?,
+        bytes: executable.bytes,
+        runtime_files: executable.runtime_files,
     })
 }
 
@@ -303,20 +402,40 @@ impl Backend for DebugBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
-        let mir = lower_validated_mir(program)?;
-        let output = mir_interpreter::interpret(&mir).map_err(|error| {
-            BackendError::from_diagnostics(vec![Diagnostic::new(
-                "M1102",
-                format!("MIR interpreter failure: {error}"),
-                Span::default(),
-            )])
-        })?;
-
-        Ok(BackendOutput::Text {
-            extension: "debug".to_string(),
-            contents: mir_interpreter::render_debug_output(&output),
-        })
+        emit_debug(program, &crate::native_link::NativeLinking::default())
     }
+}
+
+/// Runs the program in the interpreter. Its unsafe regions run in the
+/// native companion library, built with `linking` (Decision 0148 section
+/// 23).
+fn emit_debug(
+    program: &hir::Program,
+    linking: &crate::native_link::NativeLinking,
+) -> Result<BackendOutput, BackendError> {
+    let mir = lower_validated_mir(program)?;
+    let io = mir_interpreter::MirIo {
+        linking: linking.clone(),
+        ..mir_interpreter::MirIo::default()
+    };
+    let output = mir_interpreter::interpret_with_io(&mir, io)
+        .map_err(|error| {
+            if error.diagnostics.is_empty() {
+                BackendError::from_diagnostics(vec![Diagnostic::new(
+                    "M1102",
+                    format!("MIR interpreter failure: {error}"),
+                    Span::default(),
+                )])
+            } else {
+                BackendError::from_diagnostics(error.diagnostics)
+            }
+        })?
+        .output;
+
+    Ok(BackendOutput::Text {
+        extension: "debug".to_string(),
+        contents: mir_interpreter::render_debug_output(&output),
+    })
 }
 
 fn lower_validated_mir(program: &hir::Program) -> Result<mir::Program, BackendError> {
@@ -340,9 +459,9 @@ pub fn emit_with_options(
     }
 
     match options.target {
-        BackendTarget::Native => emit_native(program, options.native_profile),
-        BackendTarget::Php => PhpBackend.emit(program),
-        BackendTarget::Debug => DebugBackend.emit(program),
+        BackendTarget::Native => emit_native(program, options.native_profile, &options.linking),
+        BackendTarget::Php => emit_php(program, &options.linking),
+        BackendTarget::Debug => emit_debug(program, &options.linking),
         BackendTarget::Wasm => Err(format!(
             "backend `{}` ({}) is planned but not implemented yet",
             options.target.name(),

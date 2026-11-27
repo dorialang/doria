@@ -1,0 +1,34 @@
+// The shape of a library: a class walks graphemes in its methods, holds a
+// view in a local, names no interface, and the program prints nothing. The status is
+// clusters * 10 + cells = 4 * 10 + 6 = 46.
+class Line
+{
+    function __construct(internal string $text)
+    {
+    }
+
+    function clusters(): int
+    {
+        writable int $count = 0;
+        let $view = $this->text->graphemes;
+        foreach ($view as string $grapheme) {
+            $count++;
+        }
+        return $count;
+    }
+
+    function cells(): int
+    {
+        writable int $total = 0;
+        foreach ($this->text->graphemes as string $grapheme) {
+            $total += $grapheme->displayWidth;
+        }
+        return $total;
+    }
+}
+
+function main(): int
+{
+    let $line = new Line("a日👍🏾é");
+    return $line->clusters() * 10 + $line->cells();
+}

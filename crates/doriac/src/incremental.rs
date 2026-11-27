@@ -524,6 +524,32 @@ fn append_item_signature(surface: &mut String, item: &Item, source_text: &str) {
             append_optional_type(surface, value.ty.as_ref());
             append_expression(surface, &value.initializer, source_text);
         }
+        Item::ExternBlock(block) => {
+            surface.push_str("extern:");
+            append_access(surface, block.access);
+            surface.push_str(&block.abi.value);
+        }
+        Item::ForeignAggregate(aggregate) => {
+            surface.push_str("extern:");
+            append_access(surface, aggregate.access);
+            surface.push_str(&aggregate.abi.value);
+            surface.push(':');
+            surface.push_str(aggregate.kind.keyword());
+            surface.push(':');
+            surface.push_str(&aggregate.name);
+            match &aggregate.fields {
+                None => surface.push_str("incomplete"),
+                Some(fields) => {
+                    for field in fields {
+                        surface.push_str("field:");
+                        surface.push_str(&field.ty.to_string());
+                        surface.push(':');
+                        surface.push_str(&field.name);
+                        append_optional_expression(surface, field.default.as_ref(), source_text);
+                    }
+                }
+            }
+        }
         Item::Statement(_) => {}
     }
     surface.push('|');
@@ -575,6 +601,21 @@ fn append_function_signature(
     surface.push(if function.is_open { 'o' } else { '-' });
     surface.push(if function.is_override { 'v' } else { '-' });
     surface.push(if function.is_static { 's' } else { '-' });
+    surface.push(if function.unsafe_span.is_some() {
+        'u'
+    } else {
+        '-'
+    });
+    match &function.linkage {
+        crate::ast::FunctionLinkage::Doria => {}
+        crate::ast::FunctionLinkage::CAbi { abi, .. } => {
+            surface.push_str("c-abi:");
+            surface.push_str(&abi.value);
+        }
+        crate::ast::FunctionLinkage::Foreign { block } => {
+            surface.push_str(&format!("foreign:{}:{};", block.start, block.end));
+        }
+    }
     surface.push(match ReceiverMode::from_declaration(function) {
         ReceiverMode::Readonly => 'r',
         ReceiverMode::Writable => 'w',
@@ -621,6 +662,7 @@ fn append_function_signature(
             surface.push_str(&format!("intrinsic:{implementation:?};"));
         }
         crate::ast::FunctionBody::Requirement { .. } => surface.push_str("requirement;"),
+        crate::ast::FunctionBody::Foreign { .. } => surface.push_str("foreign;"),
         crate::ast::FunctionBody::Block(body) => {
             surface.push_str("body;");
             // Return provenance and inferred return types are part of the callable

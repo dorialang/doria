@@ -135,23 +135,52 @@ enum TerminalWaitResult {
     case Closed;
 }
 class Size {
-    internal function __construct() {}
+    function __construct(parameter int $columns, parameter int $rows) {}
+    internal static function fromParts(int $columns, int $rows): self {
+        if ($columns < 0 || $rows < 0) {
+            panic("a terminal size cannot be negative; columns and rows start at 0");
+        }
+        return Doria\Std\Term\Size::fromBits(
+            Doria\Std\Term\Console::limited($columns) | (Doria\Std\Term\Console::limited($rows) << 24));
+    }
     internal static function fromBits(int $bits): self {}
     internal int $bits { get {} }
     int $columns { get => $this->bits & 16777215; }
     int $rows { get => ($this->bits >> 24) & 16777215; }
 }
 class Position {
-    internal function __construct() {}
+    function __construct(parameter int $column, parameter int $row) {}
+    internal static function fromParts(int $column, int $row): self {
+        if ($column < 0 || $row < 0) {
+            panic("a terminal position cannot be negative; columns and rows start at 0");
+        }
+        return Doria\Std\Term\Position::fromBits(
+            Doria\Std\Term\Console::limited($column) | (Doria\Std\Term\Console::limited($row) << 24));
+    }
     internal static function fromBits(int $bits): self {}
     internal int $bits { get {} }
     int $column { get => $this->bits & 16777215; }
     int $row { get => ($this->bits >> 24) & 16777215; }
 }
 class KeyModifiers {
-    internal function __construct() {}
+    function __construct(parameter bool $control, parameter bool $alt, parameter bool $shift) {}
+    internal static function fromParts(bool $control, bool $alt, bool $shift): self {
+        writable int $bits = 0;
+        if ($control) {
+            $bits = $bits | 1;
+        }
+        if ($alt) {
+            $bits = $bits | 2;
+        }
+        if ($shift) {
+            $bits = $bits | 4;
+        }
+        return Doria\Std\Term\KeyModifiers::fromBits($bits);
+    }
     internal static function fromBits(int $bits): self {}
     internal int $bits { get {} }
+
+    static Doria\Std\Term\KeyModifiers $none { get => Doria\Std\Term\KeyModifiers::fromBits(0); }
     bool $control { get => ($this->bits & 1) != 0; }
     bool $alt { get => ($this->bits & 2) != 0; }
     bool $shift { get => ($this->bits & 4) != 0; }

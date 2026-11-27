@@ -232,6 +232,7 @@ function main(): void {
             writable: false,
             owned: true,
             synthetic: true,
+            binding: None,
         });
         request.entry_block = mir::BlockId(0);
         request.blocks = vec![

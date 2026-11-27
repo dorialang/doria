@@ -89,10 +89,9 @@ function observeNamedSnapshot(Guard $item, int $before): void
     echo "namedSnapshot{$before}:{$item->value};";
 }
 
-function makeIncrementedCopy(writable int $number): Guard
+function makeIncrementedCopy(int $number): Guard
 {
-    $number += 1;
-    return new Guard($number);
+    return new Guard($number + 1);
 }
 
 class Probe

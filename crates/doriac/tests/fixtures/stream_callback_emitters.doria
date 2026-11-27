@@ -1,6 +1,6 @@
 use Doria\Std\Io\{PendingReadableStream, PendingWritableStream, ReadRequest,
     WriteRequest, WritableByteRegion, ByteRegion, ReadOutcome, WriteOutcome,
-    ReadinessSource, ReadableFile, IoError};
+    ReadinessSource, ReadableFile, File, IoError};
 
 interface Both extends PendingReadableStream, PendingWritableStream {}
 
@@ -37,4 +37,7 @@ open class Open implements Both {
 }
 
 function observe(Both $stream): void {}
-function main(): void {}
+function main(): void {
+    observe(new Closed(File::openRead("input")));
+    observe(new Open(File::openRead("input")));
+}

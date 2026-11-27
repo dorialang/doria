@@ -1,0 +1,77 @@
+namespace Doria\Tui\Core;
+
+use Doria\Std\Io\IoError;
+use Doria\Tui\Rendering\Window;
+use Doria\Tui\Rendering\WindowStyles;
+
+class Application
+{
+    internal writable Window $window = new Window("");
+    internal writable bool $isRunning = true;
+
+    function __construct(string $title)
+    {
+        $this->window->title = $title;
+    }
+
+    /**
+     * Loads the specified window styles into the application.
+     *
+     * @return void
+     * @throws IoError
+     */
+    writable function loadStyle(take WindowStyles $styles): self
+    {
+        $this->window->styles = $styles;
+        return $this;
+    }
+
+    /**
+     * Runs the application, handling input, updating state, and rendering the window.
+     *
+     * @return void
+     * @throws IoError
+     */
+    writable function run(): void throws IoError
+    {
+        try {
+            $this->start();
+
+            while ($this->isRunning) {
+                $this->processInput();
+                $this->update();
+                $this->render();
+                // Simulate application logic here
+                $this->isRunning = false; // For demonstration, we stop after one iteration
+            }
+        } catch (IoError $error) {
+            echo "Error: {$error->message}\n";
+        } finally {
+            echo "Terminating application: {$this->window->title}.\n";
+        }
+    }
+
+    internal writable function processInput(): void
+    {
+        // Handle user input here
+    }
+
+    internal writable function update(): void
+    {
+        // Update application state here
+        List<string> $names = ["first", "second"];
+        foreach ($names as int $index => string $value) {
+            echo "{$index}) {$value}\n";
+        }
+    }
+
+    internal writable function render(): void
+    {
+        $this->window->render();
+    }
+
+    internal writable function start(): void
+    {
+        echo "Starting application: {$this->window->title}\n";
+    }
+}

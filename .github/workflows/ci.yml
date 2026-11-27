@@ -76,10 +76,12 @@ jobs:
           ini-values: ffi.enable=1
           coverage: none
 
-      - name: Install native leak checker
+      # The Stage 40 zlib package links the system zlib (Decision 0148
+      # acceptance 3).
+      - name: Install native leak checker and zlib
         run: |
           sudo apt-get update
-          sudo apt-get install --yes valgrind
+          sudo apt-get install --yes valgrind zlib1g-dev pkg-config
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -447,7 +449,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install --yes llvm-18-dev libffi-dev valgrind
+          sudo apt-get install --yes llvm-18-dev libffi-dev valgrind zlib1g-dev pkg-config
           echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
 
       - name: Install LLVM 18.1.8 on macOS
@@ -585,6 +587,40 @@ jobs:
           --test indexed_access_span_tests
           --test performance_report_tests
           --test native_testing_slice1_tests
+
+      # Decision 0148 acceptance 3: zlib on every host. Linux installs it
+      # with the LLVM packages and macOS links the system libz; Windows
+      # takes vcpkg's import library with its DLL and its static library,
+      # which links against the dynamic Universal CRT (section 20). The
+      # examples/ffi/zlib package links the import library and DLL from
+      # native/windows, as its Baton.toml maps them, so the parity manifest
+      # runs it from there.
+      - name: Provision zlib on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkg = (Get-Command vcpkg -ErrorAction Stop).Source
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            & $vcpkg install "zlib:x64-windows" "zlib:x64-windows-static-md"
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw "failed to install zlib after $attempt attempts" }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
+          "VCPKG_INSTALLATION_ROOT=$(Split-Path $vcpkg)" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $installed = Join-Path (Split-Path $vcpkg) "installed\x64-windows"
+          $package = "examples\ffi\zlib\native\windows"
+          New-Item -ItemType Directory -Force -Path "$package\lib", "$package\bin" | Out-Null
+          Copy-Item (Join-Path $installed "lib\zlib.lib") "$package\lib\zlib.lib" -ErrorAction Stop
+          Copy-Item (Join-Path $installed "bin\zlib1.dll") "$package\bin\zlib1.dll" -ErrorAction Stop
+
+      - name: Run Stage 40 unsafe code and FFI suites
+        run: >-
+          cargo test -p doriac --features llvm-backend --locked --verbose --no-fail-fast
+          --test stage40_grammar_tests
+          --test stage40_checking_tests
+          --test stage40_execution_tests
+          --test stage40_linking_tests
 
       - name: Run complete interpreter, Cranelift, and LLVM parity manifest
         run: cargo test -p doriac --test native_mir_parity_tests --features llvm-backend --locked --verbose
@@ -768,3 +804,62 @@ jobs:
           if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Call Path")) { throw "missing integer call path" }
           if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Panic[P1110]: Float To Integer Conversion Is Out Of Range")) { throw "missing float panic" }
           if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Call Path")) { throw "missing float call path" }
+
+  # The compiler other Doria repositories test against. doria-tui's CI
+  # downloads this artifact for the doria commit it pins, so a consumer run
+  # takes minutes and each commit's compiler is built once. Nothing is
+  # released. The build has no LLVM backend: that one links LLVM 18 at run
+  # time, which a consumer runner does not have. Cranelift, the interpreter
+  # and PHP output are all in it.
+  compiler-artifact:
+    name: compiler-artifact-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+
+      - name: Build the release compiler
+        run: cargo build -p doriac --release --locked
+
+      # The binary must stand alone: run it from outside the checkout, where
+      # no build directory is near it, on a program that compiles natively.
+      - name: Check the compiler runs on its own
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/doriac-artifact"
+          mkdir -p "$staging"
+          binary=doriac
+          if [ "$RUNNER_OS" = "Windows" ]; then binary=doriac.exe; fi
+          cp "target/release/$binary" "$staging/$binary"
+          cp examples/native/main_arithmetic_42.doria "$staging/main.doria"
+          cd "$staging"
+          program=main
+          if [ "$RUNNER_OS" = "Windows" ]; then program=main.exe; fi
+          "./$binary" compile main.doria --target native --out "$program"
+          status=0
+          "./$program" || status=$?
+          if [ "$status" -ne 42 ]; then
+            echo "the standalone compiler's program exited $status, expected 42"
+            exit 1
+          fi
+          "./$binary" --version --json
+
+      - name: Upload the compiler
+        uses: actions/upload-artifact@v7
+        with:
+          name: doriac-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/doriac-artifact/doriac*
+          if-no-files-found: error
+          retention-days: 30

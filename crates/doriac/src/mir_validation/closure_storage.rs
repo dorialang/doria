@@ -111,7 +111,7 @@ pub(super) fn validate(program: &mir::Program) -> Result<(), BackendError> {
                 }
                 _ => {}
             }
-            for successor in terminator_targets(&block.terminator) {
+            for successor in block.terminator.targets() {
                 match &mut incoming[successor.0] {
                     None => {
                         incoming[successor.0] = Some(state.clone());

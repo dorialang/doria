@@ -614,6 +614,44 @@ pub unsafe extern "C" fn dr_v1_string_grapheme_length(value: *const DrStringV1) 
     doria_unicode::grapheme_count(text(value))
 }
 
+/// The end of the grapheme cluster that starts at byte `offset`
+/// (Decision 0147). Compiler-private: only the `$text->graphemes` cursor
+/// calls it.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_string_grapheme_boundary_after(
+    value: *const DrStringV1,
+    offset: i64,
+) -> i64 {
+    let source = text(value);
+    let offset = usize::try_from(offset).unwrap_or(source.len());
+    // A Doria string never exceeds `i64::MAX` bytes.
+    doria_unicode::grapheme_boundary_after(source, offset) as i64
+}
+
+/// The text between two cluster boundaries as a new string (Decision
+/// 0147). Compiler-private, like the boundary walk.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_string_text_between(
+    frame: *const DrStackFrameV2,
+    value: *const DrStringV1,
+    start: i64,
+    end: i64,
+) -> *mut DrStringV1 {
+    let source = text(value);
+    let range = match (usize::try_from(start), usize::try_from(end)) {
+        (Ok(start), Ok(end)) if !doria_unicode::text_between(source, start, end).is_empty() => {
+            start..end
+        }
+        _ => 0..0,
+    };
+    copy_range(frame, source, range)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_string_display_width(value: *const DrStringV1) -> usize {
+    doria_unicode::display_width(text(value))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_string_is_empty(value: *const DrStringV1) -> u8 {
     u8::from(crate::dr_v1_string_byte_length(value) == 0)
@@ -1142,6 +1180,23 @@ mod tests {
         unsafe {
             let family = string("👨‍👩‍👧‍👦");
             assert_eq!(dr_v1_string_grapheme_length(family), 1);
+            assert_eq!(dr_v1_string_display_width(family), 2);
+            let mixed = string("e\u{301}👍🏾\r\n");
+            let mut clusters = Vec::new();
+            let mut start = 0;
+            while start < 13 {
+                let end = dr_v1_string_grapheme_boundary_after(mixed, start);
+                let cluster = dr_v2_string_text_between(ptr::null(), mixed, start, end);
+                clusters.push(read(cluster).to_string());
+                crate::dr_v1_string_release(cluster);
+                start = end;
+            }
+            assert_eq!(clusters, ["e\u{301}", "👍🏾", "\r\n"]);
+            assert_eq!(dr_v1_string_grapheme_boundary_after(mixed, 13), 13);
+            let broken = dr_v2_string_text_between(ptr::null(), mixed, 1, 2);
+            assert_eq!(read(broken), "");
+            crate::dr_v1_string_release(broken);
+            crate::dr_v1_string_release(mixed);
             assert_eq!(crate::dr_v1_string_byte_length(family), 25);
             assert_eq!(dr_v1_string_is_empty(family), 0);
 

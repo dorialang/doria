@@ -1,0 +1,1647 @@
+# Decision 0148: Unsafe Code And The Foreign Function Interface
+
+- **Status:** Accepted. Andrew ruled every fork on cards on 2026-11-16, and amended sections 6 and 7 the same day (Amendment: Initializing Unions And Fixed-Length Arrays; Amendment: What A Pin Excludes) and sections 14 and 6 on 2026-11-17 (Amendment: Variadic Calls In The Fast Profile; Amendment: Assigning A Fixed-Length Array Field), and sections 9, 12, 18 and 19 on 2026-11-20 (Amendment: Owned Foreign Strings; Amendment: Checked Errors In C-Callable Functions; Amendment: Typed Link Inputs; Amendment: Runtime Files Placed By The Compiler), and renamed the pointer, handle and foreign-memory region vocabulary and settled open-class handles in section 11 the same day (Amendment: Readable Names), and made regions iterable in section 8 the same day (Amendment: Iterating Regions), and gave the handle operations a stated type argument in section 11 the same day (Amendment: Type Arguments For Handles), and limited what is emitted to reachable code in section 17 on 2026-11-21 (Amendment: Emitting Only Reachable Code), and let a type parameter be a pointee in section 3 the same day (Amendment: Type Parameters As Pointees), and let a pointer address a collection element in section 7 the same day (Amendment: Pointers To Elements). Delivery is tracked in the end-to-end plan (Stage 40) and `docs/notes/current-pipeline.md`.
+- **Date:** 2026-11-16
+- **Owners:** Doria language, compiler, runtime and Baton design
+- **Scope:** Stage 40 (plan D12): `unsafe` contexts, pointers, `extern "C"` declarations, the types that cross the C boundary, zero-copy exchange of Doria buffers, foreign-owned memory, callbacks from C, platform selection, linking foreign libraries through Baton and `doriac`, and the native companion library through which the interpreter and PHP output run unsafe code
+
+## Approval And Boundary
+
+Andrew answered these questions on cards on 2026-11-16. Each line gives the
+question's subject and his selection, quoted.
+
+1. Where the FFI vocabulary lives: "Module Doria\Std\Ffi (Recommended)".
+2. Unsafe contexts: "Block plus expression form (Recommended)".
+3. Pointer nullability and the untyped pointee: "Non-null Ptr, ?Ptr, Ptr<Opaque> (Recommended)".
+4. Pointer operations: "Named verbs, checked alignment (Recommended)".
+5. C types whose width varies by platform: "Distinct boundary types (Recommended)".
+6. Foreign aggregates: "extern \"C\" struct and union (Recommended)".
+7. How long pointers into Doria storage stay valid: "For the enclosing unsafe context (Recommended)".
+8. Typed views over `T[]`: "ArrayRegion<T> for every T, no strides (Recommended)".
+9. Strings across the boundary: "Explicit conversions (Recommended)".
+10. Memory a foreign library allocates: "Owner-bound regions plus RAII (Recommended)".
+11. Raw handles: "Owned and shared values (Recommended)".
+12. Callbacks: "extern \"C\" functions (Recommended)".
+13. Callback threads and the Call Path: "Checked thread, chained Call Path (Recommended)".
+14. Calling conventions and variadic functions: "\"C\" only, typed per-arity (Recommended)".
+15. Symbol names: "Name is the symbol, #[LinkName] when needed (Recommended)".
+16. `errno` and `GetLastError`: "Opt-in capture per declaration (Recommended)".
+17. Platform-specific bindings: "Constant Platform branches (Recommended)".
+18. Who owns link facts: "Source names, Baton maps (Recommended)".
+19. The Baton description of a native library: "Typed per-platform table (Recommended)".
+20. The Windows C runtime: "UCRT only with foreign code (Recommended)".
+21. The Windows GUI subsystem: "Baton target field, defined streams (Recommended)".
+22. The interpreter: first "Native-only diagnostic, own manifest (Recommended)",
+    then, the same day, "Use the companion too (Recommended)", which
+    supersedes the first answer.
+23. PHP output: Andrew rejected the recommended unsupported-feature
+    diagnostic with "Im not looking for the quick answer but the correct
+    answer... what makes Doria stand out and will save developers time?" and
+    selected "Native companion library (Recommended)".
+24. Standard-library runtime bindings: "Stay intrinsics, dr_ reserved (Recommended)".
+25. Unsafe policy: "File, package and dependency audit (Recommended)".
+26. Foreign calls inside property hooks: "Only if declared non-blocking (Recommended)".
+27. Safety documentation: "Safety section, shown at call sites (Recommended)".
+
+These rulings amend plan D3 for foreign layouts, replace the plan's
+`Ptr<void>` with `Pointer<Opaque>`, move native-library declarations from plan
+Appendix A's deferral into Stage 40, and give the interpreter and PHP output
+native execution of unsafe code. The amendments are listed under Invalidated
+Elsewhere.
+
+### Amendment: Initializing Unions And Fixed-Length Arrays (2026-11-16)
+
+Section 6 required every struct field without a default to be supplied at
+construction, and did not say how a union is built or what value supplies a
+fixed-length array field. Stage 40 implementation raised the question, and
+Andrew ruled on 2026-11-16: "Zeroed or one member; arrays zeroed or copied
+(Recommended)". Section 6 states the rule.
+
+### Amendment: What A Pin Excludes (2026-11-16)
+
+Section 7 said a pinned source cannot be "accessed in a conflicting way"
+without saying which accesses conflict, and the first implementation made a
+writable pin exclude every other access. Andrew ruled on 2026-11-16: "Pins
+stop moves, not field access (Recommended)". Section 7 states the rule, and
+section 23's marshalling paragraph follows it.
+
+### Amendment: Variadic Calls In The Fast Profile (2026-11-17)
+
+Section 14 binds a variadic C function per arity but did not say how each
+native profile makes the call. Cranelift 0.134 cannot express one: it cannot
+set `%al` to the count of vector registers a System V x86_64 variadic call
+uses, and it cannot place Apple arm64 variadic arguments in their 8-byte
+stack slots. Andrew ruled on 2026-11-17: "Runtime trampoline for Cranelift
+(Recommended)". Section 14 states the rule.
+
+### Amendment: Assigning A Fixed-Length Array Field (2026-11-17)
+
+Section 6 said how a fixed-length array field is supplied at construction but
+not what assigning the whole field (`$tip->text = $region`) does. Andrew ruled
+on 2026-11-17: "Copy, same rule as construction (Recommended)". Section 6
+states the rule.
+
+### Amendment: Owned Foreign Strings (2026-11-20)
+
+Section 9 said how `CString` and `Utf16String` are made and read but not
+whether they are Copy or Move values. Andrew ruled on 2026-11-20: "Move
+value owning its buffer (Recommended)". Section 9 states the rule.
+
+### Amendment: Checked Errors In C-Callable Functions (2026-11-20)
+
+Section 12 said a checked error must be handled inside a C-callable function's
+body but not whether that includes Decision 0123's automatic I/O errors,
+which need no declaration elsewhere. Andrew ruled on 2026-11-20: "Checking
+error: catch it inside the body (Recommended)". Section 12 states the rule.
+
+### Amendment: Typed Link Inputs (2026-11-20)
+
+Sections 18 and 19 said Baton writes resolved link inputs into build-plan
+schema 2 and `doriac` accepts the same inputs through repeatable flags, but
+not the input model, the field shapes or the flags. Andrew ruled on
+2026-11-20: "Typed inputs per logical library (Recommended)". Section 18
+states the rule. `docs/build-plan-schema.md` (Baton Requirements) lists what
+Baton implements for it.
+
+### Amendment: Runtime Files Placed By The Compiler (2026-11-20)
+
+Section 19 said Baton copies `runtime-files` beside the built executable or
+companion, while section 18 lets `doriac compile` and `doriac run` link without
+Baton. Andrew ruled on 2026-11-20: "doriac places them for every build
+(Recommended)". `doriac` places the runtime files of every linked native
+library beside the program it builds, for direct `doriac compile`,
+`doriac run`, Baton builds and the companion library. Baton resolves them,
+records them in the receipt and passes them to `doriac` in build-plan schema
+2. Section 19 states the rule.
+
+### Amendment: Readable Names (2026-11-20)
+
+Section 11 did not say what the handle of a class value holds when the class
+is open, so the value's dynamic type can differ from its static type. Andrew
+answered that card on 2026-11-20: "Closed: object pointer... but I want to
+address something else that needs care! Doria should not look like Rust. I
+don't like Rust's mysterious encantations... MutPtr is another Rust like
+spelling... it doesn't not meet the standard of "Readable code"." He then
+ruled on three naming cards: "`Pointer<T>` and `WritablePointer<T>`
+(Recommended)", "create, reclaim, borrow (Recommended)" and
+"`fromPointer($owner, $pointer, $length)` (Recommended)".
+
+- `Ptr<T>` is `Pointer<T>` and `MutPtr<T>` is `WritablePointer<T>` in every
+  form: `?Pointer<T>`, `Pointer<Opaque>`, `Pointer::to`,
+  `WritablePointer::to`, `Pointer::cast`, `WritablePointer::cast`,
+  `Pointer::fromAddress`, `Pointer::from` and `Pointer::toFunction`. The names
+  match `ByteRegion` and `WritableByteRegion` and the regions' `pointer` and
+  `writablePointer` properties.
+- `Handle::create`, `Handle::reclaim` and `Handle::borrow`, with
+  `$reference->toHandle()`, `SharedReference::reclaim` and
+  `SharedReference::borrow` and the same pair on `WritableSharedReference`,
+  replace `intoRaw`, `fromRaw` and `borrowRaw` (section 11).
+- `ByteRegion::fromPointer`, `WritableByteRegion::fromPointer`,
+  `ArrayRegion::fromPointer` and `WritableArrayRegion::fromPointer` replace
+  `fromRaw` (section 10).
+- The same day Andrew ruled on three more cards: "`Architecture::X64` and
+  `Architecture::Arm64` (Recommended)", "Keep `Errno`, whitelisted in the
+  charter (Recommended)" and ""C-callable function" (Recommended)".
+  `Architecture::X8664` is `Architecture::X64` and `Architecture::Aarch64`
+  is `Architecture::Arm64` (section 17). `SystemCodeSource::Errno` stays,
+  and `errno` joins the naming charter's industry-universal lexemes beside
+  `printf` (plan §9.1). A Doria function declared `extern "C" function`
+  with a body is a C-callable function in prose and diagnostics, which
+  called it a C-ABI function.
+- The section 4 examples write `$writablePointer->write(...)`, and prose
+  says handles and pointers where it said raw handles and raw pointers.
+- The earlier spellings are not kept as aliases.
+- A closed class's handle is its object pointer, and an open class's handle
+  points to a heap box holding the object and its descriptor. Section 11
+  states the rule. As a consequence of the same ruling, every two-word
+  carrier is boxed the same way: a handle of a `SharedReference<I>` or
+  `WritableSharedReference<I>` to an interface `I` points to a box holding
+  its two words, and `reclaim` frees the box.
+
+### Amendment: Iterating Regions (2026-11-20)
+
+Section 8 said what a typed array region offers but not whether `foreach`
+walks one, and Decision 0110 left the same question open for byte regions.
+Checking accepted `foreach ($numbers->getRegion(0, 3) as int $value)` and
+lowering then rejected it, because each derived the iterable families on its
+own. Andrew answered the card on 2026-11-20: "Regions are iterable
+(Recommended)". Section 8 states the rule for `ArrayRegion<T>` and
+`WritableArrayRegion<T>`; it covers Decision 0110's `ByteRegion` and
+`WritableByteRegion` the same way, with `uint8` elements.
+
+### Amendment: Type Arguments For Handles (2026-11-20)
+
+Section 11 said `reclaim` and `borrow` take `T` from the expected type, so
+`let $counter = Handle::borrow($handle);` and
+`Handle::borrow($handle)->count` had no way to name the class. Andrew answered
+two cards on 2026-11-20: "Type argument at the call (Recommended)", then
+"Explicit type arguments for every generic call (Recommended)", recorded as
+Decision 0105's Amendment: Type Arguments At The Call. Each handle operation
+declares one type parameter `T`; `reclaim` and `borrow` read a stated `T`
+first and the expected type second. Section 11 states the rule. The pointer
+conversions of section 4 follow the same ruling: `Pointer::cast`,
+`WritablePointer::cast` and `Pointer::fromAddress` declare the pointee as one
+type parameter (`Pointer::cast<int32>($pointer)`), `Pointer::toFunction`
+declares the C function pointer type, and each reads a stated argument before
+the expected type.
+
+### Amendment: Emitting Only Reachable Code (2026-11-21)
+
+Section 17 said a branch whose condition is constant false for the target is
+neither emitted nor linked, but not whether a function called only from such a
+branch is emitted. Its own example still emitted `Win32Window::open` on macOS,
+with the Windows symbols it references. Andrew ruled on 2026-11-21: "Emit only
+reachable code (Recommended)". Section 17 states the rule. Applying it, a
+witness that reachable code dispatches to through a conformance is reachable
+code, so a class named as a type in reachable code reaches its interface
+implementations even when nothing constructs it.
+
+### Amendment: Type Parameters As Pointees (2026-11-21)
+
+Section 3 did not say whether a pointer or region pointee may be a type
+parameter, and checking rejected `function first<T>(Pointer<T> $pointer): T`
+with E0786 at the declaration. Andrew ruled on 2026-11-21: "Allow it,
+checked per use (Recommended)". Section 3 states the rule.
+
+### Amendment: Pointers To Elements (2026-11-21)
+
+Section 7 listed the places `Pointer::to` addresses as "a local, a foreign
+struct field, or a property of FFI-safe type", without an element of a
+collection, while a field of such an element is a foreign struct field.
+Andrew ruled on 2026-11-21: "Allow it for arrays, lists and regions
+(Recommended)". Section 7 states the rule. An element of `T[]`, `List<T>`,
+`ArrayRegion<T>` or `WritableArrayRegion<T>` whose `T` is FFI-safe is a
+place, pinned as a field of that element is. Dictionary values and set
+members have no stable position and are not places.
+
+### Amendment: PHP Output Of Host Operations (2026-11-27)
+
+Section 22 records every host operation as a MIR statement, and section 23
+has PHP output run each region in the companion. PHP output generates PHP
+from the syntax tree and has no path that runs a MIR statement, so running
+host operations under it needs PHP output generated from validated MIR.
+Andrew ruled on 2026-11-27: "Ship Stage 40, MIR PHP next (Recommended)".
+
+- In Stage 40, PHP output runs a region in the companion when the region
+  has no host operation, leaves by fallthrough, `break` or `continue`, and
+  passes only numbers, `bool` values and strings. Host operations, other
+  region exits, other slot kinds, C-callable functions, and pointers,
+  foreign structs and unions, foreign strings and foreign layouts in safe
+  code report E0784 when the program is built for PHP. The diagnostic names
+  `--target native` and `--target debug`, which build every such form.
+- Stage 40c makes PHP output generate from validated MIR, with one PHP
+  emitter, and builds the companion's PHP host on it: each host operation
+  as generated PHP over the region frame, reverse edges for C-callable
+  functions, `return` and checked-error exits, the remaining slot kinds, and
+  the PHP forms of the boundary values. It removes those E0784 gates.
+- Acceptance criteria 3, 5, 7 and 8 are met in Stage 40 under the
+  interpreter, Cranelift and LLVM. Under PHP output, Stage 40 runs the
+  fixtures whose forms it builds and reports E0784 for the others; Stage 40c
+  completes those criteria under PHP output. Criterion 9 stays in Stage 40.
+
+## Context
+
+Stage 40 is the second item of the approved execution sequence (plan §13).
+Its consumers are concrete:
+
+- **The Stage 40 acceptance criteria**: bind and call zlib, and a zero-copy
+  `Bytes`-view round trip.
+- **The native-window checkpoint** that follows immediately. Win32 needs C
+  structs (`WNDCLASSEXW`, `MSG`), UTF-16 strings, a window procedure that
+  receives no user-data argument, and an executable with no console. macOS
+  needs framework linking and `objc_msgSend` called through several typed
+  signatures. Linux needs X11 or Wayland client libraries found through
+  pkg-config and an event union. One application source must select among the
+  three.
+- **raylib and C-library bindings** (AGENTS.md, Project): raylib passes small
+  structs by value throughout its API.
+- **Stage 41**: the php-lib bridge needs C-callable Doria entry points and a
+  native shared-library output, transport- and direction-neutral (plan §10.3).
+- **The Doria-native Baton transition** (Decision 0124) consumes "Stage 40 FFI
+  and native-library integration where a portable library needs it".
+- **AI-0 readiness** (plan Appendix A): "transport-neutral FFI with zero-copy
+  views".
+
+### Facts confirmed in the tree on 2026-11-16
+
+- `unsafe`, `extern` and `declare` are not keywords
+  (`crates/doriac/src/lexer.rs:182-259`). Doria has no documentation-comment
+  form.
+- `doriac run` compiles a native executable and runs it
+  (`crates/doriac/src/main.rs:1230-1300`); the MIR interpreter runs for
+  `--target debug` (`main.rs:2029`).
+- On Unix the compiler links with `cc <object> <runtime archive> -o <exe>`,
+  honoring `CC` (`crates/doriac/src/codegen_native.rs:177-180`, `472-518`).
+- On Windows MSVC the compiler links with `/ENTRY:main`, `/SUBSYSTEM:CONSOLE`,
+  `kernel32.lib`, `shell32.lib` and `bcrypt.lib` and no C runtime
+  (`codegen_native.rs:478-503`). The freestanding runtime supplies `memcpy`,
+  `memmove`, `memcmp`, `memset`, `strlen`, `wcslen`, `_fltused`, `__chkstk`
+  and a `__CxxFrameHandler3` stub (`crates/doria-rt/src/lib.rs:4680-4880`,
+  feature `standalone-windows-support`).
+- The runtime allocator is `malloc`/`free` on Unix and `HeapAlloc`/`HeapFree`
+  on the process heap on Windows, with two-word natural alignment
+  (`lib.rs:4569-4598`).
+- Panic and `exit` end in `_exit` on Unix and `ExitProcess` on Windows
+  (`lib.rs:4646-4660`).
+- `Bytes` is a runtime header `{ length, data }` over a separate fixed-length
+  allocation (`crates/doria-rt/src/bytes.rs:6-10`); `bytes::from_owned` adopts
+  only runtime-allocated storage (`bytes.rs:28-30`).
+- `T[]` storage is contiguous at natural width for scalars: `bool` 1 byte,
+  integers their width, `float32` 4, `float64` 8, enum tags 4
+  (`crates/doria-rt/src/collection.rs:30-40`;
+  `crates/doriac/src/native_abi.rs:549-559`).
+- Every Doria callable receives hidden inputs, always including the current
+  diagnostic frame (`crates/doriac/src/native_closure_abi.rs:521-529`;
+  `codegen_cranelift.rs:1740-1743`). A Doria function is never a C function.
+- Native code generation targets the host only (`codegen_llvm.rs:125`).
+- The build plan has no link inputs; every struct is `deny_unknown_fields`
+  (`crates/doriac/src/build_plan.rs:10-19`, `112-117`).
+- Standard-library modules reach the runtime through `internal static
+  function` bodies bound to `CompilerIntrinsic` variants
+  (`crates/doriac/src/compiler_known_term.rs:1-8`, `311-312`;
+  `crates/doriac/src/ast.rs:498-508`).
+- PHP output already loads a native library: the hosted shared runtime, through
+  `FFI::cdef` with a path relative to the generated file and a validated
+  metadata sidecar (`crates/doriac/src/codegen_php/native_runtime.rs:172-195`;
+  `runtime_artifact.rs:252-255` for the `hosted-shared-runtime` feature set).
+- The parity manifest lists 428 example paths
+  (`crates/doriac/tests/fixtures/native_parity_examples.txt`).
+
+### Inconsistencies in the sources, and how this record resolves them
+
+1. Plan §3.5 used `Ptr<void>`, which Decision 0069 (line 27), plan §4.8 and SPEC
+   §7 forbid. Resolved: `Pointer<Opaque>` (ruling 3); plan §3.5 amended.
+2. Plan §4.9 placed zero-copy views over `uint8[]`/`Bytes` in the unsafe tier;
+   Decision 0110 had already delivered safe byte regions. Resolved: views are
+   safe regions and only their pointer accessors need `unsafe` (rulings 7 and
+   8); plan §4.9 amended.
+3. Plan §8.3 required Decision 0044 to evaluate external memory, custom
+   deallocation, alignment and pinning; 0044 recorded none. Resolved: this
+   record settles them (rulings 4, 6, 7, 10); plan §8.3 amended with what
+   remains.
+4. Plan D3 forbade user structs while the plan's goals need C-layout
+   aggregates. Resolved: foreign layouts only (ruling 6); D3 amended.
+5. Plan Appendix A deferred the "Baton native-dependency" model while Stage 40
+   links through the Baton manifest. Resolved: native-library declarations are
+   Stage 40 (rulings 18 and 19); Appendix A amended to keep only build scripts
+   and native feeds deferred.
+6. Plan D18 says the runtime is internal "until v1.0"; AGENTS.md says "never
+   treated as stable". Ruling 24 applies the AGENTS.md reading to FFI: `dr_`
+   symbols are reserved. D18's wording is unchanged and still differs.
+7. Plan §3.5 did not say whether an `unsafe function` body is an unsafe
+   context. Resolved: it is an ordinary context (ruling 2); §3.5 amended.
+8. The geometry layout decision draft (unaccepted, written by the Stage 47
+   session) leaves passing math values in vector registers across FFI to
+   Stage 44; the C ABI fixes those registers for a by-value C-layout
+   aggregate. Recorded here only; that draft belongs to another session.
+9. The geometry-math decision draft (unaccepted, written by the Stage 47
+   session) places the `declare` grammar in Stage 47. Stage 40 runs first and
+   now implements it (ruling 25). Recorded here only; that draft belongs to
+   another session.
+
+## Decision
+
+### Fixed by the plan and accepted records
+
+- `unsafe` gates pointer access, foreign calls and deliberate ownership
+  sidesteps; everything outside keeps full guarantees (plan D12, §3.5).
+- `extern "C"` blocks declare foreign symbols as bodyless functions (plan §3.5).
+- The safety contract: unsafe code upholds the invariants the ownership checker
+  assumes (plan D12).
+- FFI must not copy all buffers by default (plan Stage 40 entry).
+- `doriac` never parses `Baton.toml`; packages have no build scripts
+  (Decisions 0117, 0118).
+- `Pointer<T>` is not display-convertible (plan §4.6); `resource` stays reserved
+  for the PHP bridge (plan §4.8).
+- No implicit conversions (plan D15); checked arithmetic in both profiles (plan
+  D4); abort-only panics that never unwind (plan §3.6, Decision 0040).
+- Class payloads are private (Decision 0082); shared ownership exposes no
+  FFI-visible layout (Decision 0106); bridge handles are separate from both
+  shared families (plan §10.3).
+- Strings carry an explicit length and may contain NUL (Decision 0045); invalid
+  UTF-8 never enters a `string`.
+- Platform polling and handle types never enter the Doria surface (SPEC §7).
+- Tier-1 platforms are Linux, macOS and Windows on x86_64, and aarch64 on Linux
+  and macOS (plan §8.6); runtime additions land with Windows in the same change.
+- Two clocks: accepted syntax parses before its semantics land.
+
+### 1. The `Doria\Std\Ffi` module
+
+`Pointer`, `WritablePointer`, `Opaque`, the C boundary types, `CString`,
+`Utf16String`, `Handle`, `ForeignCall`, `Platform`, `OperatingSystem`,
+`Architecture`, `SystemCodeSource` and the FFI attributes (`Library`,
+`LinkName`, `Variadic`, `CaptureSystemCode`, `NonBlocking`) are
+compiler-known members of `Doria\Std\Ffi`. A file imports what it uses:
+`use Doria\Std\Ffi\{Opaque, Pointer, WritablePointer};`. The keywords
+`unsafe` and `extern` are language-level. `ArrayRegion<T>` and `WritableArrayRegion<T>` are core
+types beside `T[]` (section 8). `String::fromCString` and `String::fromUtf16`
+are `String` companion members (Decision 0103).
+
+Consequence: an FFI import line marks every file that touches foreign memory,
+and the names stay available to programs that do not import them.
+
+### 2. Unsafe contexts
+
+An unsafe context is either a statement block or a parenthesized expression:
+
+```doria
+unsafe {
+    $status = deflate(WritablePointer::to($stream), Z_FINISH);
+}
+let $bound = unsafe(compressBound($sourceLength));
+```
+
+- `unsafe { }` is a statement with Decision 0107's lexical scope and cleanup.
+  `return`, `break` and `continue` inside it keep their ordinary meaning.
+- `unsafe(<expression>)` covers exactly that expression and yields its value.
+- An `unsafe function` (free function, instance method or static method)
+  requires an unsafe context at every call. Its body is an ordinary context;
+  its unsafe operations need their own blocks or expressions.
+- An unsafe context does not extend into a closure body or nested declaration
+  written inside it.
+- An `unsafe function` cannot be converted to a function value.
+- An override may omit `unsafe` from an inherited `unsafe function`; an override
+  may not add `unsafe` to a safe parent method. An interface may require an
+  `unsafe function`; calls through the interface need an unsafe context.
+- A nested unsafe context inside another is redundant and draws the unused
+  `unsafe` warning.
+
+Consequences: every unsafe region is as small as its author writes it, and it is
+the unit sections 7, 22 and 23 build on. Plan §3.5 records the body rule.
+
+### 3. Pointer types
+
+- `Pointer<T>` (read access) and `WritablePointer<T>` (read and write access)
+  are Copy, one machine word, and never null.
+- `?Pointer<T>` and `?WritablePointer<T>` are C nullable pointers: one word,
+  null is address zero, narrowed with `is`, `??` and `?->` (Decision 0093).
+- `Opaque` is a compiler-known pointee-only type with no values and no size.
+  `Pointer<Opaque>` and `WritablePointer<Opaque>` spell C's `const void *`
+  and `void *`.
+- A bodyless foreign struct declares a named incomplete C type:
+  `extern "C" struct ZStream;` gives `Pointer<ZStream>`.
+- `void` remains return-position only (Decision 0069).
+- A pointee may be a type parameter: `Pointer<T>`, `WritablePointer<T>`,
+  `Pointer::cast<T>` and the pointer of an `ArrayRegion<T>`. Each use that
+  supplies a concrete type for `T` checks it: a call, stated
+  (`first<int32>(...)`) or inferred, and a generic class's type arguments.
+  A type that is not FFI-safe is E0786 at that use, naming the type. A use
+  that supplies its own caller's type parameter passes the check to that
+  caller's uses (amendment of 2026-11-21).
+
+Consequence: the checker proves which pointers may be null at compile time, and
+`?Pointer<T>` passes to C unchanged.
+
+### 4. Pointer operations
+
+| Operation | Spelling | Context |
+| --- | --- | --- |
+| Aligned read | `$pointer->read(): T` | unsafe |
+| Unaligned read | `$pointer->readUnaligned(): T` | unsafe |
+| Aligned write | `$writablePointer->write(T $value): void` | unsafe |
+| Unaligned write | `$writablePointer->writeUnaligned(T $value): void` | unsafe |
+| Element offset | `$pointer->offset(int $count)` scaled by `T`'s size | unsafe |
+| Byte offset | `$pointer->byteOffset(int $bytes)` | unsafe |
+| Cast | `Pointer::cast<T>($pointer)`, `WritablePointer::cast<T>($pointer)`, `T` stated or from the expected type | unsafe |
+| From address | `Pointer::fromAddress(uint64 $address): ?Pointer<T>` | unsafe |
+| Address | `$pointer->address: uint64` | safe |
+| Drop write access | `Pointer::from(WritablePointer<T> $pointer): Pointer<T>` | safe |
+| Copy, `==`, `!=`, null narrowing | ordinary | safe |
+
+- `read` and `write` panic with a catalogued code on a misaligned address in
+  both profiles; the unaligned forms carry no alignment requirement.
+- Address arithmetic that overflows panics with a catalogued code.
+- `offset`, `read` and `write` on `Pointer<Opaque>` are compile errors.
+- `T` in a read or write is an FFI-safe type (section 6).
+
+Consequence: every unchecked memory access is a named verb a search finds, and
+behavior is identical in the fast and release profiles.
+
+### 5. C boundary types
+
+`CChar`, `CLong`, `CUnsignedLong`, `CSize`, `CPointerDifference` and
+`CWideChar` are inline Copy values with the target C type's width and
+signedness: `long` and `unsigned long` are 32-bit on Windows and 64-bit on
+Linux and macOS; `char` is signed on x86_64 and Apple arm64 and unsigned on
+Linux aarch64; `wchar_t` is 16-bit on Windows and 32-bit elsewhere; `size_t`
+and `ptrdiff_t` are pointer-width.
+
+- `CLong::from($value)` accepts any integer and panics with a catalogued code
+  when the value does not fit on this target; `CLong::tryFrom($value)` returns
+  `?CLong`. Each boundary type has both.
+- The fixed-width companions accept boundary values: `Int64::from($length)`,
+  checked as usual.
+- Boundary values support `==` and `!=`; they have no arithmetic, ordering or
+  display conversion.
+- C types fixed on every tier-1 target bind as Doria types: `int` as `int32`,
+  `unsigned int` as `uint32`, `short` as `int16`, `long long` as `int64`,
+  `float` as `float32`, `double` as `float64`, `_Bool` as `bool`,
+  `unsigned char` as `uint8`, and the `<stdint.h>` types by width.
+
+Consequence: a binding type-checks identically on every platform, and the only
+platform difference is a checked range at an explicit conversion. SPEC §7's
+"no pointer-width integer type" holds for ordinary Doria arithmetic.
+
+### 6. Foreign structs and unions
+
+```doria
+extern "C" struct Color
+{
+    uint8 $red;
+    uint8 $green;
+    uint8 $blue;
+    uint8 $alpha = 255;
+}
+
+extern "C" union EventStorage
+{
+    KeyEvent $key;
+    ButtonEvent $button;
+    CLong[24] $padding;
+}
+```
+
+- A foreign struct is an inline Copy value laid out by the target C rules in
+  declaration order. A foreign union overlays its members at offset zero with
+  the size and alignment of its largest member.
+- Field types are FFI-safe. A field may declare a constant default; every field
+  without one must be supplied at construction: `new Color(red: 255, green: 0,
+  blue: 0)`.
+- A fixed-length array field spells its element type and count
+  (`uint16[128] $tip`) and is accessed as an `ArrayRegion<T>` view borrowing the
+  containing value; a writable containing place gives `WritableArrayRegion<T>`.
+- A fixed-length array field omitted at construction is zero-filled. A
+  supplied one is copied from an `ArrayRegion<T>` whose length must equal the
+  field's count: a length known at compile time that differs is a compile
+  error, and any other mismatch panics with a catalogued code (amendment of
+  2026-11-16). Assigning the whole field of a writable place,
+  `$tip->text = $region`, copies from a readonly region under the same rule
+  (amendment of 2026-11-17).
+- A union is built either with `new EventStorage()`, every byte zero, or with
+  exactly one named member, `new EventStorage(key: $key)`, which writes that
+  member and leaves every other byte zero (amendment of 2026-11-16).
+- The compiler provides constants `Color::SIZE` and `Color::ALIGNMENT`.
+- A foreign aggregate has no methods, hooks, constructors, destructor,
+  conformances or type parameters.
+- Reading a union member is unsafe; writing one is safe.
+- Structs and unions pass to and return from foreign functions by value and by
+  pointer. One shared aggregate classification in the native ABI layer covers
+  System V x86_64, Windows x64, AAPCS64 and Apple arm64, and both Cranelift
+  and LLVM consume it; neither backend classifies aggregates itself.
+- Bit fields and explicit packing are deferred to a later decision with a
+  consumer; a C struct that needs them cannot be declared in Stage 40.
+- Foreign aggregates are externally accessible types under Decision 0117: one
+  per file unless `internal`, with generated roots as the bundled form.
+- `Doria\Std\Math` values become FFI-safe by value through the same
+  classification once the geometry-math and geometry layout decisions are
+  accepted.
+
+Consequence: plan D3 gains one exception, foreign C layouts declared with
+`extern "C"`. Classes stay heap move types with private payloads.
+
+FFI-safe types are: fixed-width integers and floats, `bool`, `Pointer<T>`,
+`WritablePointer<T>` and their nullable forms, the boundary types, C function
+pointer types (section 12), and foreign structs and unions.
+
+### 7. Pointers into Doria storage
+
+Formation:
+
+- `$region->pointer: Pointer<uint8>` on `ByteRegion` and `WritableByteRegion`;
+  `$writableRegion->writablePointer: WritablePointer<uint8>` requires writable
+  access to the region. Typed regions have the same members with `Pointer<T>`
+  and `WritablePointer<T>` when `T` is FFI-safe.
+- `$text->byteRegion->pointer` addresses a string's UTF-8 bytes, without a NUL
+  terminator.
+- `Pointer::to($place)` and `WritablePointer::to($place)` address an FFI-safe
+  Copy place: a local, a foreign struct field, a property or static property
+  of FFI-safe type, or an element of `T[]`, `List<T>`, `ArrayRegion<T>` or
+  `WritableArrayRegion<T>` with an FFI-safe `T` (amendment of 2026-11-21).
+  Dictionary values and set members are not places. `WritablePointer::to`
+  takes a `writable` parameter, so the place must be writable.
+- A class payload has no pointer form; classes reach C only as handles
+  (section 11).
+- An empty region's pointer is a non-null address aligned for `T` that must not
+  be dereferenced.
+
+Validity: forming a pointer extends the source's loan to the end of the
+innermost enclosing unsafe context. A pin keeps the value in place and alive:
+within the context the program cannot move, replace, release or resize the
+pinned value or a value containing it, and cannot pass `writable` access to
+any of them. It may read the value, and read and write its fields and
+elements directly between foreign calls, as C code does with a struct it
+shares with a library; the unsafe context is where the programmer vouches that
+C is not using the value at that moment (amendment of 2026-11-16). Forming
+another pointer to a pinned place is not a conflict. A pin on an element, or a
+field of one, keeps its collection from being resized, replaced or released
+and its elements from being replaced, since checking does not know which
+position an index names; the fields of the elements stay writable as fields
+of any pinned value are (amendment of 2026-11-21). The pointer is valid only
+within that context on every target; using it after the context ends is
+undefined behavior. Pointers to foreign memory (from C) follow the foreign library's own
+rules and are unaffected.
+
+Consequence: the checker pins storage exactly for the audited region, which
+covers multi-call protocols such as zlib's streaming `deflate`. The same
+boundary makes copy-in and copy-out at a companion region's edge unobservable
+(section 23).
+
+### 8. Typed array regions
+
+`ArrayRegion<T>` (readonly, borrowed Copy carrier) and `WritableArrayRegion<T>`
+(borrowed move carrier) are core views over `T[]` for every element type,
+mirroring Decision 0110's byte regions:
+
+- `$values->getRegion(int $offset, int $length): ArrayRegion<T>`;
+  writable `$values->getWritableRegion(int $offset, int $length): WritableArrayRegion<T>`.
+- Both have readonly `int $length`, checked indexing, and `getRegion`; the
+  writable form has `getWritableRegion`, indexed writes through a writable
+  binding, and `copyFrom(ArrayRegion<T> $source): int`.
+- `pointer` and `writablePointer` exist when `T` is FFI-safe (section 7).
+- Formation allocates nothing and copies nothing; bounds panic as `T[]`
+  indexing does; borrow rules match the byte regions.
+- `foreach` walks every region in index order on every backend: `ByteRegion`
+  and `WritableByteRegion` (Decision 0110) with `uint8` elements, and
+  `ArrayRegion<T>` and `WritableArrayRegion<T>` with `T` elements. A binding
+  is readonly. A writable region bound to a writable place also accepts
+  `as writable T $value`, which changes the element in place, under the same
+  rule as a writable foreach over `T[]` (E0201 otherwise). `int $index =>`
+  gives the zero-based index as for `T[]` (Decision 0132), and both bindings
+  carry their types (Decision 0133). Checking classifies the region once in
+  the foreach plan, and lowering reads that plan (amendment of 2026-11-20).
+- No strided view exists in core. Shapes, ranks and strides belong to the
+  `NDArray` storage library of plan Appendix A; a binding passes a stride to C
+  as an integer.
+
+Consequence: this delivers the `T[]` slicing that plan §9.1 left as a future
+addition, and zero-copy numerical exchange reaches C through a safe value.
+
+### 9. Strings
+
+- `CString::from(string $text): CString` copies the UTF-8 bytes and appends NUL;
+  it panics with a catalogued code on an interior NUL.
+  `CString::tryFrom(string $text): ?CString` returns null instead.
+  `$cString->pointer: Pointer<CChar>` borrows it.
+- `Utf16String::from` and `Utf16String::tryFrom` produce NUL-terminated UTF-16
+  for the Windows `W` APIs, with `$utf16->pointer: Pointer<uint16>`.
+- `CString` and `Utf16String` are Move values that each own one
+  NUL-terminated buffer, released deterministically when their owner ends,
+  with no reference count. A second copy is an explicit `CString::from($text)`;
+  holders pass them readonly or with `take`. Forming `pointer` pins the value
+  as section 7 pins any place, so the buffer stays in place while the
+  pointer is live (amendment of 2026-11-20).
+- `String::fromCString(Pointer<CChar> $text): ?string` (unsafe) copies up to
+  the NUL and returns null for invalid UTF-8;
+  `String::fromUtf16(Pointer<uint16> $text): ?string` (unsafe) returns null
+  for unpaired surrogates. Both follow
+  `String::fromBytes` (Decision 0103).
+- APIs taking pointer and length use `$text->byteRegion`.
+- An extern signature never converts a `string` implicitly; `string` is not
+  FFI-safe.
+
+Consequence: every allocation and copy at the boundary is visible in source,
+and a returned C string's ownership stays with the binding author.
+
+### 10. Memory a foreign library allocates
+
+- `ByteRegion::fromPointer($owner, Pointer<uint8> $pointer, int $length)` and
+  `WritableByteRegion::fromPointer(writable $owner,
+  WritablePointer<uint8> $pointer, int $length)`, and the typed
+  `ArrayRegion::fromPointer` / `WritableArrayRegion::fromPointer`, are unsafe
+  constructors whose region borrows `$owner` (names amended 2026-11-20).
+- The owner is an ordinary class whose `__destruct` calls the library's own
+  release function in an unsafe context. A method returning the region follows
+  Decision 0089's elision to `$this`.
+
+```doria
+class DecodedImage
+{
+    function __construct(
+        internal WritablePointer<uint8> $pixels,
+        internal int $length,
+    ) {}
+
+    function getPixels(): ByteRegion
+    {
+        return unsafe(ByteRegion::fromPointer(
+            $this,
+            Pointer::from($this->pixels),
+            $this->length,
+        ));
+    }
+
+    function __destruct()
+    {
+        unsafe { freeImage($this->pixels); }
+    }
+}
+```
+
+- Doria never passes its own allocations to foreign code for release; the
+  runtime allocator is private (Decision 0044) and differs from the CRT heap on
+  Windows.
+
+Consequence: every release protocol is stated by its owner class, and the
+region works with every region-taking API, including the Decision 0110 streams.
+
+### 11. Handles
+
+- Owned class values: `Handle::create(take T $value): WritablePointer<Opaque>`;
+  `Handle::reclaim(WritablePointer<Opaque> $handle): T` (unsafe) reclaims
+  ownership.
+- `SharedReference<T>`: `$reference->toHandle(): WritablePointer<Opaque>`
+  consumes one strong claim; `SharedReference::reclaim($handle)` (unsafe)
+  reclaims it.
+- `WritableSharedReference<T>`: the same pair, preserving its family and its
+  runtime access checks.
+- Borrowing forms lend without reclaiming, for the enclosing unsafe context:
+  `Handle::borrow($handle)` (readonly access to `T`),
+  `SharedReference::borrow($handle)` and
+  `WritableSharedReference::borrow($handle)`.
+- Each operation declares one type parameter `T`. `create` infers it from its
+  argument. `reclaim` and `borrow` take it from a type argument stated at the
+  call, `Handle::borrow<Counter>($handle)`, and otherwise from the expected
+  type; for the shared families the result is the family's reference to `T`,
+  as in `SharedReference::reclaim<Counter>($handle)`. A position that states
+  neither is E0808 (amendment of 2026-11-20). A handle reclaimed or borrowed
+  as the wrong type or family is undefined behavior.
+- A closed class's handle is its object pointer; `Handle::create` allocates
+  nothing. An open class's handle points to a heap box holding the object and
+  its class descriptor: `Handle::reclaim` frees the box and returns the value
+  with its exact dynamic type, and `Handle::borrow` reads through the box
+  (amendment of 2026-11-20). The same rule covers every two-word carrier: a
+  shared reference to a class is one word and is its own handle, and a
+  shared reference to an interface is boxed, with the family's `reclaim`
+  freeing the box.
+- Handles are not Stage 41 bridge handles, and no conversion exists between
+  them.
+
+Consequence: a callback re-entered while it runs (Win32 `SendMessage` inside a
+handler) reaches application state through `WritableSharedReference<T>`, whose
+second writable access panics where an unchecked pointer would alias.
+
+### 12. Callbacks and C function pointers
+
+```doria
+extern "C" function windowProcedure(Pointer<Opaque> $window, uint32 $message,
+    uint64 $wParam, int64 $lParam): int64
+{
+    ...
+}
+```
+
+- A C-callable Doria function is a namespace-level free function declared
+  `extern "C" function` with a body. It has no captures, type parameters or
+  `throws`, and its signature is FFI-safe. Its body is an ordinary context.
+- Its name in expression position is a value of the structural type
+  `extern "C" function(Pointer<Opaque>, uint32, uint64, int64): int64`; the
+  nullable form is `?extern "C" function(...)`. These values are Copy and one
+  word.
+- Calling a C function pointer value is unsafe.
+- `Pointer::toFunction(Pointer<Opaque> $address)` (unsafe) converts an address
+  from `dlsym` or `GetProcAddress` to the C function pointer type of the
+  expected type.
+- A checked error must be handled inside the body, including the automatic
+  I/O errors of Decision 0123 (`IoError` and `InvalidUtf8Error`, which `echo`
+  can raise). A body that can let one escape is a checking error reported at
+  the function, whose fix wraps the work in `try` with a `catch` for each
+  error (amendment of 2026-11-20). A panic aborts.
+- Stage 40 exports no symbol for a C-callable function; C reaches it only through its
+  address. Stage 41 reuses the same C entry machinery for exports.
+- Closures do not convert to C function pointers. State travels through a
+  context pointer and section 11's handles.
+
+### 13. Callback threads and the Call Path
+
+- Every C entry compares the current thread with the thread running Doria code
+  and panics with a catalogued code on a mismatch.
+- Each outbound foreign call records the current Doria frame in a per-thread
+  runtime slot. A C entry links its frame to that record, so a panic shows
+  `main → render → [foreign call] → windowProcedure`. An entry with no active
+  outbound call starts a new chain.
+- Foreign-thread callbacks become possible only through the concurrency
+  decision (Stage 39).
+
+Consequence: non-atomic reference counts (Decisions 0045, 0106) cannot be
+corrupted from a foreign thread unnoticed, and Decision 0109's Call Path stays
+continuous through foreign frames.
+
+### 14. Calling conventions and variadic functions
+
+- `extern "C"` is the only ABI string. It means the target's C convention:
+  System V x86_64 on Linux and macOS x86_64, Windows x64, AAPCS64 on Linux
+  aarch64, Apple arm64 on macOS. Any other string is a compile error naming
+  `"C"`.
+- A variadic C function is bound once per used arity, with the count of fixed
+  parameters:
+
+```doria
+extern "C"
+{
+    #[LinkName("printf")]
+    #[Variadic(fixedParameters: 1)]
+    function printInteger(Pointer<CChar> $format, int32 $value): int32;
+}
+```
+
+- Parameters after the fixed ones must already have their promoted C types: no
+  `float32`, no integer narrower than 32 bits, no `bool`.
+- LLVM calls a variadic function directly. Cranelift calls it through a small
+  per-platform variadic call trampoline in `doria-rt`, built ahead of time,
+  passing the function's address and a description of the argument layout
+  from the shared classification; the trampoline places each argument as the
+  target's convention requires. Both profiles accept the same programs
+  (amendment of 2026-11-17).
+
+Consequence: every call stays fully typed, and Apple arm64's stack placement of
+variadic arguments is known at the declaration.
+
+### 15. Symbol names and declaration rules
+
+- A declaration's Doria name is its symbol. `#[LinkName("...")]` names a
+  different symbol and is required when the symbol is a reserved compiler
+  intrinsic name (`printf`, `read_line`), is not a valid Doria identifier, or is
+  bound more than once with different signatures (`objc_msgSend`).
+- Two declarations of one symbol with different signatures in one program are a
+  compile error unless every one carries `LinkName`.
+- Extern declarations are exempt from the naming charter's snake_case
+  free-function lint.
+- Extern blocks appear at namespace level. Their functions resolve as free
+  functions of the enclosing namespace (Decision 0117). `internal extern "C" { }`
+  keeps raw bindings package-private.
+- Declarations accept named arguments (Decision 0098) and constant defaults
+  (Decision 0086). Parameters take no `writable` or `take` mode.
+- An extern block without `#[Library]` binds the platform C runtime (libc on
+  Linux, libSystem on macOS, the UCRT on Windows).
+
+### 16. `errno` and `GetLastError`
+
+- `#[CaptureSystemCode(SystemCodeSource::Errno)]` or
+  `#[CaptureSystemCode(SystemCodeSource::WindowsLastError)]` on a declaration
+  makes the compiler read that code immediately after the call, before any other
+  code runs, into a per-thread runtime slot.
+- `ForeignCall::lastSystemCode` (readonly static `int`) returns the value the
+  last capturing call stored on this thread.
+- `WindowsLastError` on another platform is a compile error in emitted code.
+
+Consequence: the code survives the allocation and drop glue between a call and
+its read, and only declarations that request it pay for it.
+
+### 17. Platform constants
+
+```doria
+if (Platform::operatingSystem == OperatingSystem::Windows) {
+    Win32Window::open($title);
+} else if (Platform::operatingSystem == OperatingSystem::MacOs) {
+    CocoaWindow::open($title);
+} else {
+    X11Window::open($title);
+}
+```
+
+- `Platform::operatingSystem` (`OperatingSystem::Linux`, `MacOs`, `Windows`) and
+  `Platform::architecture` (`Architecture::X64`, `Arm64`) are compile-time
+  constants of the compilation target.
+- Every branch is parsed and type-checked on every host. A branch whose
+  condition is constant false for the target is neither emitted nor linked.
+- Checking computes once which functions and methods are reachable from the
+  program's roots: the entry point, tests and static initializers. A call,
+  construction or C-callable function value outside every constant-false
+  branch of reachable code reaches its target, and code a closure or function
+  value in reachable code can call is reachable. A class constructed in
+  reachable code makes every member of it and of its ancestors reachable: its
+  constructor, property initializers, destructor, property hooks and methods,
+  which covers each virtual and interface dispatch target of its instances.
+  A class named as a type in reachable code, including by its construction,
+  reaches every checked interface implementation of it and of its ancestors
+  and their witnesses, and nothing else of it: reachable code dispatches to
+  them through the conformance, as a stream registration, `foreach`, display
+  conversion, equality, hashing, ordering and an Error report or `catch` do
+  for a class-typed value.
+  The declarations of the compiler's own sources are roots, since runtime
+  operations create their values. A program without an entry point is a
+  library, and each declaration with a body is a root.
+- Only reachable code is compiled and linked, by Cranelift, LLVM, the
+  interpreter and PHP output alike, and every function is still fully checked
+  (amendment of 2026-11-21).
+- A foreign library is required only when emitted code references it.
+
+Consequence: Doria gains structured conditional compilation of the kind
+Decision 0028 anticipated, and platform code is checked on every developer's
+machine.
+
+### 18. Link facts
+
+```doria
+#[Library("zlib")]
+internal extern "C"
+{
+    function compressBound(CUnsignedLong $sourceLength): CUnsignedLong;
+}
+```
+
+- Source names a logical library with `#[Library("name")]` on the extern block.
+- The package's `Baton.toml` maps it per platform (section 19). Baton resolves
+  the mapping, running pkg-config where named, and writes resolved link inputs
+  into build-plan schema 2.
+- `doriac compile` and `doriac run` accept the same inputs through repeatable
+  flags, so direct compiler use links identically.
+- Emitted code referencing a logical library with no resolved input is a
+  compile-time diagnostic naming the manifest table and the flag.
+- Link inputs of dependency packages reach the final link.
+
+Resolved link inputs are typed per logical library (amendment of
+2026-11-20). In build-plan schema 2 each package carries
+
+```json
+"nativeLibraries": [
+  {
+    "name": "zlib",
+    "link": "dynamic",
+    "inputs": [
+      { "kind": "library", "name": "z" },
+      { "kind": "searchPath", "path": "native/windows/lib" },
+      { "kind": "framework", "name": "AppKit" },
+      { "kind": "file", "path": "native/windows/lib/zlib.lib" }
+    ],
+    "runtimeFiles": ["native/windows/bin/zlib1.dll"]
+  }
+]
+```
+
+with `link` either `"dynamic"` or `"static"`. Baton parses pkg-config
+`--libs` output into these kinds and rejects any other flag with its own
+diagnostic, so `doriac` never receives raw linker arguments. The same plan
+revision adds `unsafePolicy` (`"allow"` or `"deny"`) to each package
+(section 25) and `windowsSubsystem` (`"console"` or `"gui"`) to
+`selectedTarget` (section 21). Link inputs stay attributed to the package
+that declares them through the final link and the receipt.
+
+The direct flags name the logical library: `--link-library zlib=z`,
+`--link-library zlib=static:z`, `--link-search zlib=<dir>`,
+`--link-framework appkit=AppKit`, `--link-file zlib=<path>`,
+`--runtime-file zlib=<path>`, and `--windows-subsystem gui`. The
+diagnostic for a library with no input names the library and both fixes: a
+`[native-libraries.<name>]` entry for this platform, or
+`--link-library <name>=<library>`.
+
+### 19. `[native-libraries]`
+
+```toml
+[native-libraries.zlib]
+link = "dynamic"
+linux = { pkg-config = "zlib" }
+macos = { system = "z" }
+windows = { library = "zlib", search-paths = ["native/windows/lib"], runtime-files = ["native/windows/bin/zlib1.dll"] }
+
+[native-libraries.appkit]
+macos = { framework = "AppKit" }
+```
+
+- Kinds: `pkg-config`, `system` (link by name through the default search),
+  `library` with project-relative `search-paths`, and `framework` (macOS).
+- `link` is `"static"` or `"dynamic"`.
+- `doriac` places `runtime-files` beside the built executable or companion on
+  every build route and gives project-local Unix libraries an rpath relative to
+  the loading artifact. Baton passes the files in the build plan and records
+  them in the receipt; `doriac run` and `baton run` rely on that placement
+  (amendment of 2026-11-20).
+- Paths follow Decision 0118's containment rules. Resolved facts, including
+  pkg-config output, are recorded in the build receipt.
+- A platform without an entry has no such library, which is valid until emitted
+  code references it.
+- Native package feeds, prebuilt downloads and compiling C sources stay deferred
+  (Decision 0118).
+
+### 20. The Windows C runtime
+
+- A program that links any foreign code, including an extern block without
+  `#[Library]`, links the dynamic Universal CRT with the static `vcruntime`,
+  uses a CRT-hosted runtime archive (the freestanding exports disabled, as the
+  runtime's hosted builds already do), and enters through the CRT's startup. A
+  normal return from `main` leaves through the CRT's exit, as on Unix; panic and
+  `exit` keep `ExitProcess`.
+- A program without foreign code keeps today's CRT-free entry.
+
+Consequence: C libraries get an initialized C runtime, clean machines need no
+redistributable, and existing Windows programs are unchanged.
+
+### 21. The Windows GUI subsystem
+
+- A Baton binary target may set `windows-subsystem = "gui"`; the default is
+  `"console"`. The value travels through build-plan schema 2 and a `doriac`
+  flag.
+- When a standard stream is absent, writing to it discards the bytes and the
+  program continues; its view's `isInteractive` is `false`; reading absent
+  standard input reports end of input. Panic and unhandled-error statuses are
+  unchanged, and their reports go to standard error when it exists.
+- The rule applies to every platform where a stream can be absent.
+
+Consequence: Decision 0091's closed-pipe rule (status 0 on a closed pipe) does
+not apply to an absent stream, so a GUI program keeps running after `echo`.
+
+### 22 and 23. The native companion library
+
+Every target runs unsafe regions as native code. Cranelift and LLVM compile
+them inline. For the interpreter and PHP output, `doriac` compiles the
+program's unsafe regions (the extern bindings and the code inside each unsafe
+context) into a native companion library, and the host (the interpreter or the
+PHP output) calls each region as one function. FFI fixtures join the existing
+parity manifest and run under the interpreter, Cranelift, LLVM and PHP output.
+
+**Regions.** A region is one `unsafe { }` block or one `unsafe(<expression>)`,
+per monomorphized specialization of its enclosing function. Its identity is a
+hash of package identity, source identity, span and type arguments. An unsafe
+function's body is ordinary host code; its inner regions are regions.
+
+**Entry ABI.** Each region is exported from the companion as
+
+```text
+int32 doria_region_v1_<regionId>(DrRegionHostV1 *host,
+                                 const void *callerFrame,
+                                 void *inputs,
+                                 void *outputs)
+```
+
+`inputs` is a C-layout record with one slot per place the region reads or
+writes from its surroundings, in order of first use. `outputs` holds the final
+value of each writable place, the expression result, a return value, a
+break/continue target index, and an error token. The status is 0 for
+fallthrough, 1 for `return`, 2 for `break`, 3 for `continue`, and 4 for a
+checked error.
+
+**Marshalling at the edge.**
+
+| Value kind | Crossing |
+| --- | --- |
+| Integers, floats, `bool`, boundary types, pointers, C function pointers, foreign aggregates, Copy inline values (Copy enums, inline records, Time values) | By value in their native layout |
+| `string` | UTF-8 bytes; the companion materializes a native string for the region; a string produced in the region returns as bytes and the host builds its own `string` |
+| `Bytes`, `T[]` of Copy edge kinds, byte and array regions over host storage | Readonly: copied into a native buffer for the region. Writable: copied in, and copied back at every region exit |
+| Regions over foreign memory (section 10) | Address and length, no copy |
+| `CString`, `Utf16String` | Content re-materialized natively per region |
+| Handles | Host handle tokens, by value |
+| Every other value (class instances, interfaces, other collections, closures, `mixed`, shared references, nullable move values) | Stays on the host; the companion holds an opaque host token |
+
+The borrow rules of section 7 make the copies unobservable: a pinned place
+stays in place and alive for the region, every access the region makes to it
+runs on the region's copy, and a pointer into Doria storage is valid only
+inside its region.
+
+**Host operations.** Inside a region, a call to a Doria function, method,
+closure or hook, construction of a class, an operation on a host-owned value,
+a static property access, and a Doria I/O or runtime intrinsic each run on the
+host through a reverse edge: `host->call(host, operationId, arguments, results)`,
+returning the same status set. Arguments and results cross by the table above.
+
+**Version 1 of the entry ABI.** The facts below belong to version 1, which the
+`v1` in the entry names and `DrRegionHostV1` carry; a change to any of them
+takes a new version.
+
+- One host operation is one whole MIR statement or terminator that needs the
+  host. It runs inside the host frame suspended at the region entry; the locals
+  it reads cross as its arguments and the locals it writes as its results.
+  Values on the host, the host tokens, never leave that frame. Its arguments
+  are every other local it touches, with its current value; the companion
+  starts every local it owns zeroed, so a local written before it is read
+  crosses defined.
+- A host operation at a terminator ends its results with an `int32` index
+  into the terminator's targets, the one the host took, and `host->call`
+  returns status 0.
+- The host runs Doria calls, construction, static property access, every
+  operation that touches a host token, and Doria I/O (`echo`, `printf`,
+  `write_stderr`, file and stream I/O, `read_line`). Value operations on the
+  values the companion holds (string building, arithmetic, conversions,
+  region reads) run in the companion against the shared runtime. A panic goes
+  to the panic sink.
+- Operation 0 is reserved: before its own cleanup the companion hands each
+  output whose content it owns (a string, a buffer or a foreign string) to
+  the host through it. Its arguments and results are both the output slot;
+  the host reads the content and writes the host token it returns into the
+  slot's first word, 0 for a slot that holds no value.
+- Operation identities come from one MIR host-operation table, numbered in
+  region identity order and then block order; PHP output generates the PHP for
+  each operation from that table.
+- Slots follow C struct layout and alignment. A by-value slot holds the value in
+  its native layout, a nullable one in its nullable layout with its presence
+  (a nullable pointer is one word whose null is zero). A string or foreign
+  string slot is `{const uint8_t *bytes; size_t length}`, with a null `bytes`
+  for an absent `?string`. A buffer or region slot is
+  `{void *data; size_t length}`. A host token is a `uintptr_t`. `outputs` holds
+  the output slots in order, then the expression result, then the `int32`
+  index of the exit taken, its position among the region's exits; fallthrough
+  writes none. Host-call arguments and results follow the same slot rules in
+  operand order.
+- A host token has no slot: an input, output or argument that stays on the
+  host keeps its value in the host frame. A region terminator that leaves the
+  function (`return` or an escaping Error) runs in the host frame after the
+  writeback, so the locals it reads are outputs.
+- `length` counts elements: bytes for a string, `Bytes` or byte region, code
+  units for a foreign string, without its NUL. A present value has a non-null
+  data pointer even when empty; a null one is an absent `?` value or a local
+  that holds no value yet, and loads as the zero value. The host allocates
+  every record zero-filled, so a slot nobody writes holds no value.
+- Content crosses by copy. The companion copies an input's or result's
+  content into a value it owns as it loads it; a slot the companion writes
+  lends its own storage until the companion changes or releases the value,
+  and the host's result content stays valid until its next call returns or
+  the entry does.
+- A host operation's results are the locals it writes or moves; a moved one
+  crosses back with no value.
+- The entry is a MIR function the compiler generates from the first
+  lowering's region blocks: a prologue loads `inputs`, each host-operation
+  site becomes a host call, each edge out of the region writes `outputs` and
+  releases the companion's copies in reverse order. `host->call` returns 0
+  for every operation; the companion does not read it.
+- `DrRegionHostV1` is `{call, panic}`: `call` at offset 0, then the panic
+  sink, which takes the frame, code, message and facts of a validated
+  runtime panic and never returns. The host attaches it once, before its
+  first region call, through the shared runtime's
+  `dr_v1_attach_region_host`, which also records the host's thread as the
+  thread running Doria code.
+- `callerFrame` is the host's frame of the function the region is written
+  in. The entry's own frame stands in for it and links to its parent, so
+  the Call Path matches the native one. The entry checks the thread
+  (P1706) before it runs.
+- Content slots move through the shared runtime's slot accessors, which
+  both native backends call. A present empty value points at its own
+  storage, so its data is never null; a native slot is copied in its
+  native layout.
+- A `T[]` crosses as a buffer when a region over it addresses its
+  elements (section 8): `{data, length}` then shares their C layout. Any
+  other `T[]` is a host token.
+- Each extern declaration's function a region reaches has a binding
+  entry, in function order, exported as
+  `int32 doria_binding_v1_<n>(DrRegionHostV1 *host, const void *callerFrame,
+  void *arguments, void *results)`. It checks the thread
+  (`dr_v1_enter_binding`), runs at the caller's frame, loads the
+  function's parameters from `arguments`, calls it, stores its return
+  value in `results` and returns 0. A host operation's call of an extern
+  function goes through it.
+- Each C-callable function is a callback, numbered after every host
+  operation in the order MIR lists the program's C entries. The companion exports its C entry as
+  `doria_callback_v1_<operation>`, which checks the thread, links the Call
+  Path and forwards to the attached host: the arguments are the function's
+  parameters and the results its return value. The host holds the
+  function's C function pointer value as that entry's address.
+- The library emits the region entries, the extern declarations' functions
+  they call, the callbacks' forwarders and the binding entries, as the
+  shared local walk reports them; the program's other functions stay on
+  the host.
+- The library depends on the hosted shared runtime at
+  `.doria-runtime/<identity>/` beside it, through an rpath on Unix. On
+  Windows the host loads that runtime before the library, which then
+  resolves to the loaded module.
+- Generated code reaches a runtime data symbol, such as the record of the
+  outbound foreign call, as its object links the runtime. On Windows the
+  library loads the symbol's address from its import slot
+  `__imp_<symbol>`; an executable, which links the runtime archive, and a
+  Unix library name the symbol itself.
+- The companion follows the build's native profile: Cranelift by default,
+  LLVM for `--release`, and the profile is part of the cache key.
+- A region over host storage crosses as the host's native copy of the
+  elements it views, which the companion views in place; at the entry's
+  return the host copies a writable region's copy back into its storage. A
+  region output or host-operation argument that lies in such a copy
+  crosses back as a view of the host storage at the same offset.
+- A pointer a region forms to a place on the host (a property, a static
+  property or an element of a `List<T>`) addresses a native copy the host
+  lends for the rest of the region call: of the place's value, or of the
+  whole collection for an element. Every native copy the host lends goes
+  back to its host storage whenever control passes from the companion to
+  the host, at a host operation or after a binding entry returns, and takes
+  the host storage's current content whenever control passes back.
+- A foreign struct or union lives on the host as its bytes in the target's
+  C layout, and a slot of one holds those bytes.
+- The runtime's buffer loads record the address of the companion's copy in
+  the slot they load. A region output or host-operation argument that lies
+  in the copy of a buffer input, or in a buffer operation 0 accepted,
+  crosses back as a view of that host collection at the same offset; any
+  other region crossing back views memory a foreign library owns.
+- The host reads and writes a region over foreign memory through the
+  shared runtime's `dr_v1_byte_region_copy`, and passes it to a later
+  region as its address and length.
+- Every lowering of a region numbers the locals and blocks it exchanges
+  and runs as the first lowering does; the companion plan reports one
+  that does not as a compiler defect (I0001).
+- A panic or exit in Doria code during a region call ends the process as
+  the panic sink does, with the program's output written first: nothing
+  returns to the companion.
+- A callback's body runs in a new host frame whose Call Path continues,
+  below a `[foreign call]` frame, at the site the runtime's record of the
+  outbound foreign call holds, or starts anew when that record is empty.
+- The host handle table gives handle `n` to its `n`th entry.
+- One shared runtime holds one attached host, so the interpretations of one
+  process that run a companion take turns.
+- PHP output keeps a frame of the region function's MIR locals for each
+  region call. A local that lowers a source binding names it, and the frame
+  takes that binding's PHP value before the call and gives it back after;
+  temporaries and host tokens live only in the frame. Each host operation
+  is a generated PHP function over that frame.
+- PHP output checks every field of the sidecar but the library's name,
+  size and digest against the plan it was generated for, and those three
+  against the library beside it, before it loads the library. A mismatch
+  or a missing file reports B3605.
+- PHP cannot unwind through the companion, so a panic or exit during a
+  region call writes its report and ends the process through the shared
+  runtime's `dr_v1_exit_process`.
+
+**Callbacks.** The companion contains the C entry for each C-callable Doria function.
+The entry performs section 13's thread check and forwards to the host through a
+reverse edge; the body runs on the host. C-callable signatures are FFI-safe, so every
+argument crosses by value.
+
+**Ownership and destruction.** Host-owned values are created, moved and
+destroyed on the host in ordinary Doria order. Values created in the companion
+(native strings, `CString` buffers, copied buffers) are destroyed in the
+companion in reverse order at region exit. Writable places are written back
+before the host resumes, on every exit status. A value moved into a host
+operation transfers its token.
+
+**Handles in hosted mode.** `Handle::create`, `Handle::reclaim`,
+`Handle::borrow`, `toHandle` and the shared references' `reclaim` and
+`borrow` are host operations; the handle is a nonzero address-sized token
+from a host handle table. C treats it as opaque, as section 11 requires.
+
+**Foreign-backed regions on the host.** A region over foreign memory that leaves
+an unsafe context is represented on the host as address and length; its reads,
+writes and copies go through the shared runtime's byte accessors.
+
+**Panics.** A panic inside the companion goes through the runtime-outcome
+transport of Decision 0109 to a panic sink the host registered at load. The host
+renders the report exactly as a native panic and ends the process with status
+101 without returning into the companion. No cleanup runs on either side.
+Harnesses that embed the interpreter run companion fixtures in a child process.
+
+**Checked errors.** An Error raised inside a region is a host value (its
+construction is a host operation). It propagates through region code with
+Decision 0119's status transport and leaves with status 4; the host resumes
+propagation with the original Error object.
+
+**Call Path.** The host passes its current frame as `callerFrame`; companion
+frames link to it, and reverse edges pass the companion frame back, so the
+rendered Call Path matches the native one.
+
+**Thread rule.** Regions are entered only on the host's Doria thread. C entries
+in the companion check that thread.
+
+**One runtime per process.** The companion links the hosted shared runtime
+dynamically, the same library PHP output already loads, so host and companion
+share one runtime state.
+
+**Locating and loading.**
+
+- PHP output writes `<stem>.native.<so|dylib|dll>` and `<stem>.native.json`
+  beside the generated PHP. The sidecar records its schema version, compiler
+  identity, runtime ABI version, region identities and signatures, the
+  callback and binding entries, foreign libraries and the library's
+  size and SHA-256. The generated PHP validates the sidecar
+  and loads the library with `FFI::cdef(<generated declarations>, __DIR__ . ...)`,
+  as it loads the runtime. Missing PHP FFI, a missing file or a mismatch fails
+  explicitly with no fallback (Decision 0110's precedent).
+- The interpreter builds the companion into the compiler cache at
+  `doria-companion-v1/<hash>/` under the same root as the embedded runtime
+  cache, and loads it with the platform loader, searching the companion's
+  directory first for its dependent libraries.
+- `doriac` places `runtime-files` (section 19) beside the companion.
+
+**Caching.** The cache key hashes compiler identity, runtime digest, the
+validated MIR of every region and host operation signature, resolved link
+inputs and the target triple.
+
+**Build plans and receipts.** A `php` or `debug` build of a program with regions
+requires the native toolchain and the resolved link inputs. Baton's receipt
+records the companion's relative path, its SHA-256, the region inventory hash
+and the resolved native link facts.
+
+**Native shared-library output.** Stage 40 defines the native shared-library
+artifact kind the companion uses: a platform shared library exporting versioned
+entries, linked against the hosted shared runtime, with a metadata sidecar.
+Stage 41 reuses it for bridge entries.
+
+**Programs without regions** produce no companion; their PHP output stays
+platform-neutral.
+
+Consequences: a binding written once runs identically under every target,
+including the PHP compatibility backend, and calls inside a region stay
+zero-copy. PHP output of a program with unsafe code becomes host-specific and
+needs PHP FFI. The interpreter's oracle role covers Doria semantics; foreign
+behavior inside a region is defined by the native code it calls.
+
+### 24. Standard-library runtime bindings
+
+- Runtime-owned behavior keeps its compiler intrinsics and per-backend
+  implementations.
+- An extern declaration binding a `dr_`-prefixed symbol is a compile error.
+- A standard-library module may bind a third-party C library only through its
+  own decision.
+
+### 25. Unsafe policy and audit
+
+- Stage 40 implements the general `declare` grammar: `declare(<key>: "<value>");`
+  directives come first in a file, before `namespace` and `use`; each names one
+  key; a key appears at most once; an unknown key or value is a compile error.
+- `declare(unsafe: "deny");` or `declare(unsafe: "allow");` sets the file
+  policy; the default is `"allow"`. Under `"deny"` the file may contain no unsafe
+  context, `unsafe function`, extern block, foreign aggregate or C-callable function.
+  Calling a safe wrapper defined elsewhere stays allowed.
+- `unsafe = "deny"` in a package's `Baton.toml` applies `"deny"` to every source
+  of that package; a file directive may not relax it. The policy travels to
+  `doriac` in the build plan per package. Dependencies keep their own policy.
+- `baton audit unsafe` lists every unsafe context, `unsafe function`, extern
+  declaration, foreign aggregate and C-callable function across the dependency tree
+  with package, file and line. `doriac` produces that inventory as compiler
+  metadata; Baton does not parse Doria.
+
+### 26. Foreign calls in property hooks
+
+A foreign call counts as potentially blocking under Decision 0135, directly and
+through helpers, unless its declaration carries `#[NonBlocking]`. The attribute
+is part of the declaration's unchecked contract.
+
+### 27. Safety sections
+
+- A documentation comment is a `/** ... */` block immediately before a
+  declaration.
+- Every `unsafe function` and extern declaration carries a Safety section, the
+  `@safety` tag of its documentation comment, stating the caller's obligations.
+  The compiler warns when one is missing. Inside an extern block, the block's
+  comment may state obligations shared by its declarations.
+- The language server shows the Safety section in hover and completion at call
+  sites.
+- The diagnostics, each with a catalogue entry (Decision 0145): unsafe operation
+  outside an unsafe context; non-FFI-safe type in an extern signature or foreign
+  aggregate, naming the type to use; `throws` on a C-callable function; conflicting
+  declarations of one symbol; a logical library with no link input; a missing
+  Safety section (warning); `declare(unsafe: "deny")` and package policy
+  violations; an unused unsafe context (warning); a missing or mismatched
+  companion; a union construction naming more than one member and a
+  fixed-length array field supplied with a region of a known different length;
+  and the runtime panics for misaligned access, address overflow, interior NUL,
+  out-of-range boundary conversion, a fixed-length array field supplied with a
+  region of a different length, and a callback on a foreign thread.
+
+## Specified Without A Card
+
+The rulings did not name these points; this record specifies them so the stage
+has one precise contract.
+
+- A pointer into Doria storage is invalid after its unsafe context on every
+  target (section 7). Ruling 23's statement that the pinning rule bounds edge
+  crossing requires it.
+- An extern block without `#[Library]` binds the platform C runtime (section
+  15), and counts as foreign code for section 20.
+- Documentation comments are `/** */` blocks and the Safety section is the
+  `@safety` tag, the PHP docblock shape (section 27). Doria had no
+  documentation-comment form.
+- The companion's entry ABI, status codes, marshalling table, host operations,
+  hosted raw-handle tokens, foreign-backed host regions, panic sink, file
+  naming, cache path and key (sections 22 and 23).
+- Version 1 of the entry ABI (section 23), specified on 2026-11-22:
+  - Whole statements as host operations: foreign calls and pointer operations
+    are already their own MIR statements, so a host operation holds no
+    foreign call or pointer operation; a call it makes to an extern function
+    goes through that function's binding entry, and the shared local walk
+    names its exact arguments and results.
+  - Binding entries: an extern function's call lowers as an ordinary call
+    of its function, so a host operation's statement (`echo abs(-7)`) can
+    make one. Calling it through an entry keeps evaluation order,
+    short-circuits and conditionals exactly as lowered, and leaves native
+    code unchanged.
+  - Value operations stay in the companion: one runtime per process makes them
+    sound, and a reverse edge per string operation would make string-heavy
+    regions pay a crossing each time.
+  - Operation 0 accepts string outputs: it keeps both the bytes rule and the
+    companion's own cleanup at region exit, with no second export and one
+    status set.
+  - One MIR host-operation table: operation identity has one owner, and a
+    second classification in the PHP backend could drift from it.
+  - The slot layout is C layout, so the companion, the interpreter's loader and
+    PHP's `FFI::cdef` declarations read one shape.
+  - Current values as arguments: the shared local walk reports a write it
+    cannot prove whole, such as a writable borrow, as a write, so the host
+    needs the value the local holds.
+  - A successor index for terminators: the Error a failed call raises stays
+    on the host, so one index rule serves every terminator and the statuses
+    keep their region meaning.
+  - Operation 0 accepts every owned output: a buffer the region grew or
+    replaced, and a foreign string it built, need the same hand-off before
+    cleanup as a string, so one operation serves all three.
+  - No slot for a host token: every statement that touches one is a host
+    operation, so the companion never holds one, and a host terminator
+    reads the region's outputs from its own frame.
+  - Null data as no value: native code zeroes a local it moves out of, so
+    a moved or never-written local crosses as zero, and the host needs no
+    separate table of moved outputs.
+  - Copies at load and lent storage at store: each side keeps ownership of
+    the values it built, so destruction stays in ordinary order on each.
+  - A generated MIR entry: MIR validation and both native backends already
+    own every statement of the region, so the entry adds only its slot,
+    record and host-call statements.
+  - The host record and its attachment: one registration carries the call
+    and the panic sink, and the runtime that every companion shares holds
+    it, so a panic in any region and every callback find the same host.
+  - The entry's frame in place of the host's: it names the same function
+    with the companion's current site, so linking it to the parent of the
+    host's frame renders the native Call Path with no duplicate frame.
+  - Slot accessors in the runtime: the content rules (non-null present
+    data, copies at load, release of the replaced value) have one
+    implementation for both backends.
+  - Buffers only for C-layout arrays: a host reads `{data, length}` as C
+    elements, which only the arrays a region can address guarantee.
+  - Callbacks as forwarding operations: the body runs on the host as the
+    record requires, and the forwarder reuses the C entry machinery for the
+    thread check and the Call Path. Every C-callable function has one,
+    because safe host code takes C function pointer values too (zlib's
+    `zalloc` is stored in a `z_stream` before the region that passes it).
+  - Emitting from the shared local walk: the walk that decides which
+    statements are host operations already names every function a region
+    reaches, so what the library emits has one owner.
+  - The profile follows the program: the companion is part of the same
+    build, so a release build's regions get the optimized profile.
+  - Copies of regions over host storage: the interpreter's storage is not
+    C layout, so the companion views a native copy, and the copy's address
+    range names the host storage a region the companion returns views.
+  - Pins on host storage lent and synchronized at each crossing: the host
+    keeps a place's value in its own representation, so the pointer needs
+    native storage, and the companion and host never run at once, so
+    synchronizing at every crossing makes the copy behave as the one
+    storage section 7's pins describe. An element lends its whole
+    collection so pointer arithmetic between elements keeps its native
+    distances.
+  - Foreign structs and unions as C-layout bytes on the host: field access,
+    union overlay and every crossing then read one representation, laid out
+    by the shared C layout.
+  - Copy addresses in loaded slots: the companion's copy of a buffer is the
+    storage a region it builds views, and the slot is the one record both
+    sides already share for that input, so the host needs no second export
+    to learn the address.
+  - Foreign memory through the runtime's byte copy: the host reads memory
+    a foreign library owns through the same runtime both native backends
+    use, with no copy kept on the host.
+  - Lowering numbering checked by the plan: the plan owns the operation
+    table every host reads, so the defect is reported where the table is
+    built, for every target.
+  - The process ends on a panic during a region call: the companion's
+    frames are below the host's, and neither side unwinds.
+  - The Call Path of a callback from the runtime's record: the runtime
+    already holds the outbound call's frame for every C entry.
+  - A frame of MIR locals for PHP host operations: a host operation is a
+    MIR statement over MIR locals, and PHP output keeps each value in the
+    place of its source binding, so the binding a MIR local records is the
+    one map between them, and the PHP backend classifies no statement of
+    its own.
+  - The PHP sidecar check: the generated PHP knows the plan but not the
+    library, which is built when the output is published, so it checks the
+    plan fields as generated and the file against the digest the sidecar
+    records.
+  - Leaving PHP through the runtime: PHP turns `exit` inside an FFI
+    callback into a fatal error, so the runtime ends the process.
+  - Import slots for runtime data on Windows: an import library defines
+    only the `__imp_` slot for a DLL's data, and COFF has no automatic
+    data import. Native code keeps its direct store around each foreign
+    call, where an accessor call would add two calls to every one, and one
+    shared description tells both native backends which form an object
+    uses.
+- The unsafe inventory for `baton audit unsafe` is compiler metadata (section 25).
+- `Platform::architecture` beside `Platform::operatingSystem` (section 17), and
+  the placement of `Platform`, `OperatingSystem` and `Architecture` in
+  `Doria\Std\Ffi` (section 1).
+- Section 21's absent-stream rule applies on every platform.
+- `ForeignCall::lastSystemCode` is 0 before any capturing call on the
+  thread (section 16), as C's `errno` is at program start.
+
+## Unsettled
+
+- **Browser playground.** The playground runs the interpreter in WebAssembly and
+  cannot load a native companion. Which diagnostic or presentation it gives for
+  FFI examples is not decided.
+- **Foreign writes to standard streams.** The interpreter and PHP output keep
+  their own Doria output paths, while foreign code writes to the process's
+  streams. Whether the host flushes buffered Doria output at each region entry,
+  so ordering matches native, is not decided.
+- **`Sendable` and `Shareable` for pointers and handles** belong to Stage 39.
+- **Math values by value** wait for the geometry-math and geometry layout
+  decisions.
+- **Bit fields and packing** wait for a consumer.
+- **Plan D18's "until v1.0"** wording still differs from AGENTS.md.
+
+## Acceptance
+
+1. **Bind and call zlib.** A Baton package declares `zlib` in
+   `[native-libraries]` and binds `compressBound`, `compress2`, `uncompress` and
+   streaming `deflateInit_` / `deflate` / `deflateEnd` through a foreign
+   `z_stream`; `deflateInit_` receives `ZLIB_VERSION` as a `CString` and
+   `ZStream::SIZE`.
+2. **Zero-copy round trip.** A `Bytes` value is compressed and decompressed
+   through region pointers. Natively, the region `address` equals the address C
+   reports, and a Linux allocation count in `dorialang/benchmarks` shows no
+   payload copy.
+3. **Every target.** Fixtures 1 and 2 and every fixture below are in
+   `native_parity_examples.txt` and produce identical stdout, stderr, status and
+   file effects under the interpreter, Cranelift, LLVM and PHP output on Linux
+   x86_64 and aarch64, macOS aarch64 and x86_64, and Windows x86_64 (MSVC). CI
+   provisions zlib on every host: pkg-config on Linux, the system `libz` on
+   macOS, and on Windows both an import library with its DLL and a static
+   library.
+4. **Platform-dependent layout.** The `z_stream` fixture passes with 32-bit
+   `uLong` on Windows and 64-bit `uLong` elsewhere from one source.
+5. **Callbacks.** zlib's `zalloc` / `zfree` are C-callable Doria functions reaching a
+   Doria allocation counter through `opaque` and a handle; every allocation
+   is released once, including under the interpreter and PHP output through
+   reverse edges.
+6. **Foreign-owned memory.** An RAII owner exposes a foreign-backed region,
+   read by safe Doria code on every target, and releases the buffer once.
+7. **Region edges.** Fixtures cover `return`, `break` and `continue` out of an
+   unsafe block, a checked error crossing a region edge, a Doria helper called
+   from inside a region, and writable writeback on every exit status.
+8. **Failure paths.** Each runtime panic in section 27, including a callback on a
+   thread the program creates through FFI and a panic inside a companion
+   region, exits 101 with the same report on every target.
+9. **Companion loading.** PHP output fails explicitly when PHP FFI is disabled,
+   the companion is missing, or its sidecar does not match.
+10. **Native-window needs.** One source with `Platform::operatingSystem` branches
+    builds and links on each platform while every host type-checks every branch;
+    a `windows-subsystem = "gui"` binary opens with no console, survives
+    `echo`, and reports `isInteractive` false.
+11. **Direct compiler use.** `doriac compile` with link flags builds the zlib
+    fixture on every host without Baton.
+12. **Policy and audit.** `declare(unsafe: "deny")`, package `unsafe = "deny"`,
+    and `baton audit unsafe` across a dependency tree with file and line.
+13. **Two clocks.** An accepted-syntax regression test shows every Stage 40 form
+    parses with zero parser errors before its semantics land; the language
+    server's no-false-diagnostics coverage matches.
+
+## Performance Impact
+
+- A native foreign call is a direct call in the target C convention with no
+  implicit marshalling.
+- Region and pointer formation allocate nothing and copy nothing. `CString`,
+  `Utf16String` and `String::fromCString` each make one visible allocation and
+  copy.
+- A C entry costs one thread comparison and a frame link; an outbound call costs
+  two stores for the Call Path record; aligned `read` and `write` cost one mask
+  test; system-code capture costs one thread-local read on opted-in
+  declarations.
+- Programs without foreign code keep today's Windows entry and binary size.
+- Under the interpreter and PHP output, each region entry costs one native call
+  plus edge copies of the buffers it pins; calls inside the region are native
+  and zero-copy; each host operation inside a region costs a reverse edge.
+- `dorialang/benchmarks` gains a native call-overhead case (Doria to C, C to
+  Doria), the zero-copy allocation case, and a companion region-entry case.
+  Timing evidence carries `Measurement Status: Pending Available Runner` until a
+  controlled runner exists (Decision 0112).
+
+## Explicit Non-Goals
+
+- C++, Objective-C and Swift language interop; Objective-C messaging goes through
+  `objc_msgSend` bindings.
+- Generating declarations from C headers.
+- Foreign data symbols.
+- Exported symbols for C-callable functions, and a public native library format; the
+  companion's shared-library kind is internal and Stage 41 builds on it.
+- A standard dynamic-loading API.
+- Inline assembly, volatile access and atomics.
+- Bit fields and packed layout.
+- Operating-system handles of Doria files and streams.
+- ABIs other than `"C"`; Windows on aarch64 and 32-bit targets.
+- Callbacks on foreign threads before Stage 39; foreign exceptions or `longjmp`
+  across Doria frames.
+- Native package feeds, prebuilt downloads and compiling C sources in packages.
+
+## Alternatives Considered
+
+The options not selected on each card, in brief: core FFI names (1); statement
+blocks only, or `when`-style value blocks (2); nullable `Ptr<T>`, `Ptr<void>`,
+non-generic `RawPtr` (3); pointer indexing and unchecked alignment (4); fixed
+widths only, per-target aliases (5); hand-computed offsets, `#[CLayout]`
+classes, waiting for general inline records (6); call-only and last-use pointer
+validity (7); pointer accessors on `T[]` only, regions limited to FFI-safe
+elements, strided regions (8); implicit string marshalling, pointer and length
+only (9); a standard `ForeignBuffer`, `Bytes` adopting foreign memory (10);
+`SharedReference<T>` only, owned values only (11); closure trampolines, nominal
+callback types (12); unchecked or unrestricted callback threads, root Call Paths
+(13); `"system"` and named ABIs, rejected or untyped variadics (14); mandatory
+camelCase names (15); capture after every call, no capture (16); Baton
+per-platform source roots, a `#[Platform]` attribute (17); all link facts in
+source or all in Baton (18); raw linker arguments, pkg-config only (19); a
+CRT-free Windows with foreign code, the CRT for every program (20); console
+only, deciding with the GUI framework (21); a native-only interpreter diagnostic
+with its own manifest, an interpreter calling dynamic libraries through a
+generic call bridge, Doria stand-ins (22); an unsupported PHP diagnostic, PHP
+FFI lowering with per-call copies (23); migrating standard modules to public
+`extern` (24); file-only or deferred policy (25); rejecting or allowing every
+foreign call in hooks (26); no documentation enforcement, a required
+`#[Safety]` attribute (27).
+
+## Consequences
+
+- Plan D3, D12, §3.5, §4.9, §8.2, §8.3, §9.1, the Stage 40 and Stage 41 entries,
+  Appendix A and the decision-record list are amended (Invalidated Elsewhere).
+- SPEC gains the keywords, the `Doria\Std\Ffi` vocabulary, foreign aggregates,
+  platform constants, the `declare` grammar, documentation comments and the
+  absent-stream rule.
+- Decision 0110's regions gain pointer accessors and owner-bound
+  `fromPointer`; typed array regions join them.
+- Decision 0125's attribute targets grow to extern blocks and declarations.
+- Decision 0121's function types gain the structural C function pointer form.
+- The build plan moves to schema 2 (link inputs, Windows subsystem, package
+  unsafe policy); Baton gains `[native-libraries]`, `windows-subsystem`,
+  `unsafe = "deny"` and `baton audit unsafe`.
+- The runtime gains a CRT-hosted Windows archive, the C entry thread check, the
+  Call Path and system-code slots, the companion host interface, and the panic
+  sink, each with its Windows implementation in the same change.
+- The parity manifest's fixtures require zlib on every test host.
+- `--target php` and `--target debug` need the native toolchain for programs
+  with unsafe code.
+- Pointers are neither `Sendable` nor `Shareable` until Stage 39 decides.
+
+## Invalidated Elsewhere
+
+**Amended with this record (2026-11-16):**
+
+- `docs/doria-end-to-end-plan.md`: D3 (foreign layouts), D12 (`Pointer<Opaque>`,
+  companion), §3.5 (example, body rule, policy, companion), §4.9 (safe regions),
+  §8.2 (interpreter and companion), §8.3 (the ABI review: settled and remaining),
+  §9.1 (`ArrayRegion<T>` slicing), the Stage 40 entry (companion and
+  native-window needs in the acceptance criteria), the Stage 41 entry (reuses the
+  shared-library output), Appendix A (native-library declarations moved to Stage
+  40), and the decision-record list (a line for this record, and the
+  unnumbered subject removed).
+
+**Not edited here, owned by Stage 40 delivery:**
+
+- **Compiler (`doria`).** Lexer and parser (`unsafe`, `extern`, `declare`,
+  foreign aggregates, C function pointer types, documentation comments); AST,
+  HIR, semantics, MIR, MIR validation; Cranelift and LLVM with one shared
+  aggregate classification; C entry thunks; the companion emitter and its
+  shared-library output; `codegen_native.rs` link arguments and subsystem;
+  `build_plan.rs` schema 2; `main.rs` flags; the interpreter's companion host;
+  PHP output's companion loader and reverse-edge dispatcher; the diagnostic
+  catalogue; FFI fixtures in `native_parity_examples.txt`; `SPEC.md`;
+  `docs/stdlib-reference.md` (`Doria\Std\Ffi`, typed regions,
+  `String::fromCString`, `String::fromUtf16`); `docs/build-plan-schema.md`;
+  compiler metadata for the unsafe inventory.
+- **Runtime (`doria-rt`).** CRT-hosted Windows archive, companion host
+  interface, panic sink, thread check, Call Path and system-code slots, new panic
+  codes, empty-region addresses, foreign-backed region accessors.
+- **Language server (`dorialang/doria-language-server`).** The `doriac` pin;
+  hovers for the new keywords, types and attributes; Safety sections in hover
+  and completion at call sites; no-false-diagnostics coverage; highlighting.
+- **Website (`doria-website`).** A versioned unsafe and FFI guide, API reference
+  for `Doria\Std\Ffi` and typed regions, diagnostic pages, and playground
+  behavior for FFI examples. This record does not modify the website repository.
+- **Baton (`dorialang/baton-php`, later `dorialang/baton`).**
+  `docs/project-manifest.md` (`[native-libraries]`, `unsafe = "deny"`),
+  `docs/targets.md` (`windows-subsystem`), `docs/build-plan.md` (schema 2),
+  `docs/dependencies.md` (transitive link inputs), `docs/toolchain.md`
+  (pkg-config and native toolchain needs for `php` and `debug` builds), receipts
+  (companion, link facts and runtime files, which `doriac` places), and
+  `baton audit unsafe`. `docs/build-plan-schema.md` (Baton Requirements) lists
+  the Baton side of sections 18 to 21 and 25.
+- **Benchmarks (`dorialang/benchmarks`).** Call-overhead, zero-copy and
+  companion region-entry cases.
+- **Draft records owned by another session, not edited.** The geometry-math
+  decision draft places the `declare` grammar in Stage 47; Stage 40 now
+  implements it (section 25). The geometry layout decision draft leaves FFI
+  vector-register passing to Stage 44; section 6's shared C classification
+  fixes it for by-value math values.

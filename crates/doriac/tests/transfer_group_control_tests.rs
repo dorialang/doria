@@ -24,6 +24,9 @@ function detached(): CancellationToken {
 }
 "#;
 
+/// A function value that reaches `start` from `main` without running it.
+const REACH_START: &str = "let $reach = function(writable ReadinessSet $set, take TransferPlan $plan): void { try { let $group = start($set, $plan); } catch (IoError) {} };";
+
 fn source(body: &str) -> String {
     format!("{IMPORTS}\nfunction main(): void throws IoError, ClockError, CancellationError {{ {body} }}")
 }
@@ -218,7 +221,8 @@ class CancellingReader implements PendingReadableStream {
 
 #[test]
 fn native_control_transport_uses_the_shared_bridge_without_caller_state_allocation() {
-    let program = doriac::lower_source_to_mir("group-control-structure.doria", source("")).unwrap();
+    let program =
+        doriac::lower_source_to_mir("group-control-structure.doria", source(REACH_START)).unwrap();
     let roots = native_structure::authored_symbols(&program, &["start"]);
     let check = |references: std::collections::BTreeSet<String>| {
         assert!(
@@ -244,7 +248,8 @@ fn native_control_transport_uses_the_shared_bridge_without_caller_state_allocati
 
 #[test]
 fn mir_retains_only_set_and_plan_loans_and_validates_exact_control_types() {
-    let program = doriac::lower_source_to_mir("group-control-mir.doria", source("")).unwrap();
+    let program =
+        doriac::lower_source_to_mir("group-control-mir.doria", source(REACH_START)).unwrap();
     let function = program
         .functions
         .iter()

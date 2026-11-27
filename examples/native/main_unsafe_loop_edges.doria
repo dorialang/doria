@@ -1,0 +1,33 @@
+// `break` and `continue` leave unsafe code with what it wrote: numbers,
+// `bool` values and strings cross back on every edge.
+
+extern "C"
+{
+    /** @safety Any value but the least `int32`. */
+    function abs(int32 $value): int32;
+}
+
+function main(): void
+{
+    writable int32 $round = 0;
+    writable int32 $total = 0;
+    writable bool $stopped = false;
+    writable string $trail = "";
+    while ($round < 10) {
+        $round += 1;
+        unsafe {
+            if ($round == 2) {
+                $trail = $trail . "c";
+                continue;
+            }
+            $total = $total + abs(-$round);
+            if ($round == 4) {
+                $stopped = true;
+                $trail = $trail . "b";
+                break;
+            }
+            $trail = $trail . "f";
+        }
+    }
+    echo $round . " " . $total . " " . $stopped . " " . $trail . "\n";
+}

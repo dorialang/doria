@@ -21,6 +21,8 @@ pub const REPORT_SCHEMA_VERSION: u64 = 1;
 pub struct PerformanceCompilation {
     pub output: BackendOutput,
     pub report: Value,
+    /// Warnings from checking the program, reported beside the output.
+    pub warnings: Vec<Diagnostic>,
 }
 
 struct FrontendMeasurement {
@@ -142,12 +144,20 @@ fn emit_native(
     frontend: FrontendMeasurement,
 ) -> Result<PerformanceCompilation, Vec<Diagnostic>> {
     let started = Instant::now();
+    let warnings = hir.semantic_info.warnings.clone();
     let (mir, structure) = mir_lowering::lower_program_with_metrics(&hir)?;
     let mir_lowering = started.elapsed();
 
-    let (bytes, native) =
-        codegen_native::generate_executable_with_performance(&mir, options.native_profile)
-            .map_err(backend_diagnostics)?;
+    let (executable, native) = codegen_native::generate_executable_with_performance(
+        &mir,
+        options.native_profile,
+        &options.linking,
+    )
+    .map_err(backend_diagnostics)?;
+    let crate::codegen_native::LinkedExecutable {
+        bytes,
+        runtime_files,
+    } = executable;
     let total = frontend.load + frontend.started.elapsed();
     let output_size = bytes.len();
     let runtime_artifact_bytes = fs::metadata(&native.runtime_artifact)
@@ -292,8 +302,10 @@ fn emit_native(
         output: BackendOutput::Executable {
             extension: crate::backend::native_executable_extension().to_string(),
             bytes,
+            runtime_files,
         },
         report,
+        warnings,
     })
 }
 

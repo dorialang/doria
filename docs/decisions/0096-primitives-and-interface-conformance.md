@@ -50,6 +50,22 @@ This is what satisfies generic constraints, and it costs nothing:
 `<T implements Comparable>` with `T = int` monomorphizes to a direct comparison —
 no vtable, no allocation.
 
+> **Implemented for Copy enums, 2026-11-16.** A Copy enum, with or without
+> payload cases, conforms to `Equatable`, `Hashable` and `Comparable` when
+> every payload of every case conforms; a `float` payload therefore leaves it
+> `Equatable` only, and an enum that is not Copy conforms to none of them. The
+> checker asks one question for primitives and enums
+> (`compiler_known_conformance`), and every backend runs the same lowering:
+> equality compares the case and the payloads; `compare` orders cases by
+> declaration, then payloads from left to right, as Andrew ruled on
+> 2026-11-16 ("Declaration order, then payloads (Recommended)", recorded in
+> Decision 0114); `hash` folds the case index and the payload hashes under
+> the Decision 0134 law. Rule 2 holds: an enum value cannot fill an interface
+> slot (E0760). Implementation boundaries: an enum with payload cases as a
+> hashed or ordered collection key or element reports E0783, and PHP output
+> reports B4601 for an enum's `hash`, `compare` and collection keys; both are
+> planned.
+
 ### 2. Interface-typed slots stay class-only
 
 A primitive may **not** inhabit an interface-typed slot — `Comparable $x = 5;`

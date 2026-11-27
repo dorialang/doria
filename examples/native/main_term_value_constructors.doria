@@ -1,0 +1,14 @@
+use Doria\Std\Term\{KeyModifiers, Position, Size};
+
+function main(): int
+{
+    let $size = new Size(80, 24);
+    let $named = new Size(rows: 3, columns: 7);
+    let $at = new Position(5, 2);
+    let $none = KeyModifiers::none;
+    let $chord = new KeyModifiers(true, false, true);
+    let $huge = new Size(99999999, 1);
+    echo "{$size->columns}x{$size->rows} {$named->columns}x{$named->rows} {$at->column},{$at->row} ";
+    echo "{$none->control}{$none->alt}{$none->shift} {$chord->control}{$chord->alt}{$chord->shift} {$huge->columns}\n";
+    return $size->columns - 80;
+}

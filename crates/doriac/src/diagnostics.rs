@@ -11,6 +11,25 @@ pub const DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
 
 pub type DiagnosticResult<T> = Result<T, Vec<Diagnostic>>;
 
+/// Splits the findings of checking a program by Decision 0108's severity
+/// model: any error fails it, and warnings and notes alone do not. `Ok` holds
+/// the warnings and notes to report beside the result; `Err` holds every
+/// finding, in order.
+pub fn separate_errors(diagnostics: Vec<Diagnostic>) -> Result<Vec<Diagnostic>, Vec<Diagnostic>> {
+    if has_errors(&diagnostics) {
+        Err(diagnostics)
+    } else {
+        Ok(diagnostics)
+    }
+}
+
+/// Whether any finding is an error, the one severity that fails checking.
+pub fn has_errors(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
     Error,
@@ -430,10 +449,7 @@ impl Diagnostic {
                 development_only: metadata.development_only,
                 documentation: Some(DiagnosticDocumentation {
                     slug: code.to_ascii_lowercase(),
-                    url: Some(format!(
-                        "https://dorialang.org/docs/diagnostics/{}",
-                        code.to_ascii_lowercase()
-                    )),
+                    url: Some(documentation_url(code)),
                 }),
                 developer_details: matches!(
                     kind,
@@ -1625,35 +1641,29 @@ fn format_summary(summary: DiagnosticSummary) -> String {
     format!("{}: {}", summary.status(), counts.join(" And "))
 }
 
+/// Title-cases prose words and keeps code in backticks exactly as written
+/// (docs/diagnostic-style.md): a word is capitalized at its first letter only
+/// when that letter is outside a code span, wherever the span starts or ends.
 fn to_title_case(message: &str) -> String {
     let mut in_code = false;
-    message
-        .split_inclusive(char::is_whitespace)
-        .enumerate()
-        .map(|(index, word)| {
-            for character in word.chars() {
-                if character == '`' {
-                    in_code = !in_code;
+    let mut title = String::with_capacity(message.len());
+    for (index, word) in message.split_inclusive(char::is_whitespace).enumerate() {
+        let mut first_letter = true;
+        for (offset, character) in word.char_indices() {
+            if character == '`' {
+                in_code = !in_code;
+            } else if first_letter && character.is_alphabetic() {
+                first_letter = false;
+                let minor = index > 0 && is_minor_title_word(word[offset..].trim_end());
+                if !in_code && !minor {
+                    title.extend(character.to_uppercase());
+                    continue;
                 }
             }
-            if in_code || word.starts_with('`') {
-                return word.to_string();
-            }
-            let trimmed = word.trim_start_matches(|character: char| !character.is_alphabetic());
-            let prefix_len = word.len().saturating_sub(trimmed.len());
-            let (prefix, rest) = word.split_at(prefix_len);
-            let mut characters = rest.chars();
-            let Some(first) = characters.next() else {
-                return word.to_string();
-            };
-            let minor = is_minor_title_word(rest.trim_end());
-            if index > 0 && minor {
-                word.to_string()
-            } else {
-                format!("{prefix}{}{}", first.to_uppercase(), characters.as_str())
-            }
-        })
-        .collect()
+            title.push(character);
+        }
+    }
+    title
 }
 
 pub fn is_title_case(title: &str) -> bool {
@@ -1720,6 +1730,40 @@ pub use doria_diagnostic_catalogue::{
     runtime_entry as runtime_catalogue_entry, RuntimeCatalogueEntry,
     DIAGNOSTIC_CODES as CATALOGUED_CODES, RUNTIME_CATALOGUE,
 };
+/// The documentation release this compiler links to, as the documentation
+/// site names its releases: `v`, then the toolchain's year, quarter and
+/// release number without zero padding and without a channel suffix. Toolchain
+/// `2026.03.1-canary` links to `v2026.3.1`.
+pub fn documentation_release() -> String {
+    let release = crate::TOOLCHAIN_VERSION
+        .split('-')
+        .next()
+        .unwrap_or(crate::TOOLCHAIN_VERSION);
+    let parts: Vec<&str> = release
+        .split('.')
+        .map(|part| {
+            let unpadded = part.trim_start_matches('0');
+            if unpadded.is_empty() {
+                "0"
+            } else {
+                unpadded
+            }
+        })
+        .collect();
+    format!("v{}", parts.join("."))
+}
+
+/// Where a diagnostic code is documented for readers: one page per code for
+/// each documentation release, so a compiler links to the explanations for
+/// its own release.
+pub fn documentation_url(code: &str) -> String {
+    format!(
+        "https://docs.dorialang.org/{}/diagnostics/{}",
+        documentation_release(),
+        code.to_ascii_lowercase()
+    )
+}
+
 pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
     let runtime = code.starts_with("P1");
     let kind = match code.as_bytes().first().copied() {
@@ -1738,6 +1782,7 @@ pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
         title_family: match code {
             "B0003" => "Runtime Artifact Is Incompatible With This Compiler",
             "B3602" => "PHP Native Runtime Dependency Is Unavailable",
+            "B3605" => "PHP Native Companion Library Is Unavailable",
             _ => match code.as_bytes().first().copied() {
                 Some(b'L') => "Lexical Error",
                 Some(b'P') if runtime => "Runtime Panic",
@@ -1818,6 +1863,25 @@ mod tests {
         ));
         assert!(!is_title_case("`when` is not available"));
         assert!(!is_title_case("Unclosed `syntax"));
+    }
+
+    /// Code in backticks keeps its exact text in a title, including a word
+    /// that closes a span which opened in an earlier word.
+    #[test]
+    fn titles_keep_code_spans_exactly() {
+        use super::to_title_case;
+        assert_eq!(
+            to_title_case("argument 1 expects `extern \"C\" function(int32): int32`, got `int`"),
+            "Argument 1 Expects `extern \"C\" function(int32): int32`, Got `int`"
+        );
+        assert_eq!(
+            to_title_case("cannot call `$value ?? other` on a value of `List<int> items`"),
+            "Cannot Call `$value ?? other` on a Value of `List<int> items`"
+        );
+        assert_eq!(
+            to_title_case("(`first`) is not a type"),
+            "(`first`) Is Not a Type"
+        );
     }
 
     #[test]

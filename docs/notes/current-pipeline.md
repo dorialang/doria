@@ -13,6 +13,80 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 
 ## Active
 
+- Callback-provenance solver scaling, 2026-11-16. `doriac metadata` on
+  doria-tui ran 1 h 46 min at 6.2 GB: the nonblocking call-context solver
+  gave every call a context keyed by its caller, so contexts grew with the
+  number of call paths. A call now gets a caller-keyed context only when a
+  callable can cross it (a parameter or result type that can hold one, a
+  callback invocation, a closure environment); other calls share one
+  context per callee and specialization. Value and field propagation follow
+  each value's own edges. Remaining exposure: calls that do pass callables
+  stay keyed by caller, so a deep fan of such calls still multiplies
+  contexts.
+- Compiler-known panic location, 2026-11-16 (Andrew: "Fix it in this beat
+  (Recommended)"). A function of a compiler-known module runs in its caller's
+  diagnostic frame (`mir::DiagnosticFrame::Caller`), so a panic it raises,
+  such as a negative position in `Console::moveTo` or `new Position`, is
+  reported at the user's call in the interpreter, Cranelift and LLVM output,
+  and its frame is left out of the trace. A closure written inside a
+  compiler-known module keeps its own frame.
+- Copy enum core conformance, 2026-11-16 (Decision 0096 implemented for
+  enums; Decision 0114 amendment): Copy enums meet `Equatable`, `Hashable`
+  and `Comparable` when their payloads do, ordered by declaration, then
+  payloads. One conformance question in the checker, one MIR lowering
+  (`mir_lowering/core_enum.rs`) for every native backend, one
+  `CollectionComparator::for_element`. Implementation boundaries, both
+  planned: E0783 for an enum with payload cases as a hashed or ordered
+  collection key or element (the core-comparator collections move a key as
+  one word), and B4601 for PHP output of an enum's `hash`, `compare` and
+  collection keys (equality is generated).
+- Term value constructors, 2026-11-16 (Decision 0140 amendment): `new Size`,
+  `new Position`, `new KeyModifiers` and `KeyModifiers::none`. `new` on a
+  compiler-known inline value is checked against its public constructor and
+  lowered to its `fromParts` factory in HIR, so the interpreter, Cranelift,
+  LLVM and PHP output share one path.
+- Completion context, 2026-11-15. `doriac::syntax::completion_context(path,
+  source, offset)` reports the syntax context at a cursor (top level, member
+  declaration, statement, expression operand or after an operand, type with
+  its parameter and constructor flags, declared name, qualified-name segment,
+  member, static member, variable, a keyword-only continuation, or none inside
+  a comment, string or number) and the keywords the parser takes there. The
+  context comes from marks at parser entry points; each keyword is tried
+  through the real parser. The keyword table is declared once in the lexer
+  (`lexer::KEYWORDS`, `lexer::keyword_kind`). The language server reads this
+  instead of its token heuristics. Amended 2026-11-16: the context reports
+  `Statement { in_loop }` and `NamespacePath { declarations_allowed }`, and
+  the keyword list leaves out what the checker rejects after the parser takes
+  it: `break`/`continue` outside a loop (E0421/E0422), a constructor role on
+  an ordinary parameter (E0737/E0738), the type keywords the checker rejects
+  (`types::rejected_type_name`: `null`, `object`, `resource`), non-class types
+  after `new`, `void` for a parameter, keywords at a `$` word or after `->`
+  or `::`,
+  and keywords that would be the declared name itself. Type arguments, enum
+  cases in match patterns and trait adaptation methods report their
+  contexts.
+- String display width, 2026-11-15, for the `Doria\Tui` library that the
+  plan's approved sequence puts after Stage 46. Decision 0146 adds
+  `$text->displayWidth`: terminal cells per grapheme cluster, 2 for an East
+  Asian Wide or Fullwidth character or an emoji, 0 for a cluster with nothing
+  drawn, 1 otherwise. One implementation in `doria-unicode`, called by the
+  interpreter and exported by `doria-rt` as `dr_v1_string_display_width`
+  (runtime ABI 18) for Cranelift and LLVM; PHP output rejects it with the
+  other String intrinsic properties. The compiler teaches it for PHP's
+  `mb_strwidth`. The library itself lives in `dorialang/doria-tui`.
+- The String surface table, 2026-11-15. `doriac::string_surface` lists every
+  `$text->` property and `String::` companion member with its signature,
+  availability, pending reason and one-line documentation. The type checker,
+  MIR lowering (parameter names and defaults), the PHP backend's property
+  check, the foreign-spelling validation and the language server read it.
+- `$text->graphemes`, 2026-11-15 (Decision 0147): an `Iterable<string>` view
+  written in the compiler-known `Doria\Std\Text` module over two
+  compiler-private String intrinsics (runtime ABI 19). Its view and cursor
+  classes are in no canonical-type list, so authored source cannot name them.
+  Every compilation path adds compiler-known modules through one function,
+  `augment_compiler_known`, which decides the I/O identities last over the
+  augmented program; before this, a graphemes walk in a program with no I/O
+  failed with E0401 for `Doria\Std\Io\IoError`.
 - Stage 47 preparation, 2026-11-11. Stage 47 (`Doria\Std\Math` geometry) is
   designed and not implemented. Two records are drafted in `docs/decisions/`
   as Proposed and wait for Andrew's review, uncommitted until he has read
@@ -6054,7 +6128,7 @@ The master plan adds Stage 40a network/data foundations and the separate post-40
 - Stage 18 full expression interpolation and compiler-known `Displayable` is merged.
 - Stage 19 ownership, moves, destruction, and native class layout is complete on the current branch.
 - Stage 20 statically resolved instance/static methods, Copy-type static properties, class/top-level constants, `internal` enforcement, and concrete native `Displayable` execution are complete on the current branch. Static access is sigil-free, `self` resolves to the declaring class, and one class-level index rejects cross-kind member-name collisions.
-- Stage 20a/20b const-evaluable defaults are complete for Copy scalars and readonly strings across free functions, instance methods, static methods, and constructors through one caller-side MIR splice. Writable Copy scalars remain supported; `?string`, `writable string`, `take string`, and other move/`take` defaults retain explicit temporary diagnostics.
+- Stage 20a/20b const-evaluable defaults are complete for Copy scalars and readonly strings across free functions, instance methods, static methods, and constructors through one caller-side MIR splice. A `writable` parameter has no default (E0818), because it lends the caller's storage, except a promoted constructor parameter; `?string`, `writable string`, `take string`, and other move/`take` defaults retain explicit temporary diagnostics.
 - Stage 21 non-lexical borrowing, returned-borrow elision, and constructor definite initialization are complete on the current branch. Returned-borrow provenance now remains tied transitively to `$this` or one borrowed parameter through property paths, collection indexing, and compiler-known `Dictionary::get`/`List::first`/`List::last` reads. Constructor paths use decision 0090's uninitialized/initialized/maybe-initialized lattice, and shared MIR validation independently enforces the normal-exit and readonly exactly-once invariants.
 - Stage 22 general nullable types, `??`, `?->`, exact `is`, flow-sensitive narrowing, and `mixed` static semantics are complete on the current branch. Narrowing reuses the shared CFG/forward-dataflow framework; local and parameter guards preserve dominating nullable-presence proofs in MIR, and nullable scalar, string, and concrete-class values execute through the interpreter, Cranelift, and LLVM.
 - Stage 23 Slice 1 runtime collections and typed arrays are complete on the current branch. `T[]`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are owned move types backed by shared collection MIR and `doria-rt`; contextual literals, fixed-length typed arrays, indexing and indexed read-modify-write, insertion-ordered `foreach`, move-in/removal ownership, and Decision 0100's default member surface run through the interpreter, Cranelift, and LLVM. Decision 0113 completes that surface. Slice 1 implements `containsKey` and the widened `contains`; Slice 2 implements receiver-aware structured fixes, property-call diagnostics, and withdrawn literal-family `::from` guidance; Slice 3 implements `List::indexOf`, `List::remove`, map `containsValue`, and readonly set endpoint properties; Slice 4 implements writable in-place `clear(): void` on all seven named collections with exact-once cleanup and reuse. No Decision 0113 member remains pending. Dictionary `keys`/`values` are readonly, insertion-ordered, `foreach`-only projections and are not storable values.

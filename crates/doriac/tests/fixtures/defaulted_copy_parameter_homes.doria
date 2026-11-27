@@ -1,12 +1,3 @@
-function invert(writable bool $value = false): bool
-{
-    let writable $apply = function (): bool with (writable $value) {
-        $value = !$value;
-        return $value;
-    };
-    return $apply();
-}
-
 class Counter
 {
     function __construct(writable bool $value = false)
@@ -23,10 +14,8 @@ class Counter
 
 function main(): void
 {
-    let writable $seed = true;
     let writable $constructorSeed = true;
     let $defaultCounter = new Counter();
     let $explicitCounter = new Counter($constructorSeed);
-    echo invert() . ":" . invert($seed) . ":{$seed}:" .
-        $defaultCounter->read() . ":" . $explicitCounter->read() . "\n";
+    echo $defaultCounter->read() . ":" . $explicitCounter->read() . ":{$constructorSeed}\n";
 }

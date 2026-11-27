@@ -262,6 +262,9 @@ pub struct FunctionDecl {
     pub test_assertion_checked_effects: Vec<ResolvedType>,
     pub body: Block,
     pub intrinsic: Option<crate::ast::CompilerIntrinsic>,
+    /// An extern declaration (Decision 0148 section 15): its body is the
+    /// call to the C function `SemanticInfo::foreign_bindings` records.
+    pub foreign: bool,
     pub modifier_prefix_span: Span,
     pub span: Span,
 }

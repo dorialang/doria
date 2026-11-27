@@ -205,14 +205,14 @@ fn protocol_only(
 }
 
 pub(super) fn repeated_block(function: &mir::Function, start: mir::BlockId) -> bool {
-    let mut pending = terminator_targets(&function.blocks[start.0].terminator);
+    let mut pending = function.blocks[start.0].terminator.targets();
     let mut seen = HashSet::new();
     while let Some(block) = pending.pop() {
         if block == start {
             return true;
         }
         if seen.insert(block) {
-            pending.extend(terminator_targets(&function.blocks[block.0].terminator));
+            pending.extend(function.blocks[block.0].terminator.targets());
         }
     }
     false

@@ -302,7 +302,7 @@ fn cfg_reaches_without(
         if block == target {
             return Ok(true);
         }
-        pending.extend(terminator_targets(&block_in(function, block)?.terminator));
+        pending.extend(block_in(function, block)?.terminator.targets());
     }
     Ok(false)
 }

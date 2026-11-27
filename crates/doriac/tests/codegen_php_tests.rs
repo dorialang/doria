@@ -546,7 +546,7 @@ function main(): void {
     let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
     assert_eq!(
         expected.stdout,
-        b"7|1|c|b|makea|makec|a|c|makea|makeb|a|b|\n"
+        b"7|7|c|b|makea|makec|a|c|makea|makeb|a|b|\n"
     );
     let php = doriac::compile_source_to_php("assignment-regions.doria", source).unwrap();
     for name in ["scalar", "copyParameter", "borrowed", "owning"] {
@@ -721,6 +721,58 @@ function main(): void {
     );
     assert_eq!(output.stdout, expected.stdout);
     assert_eq!(output.stderr, expected.stderr);
+}
+
+#[test]
+fn php_compares_enum_values_exactly_and_refuses_their_order_and_hash() {
+    let enums = "enum Focus { case Search; case List; } enum Cell { case Empty; case Glyph(string $text, int $width); }";
+    let source = format!(
+        r#"{enums}
+function same<T implements Equatable<T>>(T $left, T $right): bool {{ return $left->equals($right); }}
+function main(): void {{
+    echo same(Focus::List, Focus::List) ? "y" : "n";
+    echo same(Focus::List, Focus::Search) ? "y" : "n";
+    echo same(Cell::Glyph("a", 1), Cell::Glyph("a", 1)) ? "y" : "n";
+    echo same(Cell::Glyph("a", 1), Cell::Glyph("a", 2)) ? "y" : "n";
+    echo same(Cell::Empty, Cell::Empty) ? "y" : "n";
+    echo "\n";
+}}
+"#
+    );
+    let program = doriac::lower_source_to_mir("enum-equality.doria", &source).unwrap();
+    let expected = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(expected.stdout, b"ynyny\n");
+    let php = doriac::compile_source_to_php("enum-equality.doria", &source).unwrap();
+    assert!(php.contains("__doria_equal("), "{php}");
+    let script = format!(
+        "{}\n{}();",
+        php.strip_prefix("<?php").unwrap(),
+        php_function_name("main")
+    );
+    let output = php_execution::Script::new(&script)
+        .command(&[])
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, expected.stdout, "{output:?}");
+
+    for body in [
+        "function order<T implements Comparable<T>>(T $left, T $right): Ordering { return $left->compare($right); } function main(): void { order(Focus::List, Focus::Search); }",
+        "function code<T implements Hashable>(T $value): uint64 { return $value->hash(); } function main(): void { code(Cell::Empty); }",
+        "function main(): void { writable Set<Focus> $seen = Set::from([]); $seen->add(Focus::List); }",
+        "function main(): void { writable Dictionary<Focus, int> $counts = []; $counts[Focus::List] = 1; }",
+        "function main(): void { writable SortedSet<Focus> $sorted = SortedSet::from([]); $sorted->add(Focus::List); }",
+    ] {
+        let source = format!("{enums} {body}");
+        doriac::check_source("enum-core.doria", &source)
+            .expect("PHP compatibility limitations must not affect Doria checking");
+        let diagnostics = doriac::compile_source_to_php("enum-core.doria", &source)
+            .expect_err("PHP output must refuse an enum order, hash or key it does not generate");
+        assert_eq!(diagnostics[0].code, "B4601", "{body}: {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].title,
+            "PHP Target Cannot Order Or Hash Enum Values Yet"
+        );
+    }
 }
 
 #[test]
@@ -1045,7 +1097,7 @@ function copy<T>(T $input): T {
     return $callback($input);
 }
 function replace(writable int $input, int $other): int { $input = $other; return $input; }
-function copyParameter(int $input): int { return replace($input, 7); }
+function copyParameter(writable int $input): int { return replace($input, 7); }
 function main(): void {
     let $duration = Duration::fromNanoseconds(-17);
     let $sample = new Sample();
@@ -1058,7 +1110,8 @@ function main(): void {
     if (copy(42) != 42) { panic("nested integer changed"); }
     let $wait = Wait::For($duration);
     if (copy($wait) != $wait) { panic("nested enum changed"); }
-    if (copyParameter(42) != 7) { panic("local parameter storage changed"); }
+    let writable $number = 42;
+    if (copyParameter($number) != 7 || $number != 7) { panic("lent parameter storage lost its write"); }
 }
 "#;
     let php = doriac::compile_source_to_php("generic-copy-callback.doria", source).unwrap();
@@ -2272,14 +2325,10 @@ fn php_backend_normalizes_defaulted_cell_parameters_without_leaking_transport() 
     let mir = doriac::lower_source_to_mir("defaulted-cell-parameters.doria", source).unwrap();
     let expected = doriac::mir_interpreter::interpret(&mir).unwrap();
     assert!(expected.runtime_diagnostic.is_none(), "{expected:?}");
-    assert_eq!(expected.stdout, b"true:false:true:false:true\n");
+    assert_eq!(expected.stdout, b"false:true:true\n");
     let php = doriac::compile_source_to_php("defaulted-cell-parameters.doria", source)
         .expect("defaulted cell parameters should lower to PHP");
 
-    assert!(php.contains(&format!(
-        "function {}(bool $value = false): bool",
-        php_function_name("invert")
-    )));
     assert!(php.contains("public bool $value;"));
     assert!(php.contains("function __construct(bool $value = false)"));
     assert!(php.contains("$value = new __DoriaCell($value);"));
@@ -2424,7 +2473,8 @@ fn php_backend_preserves_byte_lexicographic_string_ordering() {
         r#"
 function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
-    if ("10" < "2") {
+    let $left = "10";
+    if ($left < "2") {
         return 42;
     }
     return 0;
@@ -2433,7 +2483,8 @@ function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("PHP should preserve Doria string ordering");
 
-    assert!(php.contains("__doria_less(\"10\", \"2\")"));
+    assert!(php.contains("__doria_less("));
+    assert!(php.contains(", \"2\")"));
     assert!(php.contains("strcmp($left, $right)"));
 
     let Ok(version) = Command::new("php").arg("--version").output() else {
@@ -3658,6 +3709,7 @@ function main(): void throws Doria\Std\Io\IoError
         echo "block {$name}";
     }
     echo $name;
+    let $greeting = greet($name);
 }
 "#,
     )
@@ -4248,6 +4300,7 @@ function accept(function(int): int $callback): void
 
 function main(): void
 {
+    accept(fn(int $value) => $value);
 }
 "#;
 
@@ -4485,7 +4538,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(php.contains("if ($prompt !== \"\")"));
     assert!(php.contains("__DoriaStdIoIoTarget::__doriaCaseStandardOutput()"));
     assert!(php.contains("__doria_flush_stdout($start, $end, $callable);"));
-    assert!(php.contains("if (@fflush(STDOUT)) { return; }"));
+    assert!(php.contains("if (@fflush(__DORIA_STDOUT)) { return; }"));
     assert!(php.contains("if (__doria_is_broken_pipe(error_get_last())) { exit(0); }"));
     assert!(!php.contains("readline("));
     assert!(php.contains("function __doria_panic("));
@@ -4498,7 +4551,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         .unwrap()
         .contains(": never"));
     assert!(php.contains("if ($line === false)"));
-    assert!(php.contains("if (feof(STDIN)) { return null; }"));
+    assert!(php.contains("if (feof(__DORIA_STDIN)) { return null; }"));
     assert!(php.contains("__DoriaStdIoIoOperation::Read"));
     assert!(php.contains("new __DoriaStdIoInvalidUtf8Error("));
     assert!(!php.contains("__doria_panic(\"P1403\""));
@@ -5996,7 +6049,10 @@ function failTwice(): void throws FirstError, FinalError
     }
 }
 
-function main(): void {}
+function main(): void
+{
+    try { failTwice(); } catch (Error) {}
+}
 "#;
     let php = doriac::compile_source_to_php("php-finalizer-replacement.doria", source)
         .expect("fallible finalizer source should compile for PHP");

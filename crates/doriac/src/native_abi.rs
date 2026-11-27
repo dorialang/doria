@@ -1,5 +1,7 @@
 //! Shared helpers for the implementation-private native function ABI.
 
+pub mod c_abi;
+
 use crate::mir;
 
 pub(crate) fn call_return_type(
@@ -58,8 +60,8 @@ pub fn collection_uses_aggregate_storage(program: &mir::Program, ty: mir::Type) 
                 | mir::Type::NullableInterface(_)
                 | mir::Type::Function(_)
                 | mir::Type::NullableFunction(_)
-                | mir::Type::ByteRegion(_)
-                | mir::Type::NullableByteRegion(_)
+                | mir::Type::Region(_)
+                | mir::Type::NullableRegion(_)
         )
         || match ty {
             mir::Type::Class(class) | mir::Type::NullableClass(class) => program
@@ -111,6 +113,9 @@ pub const STRING_LENGTH: &str = "dr_v1_string_length";
 pub const STRING_BYTE_LENGTH: &str = "dr_v1_string_byte_length";
 pub const STRING_HASH: &str = "dr_v1_string_hash";
 pub const STRING_GRAPHEME_LENGTH: &str = "dr_v1_string_grapheme_length";
+pub const STRING_DISPLAY_WIDTH: &str = "dr_v1_string_display_width";
+pub const STRING_GRAPHEME_BOUNDARY_AFTER: &str = "dr_v1_string_grapheme_boundary_after";
+pub const STRING_TEXT_BETWEEN: &str = "dr_v2_string_text_between";
 pub const STRING_IS_EMPTY: &str = "dr_v1_string_is_empty";
 pub const STRING_TO_BYTES: &str = "dr_v1_string_to_bytes";
 pub const STRING_TRIM: &str = "dr_v2_string_trim";
@@ -160,6 +165,37 @@ pub const APPEND_FILE: &str = "dr_v2_append_file";
 pub const BYTES_COPY: &str = "dr_v1_bytes_copy";
 pub const BYTES_ALLOCATE: &str = "dr_v2_bytes_allocate";
 pub const BYTES_FREE: &str = "dr_v1_bytes_free";
+/// Releases a `CString` or `Utf16String` buffer (Decision 0148 section 9).
+pub const FOREIGN_STRING_FREE: &str = "dr_v1_foreign_string_free";
+/// The box behind an open class value's handle (Decision 0148 section 11):
+/// the object word, then the descriptor word.
+pub const HANDLE_BOX_CREATE: &str = "dr_v1_handle_box_create";
+pub const HANDLE_BOX_FREE: &str = "dr_v1_handle_box_free";
+
+/// The runtime function that builds an owned foreign string from a string:
+/// `(frame, string) -> buffer`, null from a `tryFrom` form for text with NUL.
+pub const fn foreign_string_constructor(
+    encoding: crate::foreign::ForeignStringEncoding,
+    fallible: bool,
+) -> &'static str {
+    match (encoding, fallible) {
+        (crate::foreign::ForeignStringEncoding::Utf8, false) => "dr_v2_c_string_from",
+        (crate::foreign::ForeignStringEncoding::Utf8, true) => "dr_v2_c_string_try_from",
+        (crate::foreign::ForeignStringEncoding::Utf16, false) => "dr_v2_utf16_string_from",
+        (crate::foreign::ForeignStringEncoding::Utf16, true) => "dr_v2_utf16_string_try_from",
+    }
+}
+
+/// The runtime function behind `String::fromCString` or
+/// `String::fromUtf16`: `(frame, pointer) -> ?string`.
+pub const fn foreign_string_reader(
+    encoding: crate::foreign::ForeignStringEncoding,
+) -> &'static str {
+    match encoding {
+        crate::foreign::ForeignStringEncoding::Utf8 => "dr_v2_string_from_c_string",
+        crate::foreign::ForeignStringEncoding::Utf16 => "dr_v2_string_from_utf16",
+    }
+}
 pub const BYTES_LENGTH: &str = "dr_v1_bytes_length";
 pub const BYTES_DATA: &str = "dr_v1_bytes_data";
 pub const BYTES_GET: &str = "dr_v2_bytes_get";
@@ -170,6 +206,162 @@ pub const BYTE_REGION_GET: &str = "dr_v2_byte_region_get";
 pub const BYTE_REGION_SET: &str = "dr_v2_byte_region_set";
 pub const BYTE_REGION_COPY: &str = "dr_v1_byte_region_copy";
 pub const BYTE_REGION_COPY_WITHIN: &str = "dr_v1_byte_region_copy_within";
+/// Typed array regions (Decision 0148 section 8): formation from a `T[]`,
+/// subregions, the bounds-checked address of an element, and `copyFrom`,
+/// each scaled by the element stride the typed array stores.
+pub const ARRAY_REGION: &str = "dr_v2_array_region";
+pub const ARRAY_REGION_SUBREGION: &str = "dr_v2_array_region_subregion";
+pub const ARRAY_REGION_ELEMENT: &str = "dr_v2_array_region_element";
+pub const ARRAY_REGION_COPY: &str = "dr_v1_array_region_copy";
+/// Decision 0148 section 16: stores the system code a foreign call left,
+/// and reads the stored code.
+pub const CAPTURE_SYSTEM_CODE: &str = "dr_v1_capture_system_code";
+pub const LAST_SYSTEM_CODE: &str = "dr_v1_last_system_code";
+/// Decision 0148 section 13: the runtime's record of the Doria frame of the
+/// outbound foreign call in progress, which generated code stores before
+/// and after every foreign call; the entry of a C-callable function, which checks
+/// the thread and links the function's frame to that record; and the
+/// recording of the thread running Doria code at process entry.
+pub const FOREIGN_CALL_FRAME: &str = "dr_v1_foreign_call_frame";
+
+/// How generated code addresses a data symbol the runtime defines, such as
+/// [`FOREIGN_CALL_FRAME`]. Every object decides it once from its target and
+/// from how it links the runtime, and both native backends follow it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeDataAccess {
+    /// The symbol itself. The runtime is linked into the same image (an
+    /// executable links the runtime archive), or the dynamic linker binds
+    /// data across images through position-independent references (ELF
+    /// and Mach-O).
+    Direct,
+    /// The import slot `__imp_<symbol>` that holds the symbol's address. A
+    /// Windows DLL that links the runtime DLL (the native companion) reaches
+    /// runtime data only through it: the import library defines no data
+    /// symbol of its own, and COFF has no automatic data import.
+    ImportSlot,
+}
+
+impl RuntimeDataAccess {
+    /// The access of an object for the target `triple`
+    /// (`<architecture>-<vendor>-<system>[-<environment>]`), linking the
+    /// shared runtime (a companion library) or the runtime archive.
+    pub fn for_object(triple: &str, shared_runtime: bool) -> Self {
+        let windows = triple.split('-').nth(2) == Some("windows");
+        if windows && shared_runtime {
+            Self::ImportSlot
+        } else {
+            Self::Direct
+        }
+    }
+
+    /// The symbol generated code references for the runtime data `name`.
+    /// For an import slot it holds the address of `name`.
+    pub fn symbol(self, name: &str) -> String {
+        match self {
+            Self::Direct => name.to_string(),
+            Self::ImportSlot => format!("__imp_{name}"),
+        }
+    }
+}
+
+pub const ENTER_C_FUNCTION: &str = "dr_v1_enter_c_function";
+/// Enters a companion region entry: the thread check, then the host's
+/// frame as the region's parent (Decision 0148 section 23).
+pub const ENTER_REGION: &str = "dr_v1_enter_region";
+/// Enters a companion binding entry: the thread check, then the host's
+/// frame as the entry's own (Decision 0148 section 23).
+pub const ENTER_BINDING: &str = "dr_v1_enter_binding";
+/// The host a companion's callback entries forward to.
+pub const REGION_HOST: &str = "dr_v1_region_host";
+/// The slot accessors of content values (Decision 0148 section 23, entry
+/// ABI version 1): `store(slot, value)` lends a value's content, and
+/// `load` copies a slot's content into a value the companion owns.
+pub const REGION_SLOT_STORE_TEXT: &str = "dr_v1_region_slot_store_text";
+pub const REGION_SLOT_LOAD_TEXT: &str = "dr_v1_region_slot_load_text";
+pub const REGION_SLOT_STORE_BYTES: &str = "dr_v1_region_slot_store_bytes";
+pub const REGION_SLOT_LOAD_BYTES: &str = "dr_v1_region_slot_load_bytes";
+pub const REGION_SLOT_STORE_ARRAY: &str = "dr_v1_region_slot_store_array";
+pub const REGION_SLOT_LOAD_ARRAY: &str = "dr_v1_region_slot_load_array";
+pub const REGION_SLOT_STORE_FOREIGN_STRING: &str = "dr_v1_region_slot_store_foreign_string";
+pub const REGION_SLOT_LOAD_FOREIGN_STRING: &str = "dr_v1_region_slot_load_foreign_string";
+
+/// How a `RegionSlot` statement moves a slot's value, shared by both
+/// native backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionSlotForm {
+    /// Copied between the local's storage and the slot in its native layout.
+    Native,
+    /// A string, through the text accessors; `nullable` for `?string`.
+    Text { nullable: bool },
+    /// A `Bytes` buffer.
+    Bytes,
+    /// A typed array of C-layout elements.
+    Array(crate::mir::CollectionTypeId),
+    /// A `CString` or `Utf16String` of `unit_bytes`-byte code units.
+    ForeignString { unit_bytes: u64 },
+    /// A region view `{data, length}`; `nullable` for a `?` region, whose
+    /// local also holds its presence.
+    Region { nullable: bool },
+}
+
+impl RegionSlotForm {
+    pub fn of(slot: mir::CompanionSlot, ty: mir::Type, program: &mir::Program) -> Option<Self> {
+        let collection = |ty: mir::Type| match ty {
+            mir::Type::Collection(id) => program.collection_types.get(id.0).map(|c| (id, c.kind)),
+            _ => None,
+        };
+        Some(match slot.value.kind {
+            mir::UnsafeRegionValueKind::Native => Self::Native,
+            mir::UnsafeRegionValueKind::Text => Self::Text {
+                nullable: ty == mir::Type::NullableString,
+            },
+            mir::UnsafeRegionValueKind::Buffer => match collection(ty)? {
+                (_, mir::CollectionKind::Bytes) => Self::Bytes,
+                (id, mir::CollectionKind::TypedArray) => Self::Array(id),
+                _ => return None,
+            },
+            mir::UnsafeRegionValueKind::ForeignString => match collection(ty)? {
+                (_, mir::CollectionKind::ForeignString(encoding)) => Self::ForeignString {
+                    unit_bytes: match encoding {
+                        crate::foreign::ForeignStringEncoding::Utf8 => 1,
+                        crate::foreign::ForeignStringEncoding::Utf16 => 2,
+                    },
+                },
+                _ => return None,
+            },
+            mir::UnsafeRegionValueKind::Region => Self::Region {
+                nullable: matches!(ty, mir::Type::NullableRegion(_)),
+            },
+            mir::UnsafeRegionValueKind::HostToken => return None,
+        })
+    }
+}
+pub const RECORD_DORIA_THREAD: &str = "dr_v1_record_doria_thread";
+/// Decision 0148 section 14 (amendment of 2026-11-17): the trampoline
+/// through which the fast profile calls a variadic C function, and the
+/// byte offsets of the runtime's `DrVariadicCallV1` it reads and writes:
+/// eight integer and eight float argument register images, the indirect
+/// result register, the System V vector register count, the stack area's
+/// size and address, and two integer and four float result registers.
+pub const VARIADIC_CALL: &str = "dr_v1_variadic_call";
+pub const VARIADIC_CALL_INTEGER: i32 = 0;
+pub const VARIADIC_CALL_FLOAT: i32 = 64;
+pub const VARIADIC_CALL_INDIRECT_RESULT: i32 = 128;
+pub const VARIADIC_CALL_VECTOR_REGISTERS: i32 = 136;
+pub const VARIADIC_CALL_STACK_BYTES: i32 = 144;
+pub const VARIADIC_CALL_STACK: i32 = 152;
+pub const VARIADIC_CALL_RETURN_INTEGER: i32 = 160;
+pub const VARIADIC_CALL_RETURN_FLOAT: i32 = 176;
+pub const VARIADIC_CALL_SIZE: u32 = 208;
+
+/// The runtime's number for a system code source, which
+/// `CAPTURE_SYSTEM_CODE` takes.
+pub const fn system_code_source(source: crate::foreign::SystemCodeSource) -> u32 {
+    match source {
+        crate::foreign::SystemCodeSource::Errno => 0,
+        crate::foreign::SystemCodeSource::WindowsLastError => 1,
+    }
+}
 /// Decision 0110 child processes: one checked transport for every `Child`
 /// intrinsic (operation tag, child payload, operand words, checked outputs).
 pub const CHECKED_PROCESS: &str = "dr_v1_checked_process";
@@ -278,6 +470,9 @@ pub const fn assertion_collection_kind(kind: mir::CollectionKind) -> i64 {
         mir::CollectionKind::SortedSet => 6,
         mir::CollectionKind::PriorityQueue => 7,
         mir::CollectionKind::Deque => 8,
+        // Checking gives owned foreign strings no assertion presentation,
+        // and validation rejects one.
+        mir::CollectionKind::ForeignString(_) => 9,
     }
 }
 
@@ -542,6 +737,13 @@ pub const MIXED_TAG_PAYLOAD_ENUM: u8 = 15;
 pub const MIXED_TAG_INTERFACE: u8 = 16;
 pub const MIXED_TAG_FUNCTION: u8 = 17;
 pub const MIXED_TAG_INLINE: u8 = 18;
+/// A data or C function pointer; the type id is its `PointerTypeId`.
+pub const MIXED_TAG_POINTER: u8 = 19;
+/// A foreign struct or union, boxed as a copy of its C layout; the type id is
+/// its `ForeignAggregateId`.
+pub const MIXED_TAG_FOREIGN_AGGREGATE: u8 = 20;
+/// A C boundary value; the type id is its `CBoundaryType` position.
+pub const MIXED_TAG_BOUNDARY: u8 = 21;
 
 pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
     if ty.shared_interface().is_some() {
@@ -575,11 +777,18 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_) => Some(pointer_width),
         mir::Type::Interface(_) | mir::Type::NullableInterface(_) => pointer_width.checked_mul(2),
-        mir::Type::ByteRegion(_) => pointer_width.checked_mul(2),
+        mir::Type::Region(_) => pointer_width.checked_mul(2),
         // An empty region may have a null data pointer and is still present.
-        mir::Type::NullableByteRegion(_) => pointer_width.checked_mul(3),
+        mir::Type::NullableRegion(_) => pointer_width.checked_mul(3),
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => pointer_width.checked_mul(2),
         mir::Type::ClosureEnvironment(_) => Some(pointer_width),
+        // A null pointer is address zero, so `?Pointer<T>` is stored as its
+        // word and the runtime reads zero as absent.
+        mir::Type::NullableScalar(scalar)
+            if crate::native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            Some(pointer_width)
+        }
         mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => {
             let payload_width = ty.storage_bytes() as u8;
             Some(if payload_width > pointer_width {
@@ -589,7 +798,76 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
             })
         }
         mir::Type::NullableScalar(_) => Some(16),
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => None,
+        mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => None,
+    }
+}
+
+/// The stride of a typed array region's elements of type `element`, for
+/// the element types every execution target builds regions over: values
+/// copied bit for bit that the typed array stores at their own width
+/// (Decision 0148 section 8). These are the integers (with the C boundary
+/// types), floats, `bool`, unit and backed enum tags, pointers and nullable
+/// pointers, the inline values with no cleanup, and foreign structs and
+/// unions, whose C size is a multiple of their alignment, as a C array
+/// lays them out (section 6). `None` for an element type no target builds
+/// a region over yet. The collection runtime takes the same stride.
+pub fn array_region_stride(element: mir::Type) -> Option<usize> {
+    match element {
+        // A scalar's stride is its width; pointer width does not enter it.
+        mir::Type::Scalar(
+            mir::ScalarType::Integer(_)
+            | mir::ScalarType::Float(_)
+            | mir::ScalarType::Bool
+            | mir::ScalarType::Enum(_),
+        ) => collection_value_width(element, 8).map(usize::from),
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) if !ty.requires_owned_cleanup() => {
+            collection_value_width(element, 8).map(usize::from)
+        }
+        // `?Pointer<T>` is one word, null at zero (section 3), so C reads
+        // an array of nullable pointers as `T **`.
+        mir::Type::NullableScalar(scalar)
+            if crate::native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            collection_value_width(element, 8).map(usize::from)
+        }
+        mir::Type::ForeignAggregate(ty) => usize::try_from(ty.size).ok(),
+        _ => None,
+    }
+}
+
+/// The alignment of a typed array region's elements of type `element`:
+/// a scalar's is its width, and a foreign struct's or union's is its C
+/// alignment. `None` where [`array_region_stride`] is `None`.
+pub fn array_region_alignment(element: mir::Type) -> Option<usize> {
+    match element {
+        mir::Type::ForeignAggregate(ty) => usize::try_from(ty.align).ok(),
+        _ => array_region_stride(element),
+    }
+}
+
+/// The element type and element stride of the typed array region `region`;
+/// `None` for a byte region and for an element type no target builds.
+pub fn array_region_element(
+    program: &mir::Program,
+    region: mir::RegionType,
+) -> Option<(mir::Type, usize)> {
+    let array = program.collection_types.get(region.array?.0)?;
+    if array.kind != mir::CollectionKind::TypedArray {
+        return None;
+    }
+    Some((array.value, array_region_stride(array.value)?))
+}
+
+/// The bytes between elements of `region`: one for a byte region, the
+/// element stride for a typed array region; `None` for an element type no
+/// target builds.
+pub fn region_stride(program: &mir::Program, region: mir::RegionType) -> Option<usize> {
+    match region.array {
+        None => Some(1),
+        Some(_) => array_region_element(program, region).map(|(_, stride)| stride),
     }
 }
 
@@ -615,9 +893,10 @@ pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
             Some(mir::Type::WritableSharedReferenceAccess(value))
         }
         mir::Type::NullableCollection(value) => Some(mir::Type::Collection(value)),
-        mir::Type::NullableByteRegion(kind) => Some(mir::Type::ByteRegion(kind)),
+        mir::Type::NullableRegion(kind) => Some(mir::Type::Region(kind)),
         mir::Type::NullableFunction(value) => Some(mir::Type::Function(value)),
         mir::Type::NullablePayloadEnum(value) => Some(mir::Type::PayloadEnum(value)),
+        mir::Type::NullableForeignAggregate(value) => Some(mir::Type::ForeignAggregate(value)),
         _ => None,
     }
 }
@@ -635,6 +914,69 @@ pub fn function_symbol(function: &mir::Function) -> String {
         })
         .collect::<String>();
     format!("__doria_fn_{}_{}", function.id.0, sanitized)
+}
+
+/// The C size, equal to its alignment, of a scalar a pointer reads and
+/// writes (Decision 0148 section 4); `None` for a scalar without a C layout.
+/// The size and alignment of the companion slot holding `value`, a local
+/// of type `ty` (Decision 0148 section 23, entry ABI version 1). A native
+/// value has its native layout, a nullable one with its presence
+/// (`native_closure_abi::type_layout`); a string, buffer, region or foreign
+/// string slot is `{const void *data; size_t length}`. A host token has no
+/// slot: it stays in the host frame.
+pub fn companion_slot_layout(value: mir::UnsafeRegionValue, ty: mir::Type) -> Option<(u64, u64)> {
+    const WORD: u64 = 8;
+    match value.kind {
+        mir::UnsafeRegionValueKind::Native => {
+            let layout = crate::native_closure_abi::type_layout(ty, WORD as u32);
+            Some((u64::from(layout.size), u64::from(layout.align)))
+        }
+        mir::UnsafeRegionValueKind::Text
+        | mir::UnsafeRegionValueKind::Buffer
+        | mir::UnsafeRegionValueKind::Region
+        | mir::UnsafeRegionValueKind::ForeignString => Some((2 * WORD, WORD)),
+        mir::UnsafeRegionValueKind::HostToken => None,
+    }
+}
+
+/// The `int32` index ending an `outputs` record or a terminator host
+/// operation's results.
+pub const COMPANION_INDEX_LAYOUT: (u64, u64) = (4, 4);
+
+/// The size and alignment of a value a pointer reads or writes (Decision
+/// 0148 section 4): a scalar with a C layout, whose alignment is its size,
+/// or a foreign struct or union with its C layout.
+pub(crate) const fn pointee_layout(ty: crate::mir::Type) -> Option<(u64, u64)> {
+    match ty {
+        crate::mir::Type::Scalar(scalar) => match pointee_scalar_size(scalar) {
+            Some(size) => Some((size, size)),
+            None => None,
+        },
+        // A nullable pointer is stored as its word.
+        crate::mir::Type::NullableScalar(scalar)
+            if crate::native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            match pointee_scalar_size(scalar) {
+                Some(size) => Some((size, size)),
+                None => None,
+            }
+        }
+        crate::mir::Type::ForeignAggregate(aggregate) => {
+            Some((aggregate.size as u64, aggregate.align as u64))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) const fn pointee_scalar_size(scalar: crate::mir::ScalarType) -> Option<u64> {
+    use crate::mir::ScalarType;
+    match scalar {
+        ScalarType::Integer(ty) => Some(ty.storage_bytes() as u64),
+        ScalarType::Float(ty) => Some(ty.storage_bytes() as u64),
+        ScalarType::Bool => Some(1),
+        ScalarType::Inline(crate::inline_value::InlineValueType::Pointer) => Some(8),
+        ScalarType::Inline(_) | ScalarType::Enum(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -847,5 +1189,25 @@ mod tests {
             doria_rt::DR_COLLECTION_SIZE
         );
         assert_eq!(align_of::<usize>(), doria_rt::DR_COLLECTION_ALIGN);
+    }
+
+    #[test]
+    fn only_a_windows_library_over_the_shared_runtime_uses_import_slots() {
+        use super::RuntimeDataAccess::{Direct, ImportSlot};
+        for (triple, shared, access) in [
+            ("x86_64-pc-windows-msvc", true, ImportSlot),
+            ("aarch64-pc-windows-msvc", true, ImportSlot),
+            ("x86_64-pc-windows-msvc", false, Direct),
+            ("x86_64-unknown-linux-gnu", true, Direct),
+            ("aarch64-apple-darwin", true, Direct),
+        ] {
+            assert_eq!(
+                super::RuntimeDataAccess::for_object(triple, shared),
+                access,
+                "{triple}, shared runtime: {shared}"
+            );
+        }
+        assert_eq!(ImportSlot.symbol("dr_v1_x"), "__imp_dr_v1_x");
+        assert_eq!(Direct.symbol("dr_v1_x"), "dr_v1_x");
     }
 }

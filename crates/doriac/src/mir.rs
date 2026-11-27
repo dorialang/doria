@@ -4,6 +4,8 @@
 //! 11 grows into the debug/interpreter oracle and future native lowering input.
 //! The text dump is deterministic but not a stable public format.
 
+pub mod companion;
+pub mod local_access;
 pub(crate) mod return_adaptation;
 pub(crate) mod value_factory;
 
@@ -71,6 +73,22 @@ pub struct ErrorOriginId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionTypeId(pub usize);
 
+/// The exact checked type of a data or C function pointer (Decision 0148
+/// sections 3 and 12), which a `mixed` box records so that `is` tests the
+/// access and pointee, or the C signature, exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PointerTypeId(pub usize);
+
+/// A pointer type of the program, interned by its canonical checked type.
+/// MIR carries no pointee: every pointer value is one address word, and the
+/// identity exists only for exact `mixed` tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerType {
+    pub id: PointerTypeId,
+    /// The canonical Doria spelling, such as `WritablePointer<int32>`.
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClosureDescriptorId(pub usize);
 
@@ -100,6 +118,18 @@ pub struct Program {
     pub function_types: Vec<FunctionType>,
     pub closure_descriptors: Vec<ClosureDescriptor>,
     pub closure_environment_layouts: Vec<ClosureEnvironmentLayout>,
+    pub foreign_aggregates: Vec<ForeignAggregateDefinition>,
+    /// Every pointer type a `mixed` tag names, by `PointerTypeId`.
+    pub pointer_types: Vec<PointerType>,
+    /// The C-callable Doria functions (Decision 0148 section 12). Each has a C
+    /// entry under the target's C convention, which checks the calling
+    /// thread, links the Call Path to the outbound foreign call in
+    /// progress (section 13) and calls the function as Doria code does.
+    pub c_entries: Vec<FunctionId>,
+    /// The native companion library the interpreter and PHP output run the
+    /// program's unsafe regions in (Decision 0148 sections 22 and 23).
+    /// Empty for a program without regions.
+    pub companion: Companion,
     pub functions: Vec<Function>,
     /// The validated process entry. Libraries deliberately have no entry.
     pub selected_entry: Option<FunctionId>,
@@ -123,6 +153,8 @@ impl PartialEq for Program {
             && self.function_types == other.function_types
             && self.closure_descriptors == other.closure_descriptors
             && self.closure_environment_layouts == other.closure_environment_layouts
+            && self.foreign_aggregates == other.foreign_aggregates
+            && self.pointer_types == other.pointer_types
             && self.functions == other.functions
             && self.selected_entry == other.selected_entry
             && self.entry == other.entry
@@ -193,7 +225,47 @@ impl SelectedTarget {
     }
 }
 
+/// How a handle holds its value (Decision 0148 section 11, amendment
+/// Readable Names of 2026-11-20). A one-word value is its own handle. A
+/// two-word carrier, an open class value (object and class descriptor) or
+/// a shared reference to an interface (control block and interface view),
+/// is boxed: the handle addresses one runtime allocation holding both words
+/// (`native_abi::HANDLE_BOX_CREATE`), and `reclaim` frees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleCarrier {
+    Word,
+    Boxed,
+}
+
 impl Program {
+    /// How a handle holds a value of `ty`, or `None` when no handle holds
+    /// one: handles hold class values and the strong claims of
+    /// `SharedReference<T>` and `WritableSharedReference<T>`.
+    pub fn handle_carrier(&self, ty: Type) -> Option<HandleCarrier> {
+        if !ty.is_handle_value() {
+            return None;
+        }
+        let two_words = match ty {
+            Type::Class(class) => self
+                .classes
+                .get(class.0)
+                .is_some_and(|definition| definition.is_open),
+            _ => ty.shared_interface().is_some(),
+        };
+        Some(if two_words {
+            HandleCarrier::Boxed
+        } else {
+            HandleCarrier::Word
+        })
+    }
+
+    /// Whether the executable links foreign code: any foreign call,
+    /// including one of the platform C runtime or of a C function pointer
+    /// (Decision 0148 section 20).
+    pub fn links_foreign_code(&self) -> bool {
+        self.functions.iter().any(Function::calls_foreign_code)
+    }
+
     pub fn source_by_id(&self, id: SourceId) -> Option<&SourceFile> {
         self.sources
             .iter()
@@ -218,8 +290,8 @@ impl Program {
             return false;
         }
         match ty {
-            Type::ByteRegion(_)
-            | Type::NullableByteRegion(_)
+            Type::Region(_)
+            | Type::NullableRegion(_)
             | Type::Function(_)
             | Type::NullableFunction(_) => true,
             Type::PayloadEnum(payload) | Type::NullablePayloadEnum(payload) => {
@@ -304,7 +376,7 @@ impl EnumDefinition {
             .iter()
             .any(|case| !case.payload.is_empty())
             .then(|| {
-                let nullable = crate::enums::nullable_enum_layout(&self.layout)
+                let nullable = crate::enums::nullable_inline_layout(self.layout.shape())
                     .expect("validated payload enum has finite nullable layout");
                 PayloadEnumType {
                     id: self.id,
@@ -338,6 +410,11 @@ impl Eq for Program {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CollectionKind {
     Bytes,
+    /// `CString` or `Utf16String` (Decision 0148 section 9): one runtime
+    /// buffer of NUL-terminated code units, the value being the buffer's
+    /// address. It has no elements a program reads or iterates; its value
+    /// type is the code unit, `uint8` or `uint16`.
+    ForeignString(crate::foreign::ForeignStringEncoding),
     TypedArray,
     List,
     Dictionary,
@@ -365,7 +442,10 @@ impl CollectionKind {
     }
 
     pub const fn supports_foreach(self) -> bool {
-        !matches!(self, Self::Bytes | Self::PriorityQueue)
+        !matches!(
+            self,
+            Self::Bytes | Self::ForeignString(_) | Self::PriorityQueue
+        )
     }
 
     pub const fn supports_writable_element_iteration(self) -> bool {
@@ -386,6 +466,30 @@ pub enum CollectionComparator {
     Bool,
     StringBytes,
     Core,
+}
+
+impl CollectionComparator {
+    /// How a hashed or ordered collection compares elements of `ty`: by the
+    /// value's bits for the primitives, and through the core value operations
+    /// for classes, interfaces and Copy enums (Decision 0096). Lowering and
+    /// validation both ask this one function.
+    pub const fn for_element(ty: Type) -> Option<Self> {
+        match ty {
+            Type::Scalar(ScalarType::Integer(integer)) if integer.is_signed() => {
+                Some(Self::SignedInteger(integer.bit_width() as u8))
+            }
+            Type::Scalar(ScalarType::Integer(integer)) => {
+                Some(Self::UnsignedInteger(integer.bit_width() as u8))
+            }
+            Type::Scalar(ScalarType::Bool) => Some(Self::Bool),
+            Type::String => Some(Self::StringBytes),
+            Type::Class(_)
+            | Type::Interface(_)
+            | Type::Scalar(ScalarType::Enum(_))
+            | Type::PayloadEnum(_) => Some(Self::Core),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -739,6 +843,73 @@ pub enum StaticValue {
     String(String),
     Null,
     PayloadEnum(PayloadEnumConstant),
+    ForeignAggregate(ForeignAggregateConstant),
+}
+
+/// A foreign struct or union built from constant fields (Decision 0148
+/// section 6): every byte zero, with each field's value stored at its
+/// offset in the target's C layout. A union holds at most one field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAggregateConstant {
+    pub ty: ForeignAggregateType,
+    pub fields: Vec<ForeignFieldConstant>,
+}
+
+/// One constant field: `value`, of the field's type `ty`, at `offset`
+/// bytes from the start of the aggregate. `ty` is a scalar, a nullable
+/// pointer, whose `null` is address zero, or a nested foreign struct or
+/// union.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignFieldConstant {
+    pub offset: u64,
+    pub ty: Type,
+    pub value: StaticValue,
+}
+
+impl ForeignAggregateConstant {
+    /// The aggregate's bytes on the target: zero, with each field's bytes
+    /// in the target's byte order at its offset. Static data of the
+    /// aggregate is exactly these bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0; self.ty.size as usize];
+        for (offset, value) in self.scalar_fields() {
+            let data = value.data_bytes();
+            let start = offset as usize;
+            bytes[start..start + data.len()].copy_from_slice(&data);
+        }
+        bytes
+    }
+
+    /// The bytes of the value present in a `?Name` static: the presence
+    /// byte 1 at offset 0 and [`Self::bytes`] at the payload offset, in the
+    /// nullable inline layout of its type.
+    pub fn nullable_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0; self.ty.nullable_size as usize];
+        bytes[0] = 1;
+        let start = self.ty.nullable_payload_offset as usize;
+        bytes[start..start + self.ty.size as usize].copy_from_slice(&self.bytes());
+        bytes
+    }
+
+    /// Each scalar field's bytes and absolute offset, nested aggregates
+    /// included; a `null` pointer is zero and stores nothing.
+    pub fn scalar_fields(&self) -> Vec<(u64, ScalarValue)> {
+        let mut scalars = Vec::new();
+        self.collect_scalars(0, &mut scalars);
+        scalars
+    }
+
+    fn collect_scalars(&self, base: u64, scalars: &mut Vec<(u64, ScalarValue)>) {
+        for field in &self.fields {
+            match &field.value {
+                StaticValue::Scalar(value) => scalars.push((base + field.offset, *value)),
+                StaticValue::ForeignAggregate(nested) => {
+                    nested.collect_scalars(base + field.offset, scalars)
+                }
+                StaticValue::Null | StaticValue::String(_) | StaticValue::PayloadEnum(_) => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -757,6 +928,14 @@ pub struct Class {
     pub arguments: Vec<Type>,
     pub source_span: Span,
     pub is_open: bool,
+    /// Whether reachable code constructs the class or a class derived from
+    /// it (Decision 0148 section 17). An unconstructed class has no instance:
+    /// no constructor or destructor is emitted for it.
+    pub constructed: bool,
+    /// Whether the class's interface implementations are emitted: reachable
+    /// code constructs it or names it, or a class derived from it, as a type,
+    /// and dispatches to their witnesses through a conformance.
+    pub implementations_reached: bool,
     pub parent: Option<ClassId>,
     pub ancestors: Vec<ClassId>,
     pub virtual_methods: Vec<VirtualMethodSlot>,
@@ -911,7 +1090,8 @@ pub enum DiagnosticFrame {
     Authored,
     /// A dispatch adapter forwards to this authored implementation.
     Forwarded(FunctionId),
-    /// A compiler-owned collection entry executes at the caller's site.
+    /// A compiler-known function, or a compiler-owned collection entry,
+    /// executes at the caller's site.
     Caller,
 }
 
@@ -937,6 +1117,9 @@ pub struct Function {
     pub locals: Vec<Local>,
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
+    /// The function's unsafe regions in source order (Decision 0148
+    /// sections 22 and 23).
+    pub unsafe_regions: Vec<UnsafeRegion>,
 }
 
 impl PartialEq for Function {
@@ -959,6 +1142,7 @@ impl PartialEq for Function {
             && self.locals == other.locals
             && self.blocks == other.blocks
             && self.entry_block == other.entry_block
+            && self.unsafe_regions == other.unsafe_regions
     }
 }
 
@@ -982,6 +1166,29 @@ impl Function {
         })
     }
 
+    /// Whether writes to a parameter go to the caller's place through its
+    /// borrow home: a retained writable constructor input, and a writable
+    /// Copy parameter of a function or method. A closure receives such a
+    /// parameter's address directly, and a move-owned value is changed
+    /// through the value it already shares.
+    pub fn writes_through_parameter_home(&self, local: LocalId) -> bool {
+        self.promotes_writable_input(local)
+            || self.closure.is_none()
+                && self
+                    .params
+                    .iter()
+                    .position(|parameter| *parameter == local)
+                    .is_some_and(|index| {
+                        (index > 0 || self.receiver_mode.is_none())
+                            && self.parameter_modes.get(index)
+                                == Some(&FunctionParameterMode::Writable)
+                            && self
+                                .locals
+                                .get(local.0)
+                                .is_some_and(|definition| !definition.ty.has_move_ownership())
+                    })
+    }
+
     pub(crate) fn promotes_writable_input(&self, local: LocalId) -> bool {
         self.retains_writable_input(local)
             && self
@@ -1002,6 +1209,31 @@ impl Function {
         self.diagnostic_frame == DiagnosticFrame::Authored
     }
 
+    /// Whether this is an extern declaration's function, whose body is its
+    /// foreign call of the declaration's symbol (Decision 0148 section 15).
+    pub fn is_foreign_binding(&self) -> bool {
+        self.foreign_calls()
+            .any(|function| matches!(function.callee, ForeignCallee::Symbol { .. }))
+    }
+
+    /// Whether this function calls into C: an extern declaration's body,
+    /// or a call of a C function pointer value (section 12).
+    pub fn calls_foreign_code(&self) -> bool {
+        self.foreign_calls().next().is_some()
+    }
+
+    fn foreign_calls(&self) -> impl Iterator<Item = &ForeignFunction> {
+        self.blocks.iter().flat_map(|block| {
+            block
+                .statements
+                .iter()
+                .filter_map(|statement| match statement {
+                    Statement::ForeignCall { function, .. } => Some(function.as_ref()),
+                    _ => None,
+                })
+        })
+    }
+
     pub fn uses_virtual_receiver_abi(&self) -> bool {
         self.virtual_slot.is_some() && self.receiver_mode.is_some()
     }
@@ -1013,14 +1245,13 @@ impl Function {
             .iter()
             .position(|parameter| *parameter == local)
             .is_some_and(|index| {
+                // A writable parameter of any type lends the caller's place
+                // (Andrew's ruling of 2026-11-21, "Writable always borrows").
                 self.parameter_modes.get(index) == Some(&FunctionParameterMode::Writable)
                     && (self.closure.is_some()
                         || self.promotes_writable_input(local)
-                        || (index > 0 || self.receiver_mode.is_none())
-                            && self
-                                .locals
-                                .get(local.0)
-                                .is_some_and(|definition| definition.ty.has_move_ownership()))
+                        || index > 0
+                        || self.receiver_mode.is_none())
             })
             || self.closure.as_ref().is_some_and(|closure| {
                 closure
@@ -1271,6 +1502,33 @@ impl ScalarValue {
             Self::Inline(value) => ScalarType::Inline(value.ty),
         }
     }
+
+    /// The value's storage bytes in the target's byte order. Native code
+    /// generation targets the host, so the host order is the target's.
+    pub fn data_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Integer(value) => match value.ty.bit_width() {
+                8 => vec![value.bits as u8],
+                16 => (value.bits as u16).to_ne_bytes().to_vec(),
+                32 => (value.bits as u32).to_ne_bytes().to_vec(),
+                64 => value.bits.to_ne_bytes().to_vec(),
+                width => unreachable!("canonical Doria integer has unsupported width {width}"),
+            },
+            Self::Float(value) => match value.ty {
+                FloatType::Float32 => (value.bits as u32).to_ne_bytes().to_vec(),
+                FloatType::Float64 => value.bits.to_ne_bytes().to_vec(),
+            },
+            Self::Bool(value) => vec![u8::from(value)],
+            Self::Enum(value) => (value.case_id.index as u32).to_ne_bytes().to_vec(),
+            Self::Inline(value) => {
+                if value.ty.storage_bytes() == 8 {
+                    (value.bits as u64).to_ne_bytes().to_vec()
+                } else {
+                    value.bits.to_ne_bytes().to_vec()
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1281,14 +1539,23 @@ pub struct Local {
     pub writable: bool,
     pub owned: bool,
     pub synthetic: bool,
+    /// The source binding the local lowers, when it lowers one: a
+    /// parameter, a receiver, a declared local, a loop, catch or match
+    /// binding, or a closure capture. A backend that keeps its own place
+    /// for a binding (PHP output) reaches the local's value there through
+    /// this identity. Temporaries and compiler-introduced locals have none.
+    pub binding: Option<BindingId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     Scalar(ScalarType),
     String,
-    ByteRegion(ByteRegionKind),
-    NullableByteRegion(ByteRegionKind),
+    /// A borrowed region: a byte region over `Bytes` or a string's bytes,
+    /// or a typed array region over a `T[]` (Decisions 0110 and 0148
+    /// section 8). Both are the inline data pointer and length.
+    Region(RegionType),
+    NullableRegion(RegionType),
     Mixed,
     NullableScalar(ScalarType),
     NullableString,
@@ -1316,6 +1583,103 @@ pub enum Type {
     Function(FunctionTypeId),
     NullableFunction(FunctionTypeId),
     ClosureEnvironment(Option<ClosureEnvironmentLayoutId>),
+    /// A foreign struct or union (Decision 0148 section 6): an inline Copy
+    /// value held in memory with its C layout. It needs no cleanup.
+    ForeignAggregate(ForeignAggregateType),
+    /// `?Name` of a foreign struct or union: the value in the nullable
+    /// inline layout its type records, a presence byte and the C layout.
+    NullableForeignAggregate(ForeignAggregateType),
+}
+
+/// What a region views and the access it grants (Decision 0110's byte
+/// regions, generalized to typed array regions by Decision 0148 section 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegionType {
+    pub access: ByteRegionKind,
+    /// The `T[]` whose elements a typed array region views; `None` for a
+    /// byte region over `Bytes` or a string's UTF-8 bytes.
+    pub array: Option<CollectionTypeId>,
+}
+
+impl RegionType {
+    /// A byte region with `access`.
+    pub const fn bytes(access: ByteRegionKind) -> Self {
+        Self {
+            access,
+            array: None,
+        }
+    }
+
+    pub const fn is_writable(self) -> bool {
+        self.access.is_writable()
+    }
+
+    /// The same view with `access`, as a readonly reborrow of a writable
+    /// region has.
+    pub const fn with_access(self, access: ByteRegionKind) -> Self {
+        Self { access, ..self }
+    }
+}
+
+/// A foreign struct or union as a value type: its definition and the size
+/// and alignment of its C layout on the native target, so storage for one
+/// is sized without a lookup. `?Name` stores the value in the shared
+/// nullable inline layout (`crate::enums::nullable_inline_layout`): a
+/// presence byte at offset 0 and the C layout at `nullable_payload_offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForeignAggregateType {
+    pub id: ForeignAggregateId,
+    pub size: u32,
+    pub align: u32,
+    pub nullable_size: u32,
+    pub nullable_payload_offset: u32,
+}
+
+impl ForeignAggregateType {
+    pub const fn storage_size(self, nullable: bool) -> u32 {
+        if nullable {
+            self.nullable_size
+        } else {
+            self.size
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ForeignAggregateId(pub usize);
+
+/// A foreign struct or union of the program: its canonical name and its C
+/// layout on the native target, which field accesses, the C ABI
+/// classification and MIR validation read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignAggregateDefinition {
+    pub id: ForeignAggregateId,
+    pub name: String,
+    pub layout: std::sync::Arc<crate::c_layout::CRecord>,
+}
+
+impl ForeignAggregateDefinition {
+    /// The value type, or `None` when the C layout or its nullable form does
+    /// not fit the 32-bit sizes MIR storage uses.
+    pub fn checked_ty(&self) -> Option<ForeignAggregateType> {
+        let shape = crate::enums::LayoutShape {
+            size: u32::try_from(self.layout.size).ok()?,
+            align: u32::try_from(self.layout.align).ok()?,
+        };
+        let nullable = crate::enums::nullable_inline_layout(shape).ok()?;
+        Some(ForeignAggregateType {
+            id: self.id,
+            size: shape.size,
+            align: shape.align,
+            nullable_size: nullable.size,
+            nullable_payload_offset: nullable.payload_offset,
+        })
+    }
+
+    pub fn ty(&self) -> ForeignAggregateType {
+        self.checked_ty()
+            .expect("a lowered foreign layout and its nullable form fit in u32")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1334,6 +1698,74 @@ impl PayloadEnumType {
             self.nullable_size
         } else {
             self.size
+        }
+    }
+}
+
+/// How a collection stores an element held inline by value: a payload enum
+/// or a foreign struct or union, each also as `?T` in the shared nullable
+/// inline layout. The collection runtime copies `size` bytes per element
+/// at a stride rounded to `align`. An access that may find no element
+/// builds the value's nullable form from `value_size`, `nullable_size` and
+/// `nullable_payload_offset`. Only a payload enum's elements have drop
+/// glue; a foreign aggregate is bytes (Decision 0148 section 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlineElementStorage {
+    pub size: u32,
+    pub align: u32,
+    pub nullable: bool,
+    pub value_size: u32,
+    pub nullable_size: u32,
+    pub nullable_payload_offset: u32,
+    /// The element's payload enum, when it is one.
+    pub payload_enum: Option<PayloadEnumType>,
+}
+
+impl InlineElementStorage {
+    /// The inline storage of elements of type `ty`, or `None` when the
+    /// collection stores them another way.
+    pub const fn of(ty: Type) -> Option<Self> {
+        let (value_size, align, nullable_size, nullable_payload_offset, nullable, payload_enum) =
+            match ty {
+                Type::PayloadEnum(payload) | Type::NullablePayloadEnum(payload) => (
+                    payload.size,
+                    payload.align,
+                    payload.nullable_size,
+                    payload.nullable_payload_offset,
+                    matches!(ty, Type::NullablePayloadEnum(_)),
+                    Some(payload),
+                ),
+                Type::ForeignAggregate(aggregate) | Type::NullableForeignAggregate(aggregate) => (
+                    aggregate.size,
+                    aggregate.align,
+                    aggregate.nullable_size,
+                    aggregate.nullable_payload_offset,
+                    matches!(ty, Type::NullableForeignAggregate(_)),
+                    None,
+                ),
+                _ => return None,
+            };
+        Some(Self {
+            size: if nullable { nullable_size } else { value_size },
+            align,
+            nullable,
+            value_size,
+            nullable_size,
+            nullable_payload_offset,
+            payload_enum,
+        })
+    }
+
+    /// The stored element with `nullable` stored nullability.
+    pub const fn with_nullable(self, nullable: bool) -> Self {
+        Self {
+            size: if nullable {
+                self.nullable_size
+            } else {
+                self.value_size
+            },
+            nullable,
+            ..self
         }
     }
 }
@@ -1383,6 +1815,11 @@ impl SharedAccessType {
 }
 
 impl Type {
+    /// A present region with writable access.
+    pub const fn is_writable_region(self) -> bool {
+        matches!(self, Self::Region(region) if region.is_writable())
+    }
+
     pub const ERROR: Self = Self::Interface(InterfaceTypeId::ERROR);
     pub const NULLABLE_ERROR: Self = Self::NullableInterface(InterfaceTypeId::ERROR);
 
@@ -1417,6 +1854,16 @@ impl Type {
         }
     }
 
+    /// Whether a handle holds a value of this type: a class value or the
+    /// strong claim of a `SharedReference<T>` or `WritableSharedReference<T>`
+    /// (Decision 0148 section 11). [`Program::handle_carrier`] says how.
+    pub const fn is_handle_value(self) -> bool {
+        matches!(
+            self,
+            Self::Class(_) | Self::SharedReference(_) | Self::WritableSharedReference(_)
+        )
+    }
+
     pub const fn shared_interface(self) -> Option<InterfaceTypeId> {
         match self.shared_payload() {
             Some(SharedPayload::Interface(interface)) => Some(interface),
@@ -1428,8 +1875,14 @@ impl Type {
         matches!(
             self,
             Self::Mixed
-                | Self::ByteRegion(ByteRegionKind::Writable)
-                | Self::NullableByteRegion(ByteRegionKind::Writable)
+                | Self::Region(RegionType {
+                    access: ByteRegionKind::Writable,
+                    ..
+                })
+                | Self::NullableRegion(RegionType {
+                    access: ByteRegionKind::Writable,
+                    ..
+                })
                 | Self::NullableMixed
                 | Self::Interface(_)
                 | Self::NullableInterface(_)
@@ -1558,8 +2011,8 @@ pub struct BasicBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
-    ByteRegionLength(LocalId),
-    ByteRegionIndex {
+    RegionLength(LocalId),
+    RegionIndex {
         region: LocalId,
         index: Box<Rvalue>,
         index_span: Span,
@@ -1602,6 +2055,12 @@ pub enum StringIntrinsicKind {
     /// Compiler-private unboxed Hashable operation over exact UTF-8 bytes.
     Hash,
     GraphemeLength,
+    DisplayWidth,
+    /// Compiler-private: the end of the grapheme cluster at a byte offset
+    /// (Decision 0147's `$text->graphemes` cursor).
+    GraphemeBoundaryAfter,
+    /// Compiler-private: the text between two cluster boundaries.
+    TextBetween,
     ByteLength,
     IsEmpty,
     ToBytes,
@@ -1778,8 +2237,8 @@ impl NullableFunctionExpression {
 pub enum Rvalue {
     Value(ValueExpression),
     String(StringExpression),
-    ByteRegion(ByteRegionExpression),
-    NullableByteRegion(NullableByteRegionExpression),
+    Region(RegionExpression),
+    NullableRegion(NullableRegionExpression),
     Mixed(MixedExpression),
     NullableScalar(NullableScalarExpression),
     NullableString(NullableStringExpression),
@@ -1804,6 +2263,402 @@ pub enum Rvalue {
     NullablePayloadEnum(NullablePayloadEnumExpression),
     Function(FunctionExpression),
     NullableFunction(NullableFunctionExpression),
+    ForeignAggregate(ForeignAggregateExpression),
+    NullableForeignAggregate(NullableForeignAggregateExpression),
+}
+
+/// A foreign struct or union value (Decision 0148 section 6). Each form
+/// produces the value's bytes; storing one copies them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignAggregateExpression {
+    /// `new Name(...)`: every byte zero, then each field stored at its
+    /// offset in order. A union stores at most one member.
+    Construct {
+        ty: ForeignAggregateType,
+        fields: Vec<ForeignFieldValue>,
+        span: Span,
+    },
+    /// A copy of the value `local` holds.
+    Local {
+        ty: ForeignAggregateType,
+        local: LocalId,
+    },
+    /// A copy of the value the stored property `property` of the class
+    /// value `object` holds.
+    Property {
+        ty: ForeignAggregateType,
+        object: LocalId,
+        property: PropertyId,
+    },
+    /// A copy of the value the static property `id` holds.
+    Static {
+        ty: ForeignAggregateType,
+        id: StaticId,
+    },
+    Call {
+        ty: ForeignAggregateType,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        span: Span,
+    },
+    /// A copy of the value the `?Name` local `local` holds, which checking
+    /// has narrowed to present.
+    NullableLocalAssumeNonNull {
+        ty: ForeignAggregateType,
+        local: LocalId,
+    },
+    /// A copy of the element of the collection `collection` at `index`: a
+    /// position of a `List<Name>` or `Name[]` when `positional`, otherwise
+    /// a key of a Dictionary family. With `remove` the element leaves the
+    /// collection (`removeAt`) and the copy is its value. A missing element
+    /// panics as indexing does.
+    CollectionIndex {
+        ty: ForeignAggregateType,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+        positional: bool,
+        remove: bool,
+    },
+    /// A copy of element `index` of the typed array region `region`
+    /// (Decision 0148 section 8), bounds-checked as `Name[]` indexing is.
+    RegionIndex {
+        ty: ForeignAggregateType,
+        region: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+    },
+    /// A copy of the payload of the `mixed` local `mixed`, which a
+    /// dominating exact `is` proved holds a `ty` value.
+    MixedPayload {
+        ty: ForeignAggregateType,
+        mixed: LocalId,
+    },
+}
+
+impl ForeignAggregateExpression {
+    pub const fn ty(&self) -> ForeignAggregateType {
+        match self {
+            Self::Construct { ty, .. }
+            | Self::Local { ty, .. }
+            | Self::Property { ty, .. }
+            | Self::Static { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::NullableLocalAssumeNonNull { ty, .. }
+            | Self::CollectionIndex { ty, .. }
+            | Self::RegionIndex { ty, .. }
+            | Self::MixedPayload { ty, .. } => *ty,
+        }
+    }
+}
+
+/// A `?Name` value of a foreign struct or union (Decision 0148 section 6).
+/// Each form produces the value's bytes in the nullable inline layout of
+/// its type; storing one copies them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableForeignAggregateExpression {
+    Null(ForeignAggregateType),
+    Present(ForeignAggregateExpression),
+    Local {
+        ty: ForeignAggregateType,
+        local: LocalId,
+    },
+    Property {
+        ty: ForeignAggregateType,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Static {
+        ty: ForeignAggregateType,
+        id: StaticId,
+    },
+    Call {
+        ty: ForeignAggregateType,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        span: Span,
+    },
+    /// A copy of the element of the collection of `?Name` values
+    /// `collection` at `index`, as
+    /// `ForeignAggregateExpression::CollectionIndex` reads one.
+    CollectionIndex {
+        ty: ForeignAggregateType,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+        positional: bool,
+        remove: bool,
+    },
+    /// An element that may be absent: `get`, `pop` and the Deque and
+    /// Dictionary accessors `access` names, with `key` the position or key
+    /// it reads. `stored_nullable` says whether the collection stores
+    /// `?Name`, so a present element may itself be `null`.
+    CollectionGet {
+        ty: ForeignAggregateType,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+        stored_nullable: bool,
+        index_span: Span,
+    },
+}
+
+impl NullableForeignAggregateExpression {
+    pub const fn ty(&self) -> ForeignAggregateType {
+        match self {
+            Self::Null(ty)
+            | Self::Local { ty, .. }
+            | Self::Property { ty, .. }
+            | Self::Static { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::CollectionIndex { ty, .. }
+            | Self::CollectionGet { ty, .. } => *ty,
+            Self::Present(value) => value.ty(),
+        }
+    }
+}
+
+/// Storage that holds an inline Copy value in place (Decision 0148
+/// sections 6 and 7): a local, a narrowed nullable local, a stored class
+/// property, a static property, a collection element or a region element.
+/// A foreign field access finds its aggregate here, so a write through a
+/// property changes the object or the static, and `Pointer::to` addresses
+/// the same storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InlinePlace {
+    Local(LocalId),
+    /// The value of the `?Name` or `?T` local `local`, which checking has
+    /// narrowed to present, in place at its payload offset.
+    NullableLocalAssumeNonNull(LocalId),
+    Property {
+        object: LocalId,
+        property: PropertyId,
+    },
+    /// The value of a stored `?Name` property, which the enclosing
+    /// null-safe access found present, in place at its payload offset.
+    NullablePropertyAssumeNonNull {
+        object: LocalId,
+        property: PropertyId,
+    },
+    Static(StaticId),
+    /// The value of a `?Name` static property, which the enclosing
+    /// null-safe access found present, in place at its payload offset.
+    NullableStaticAssumeNonNull(StaticId),
+    /// The element of the collection `collection` at the position or key
+    /// `index` holds, in its slot, as
+    /// `ForeignAggregateExpression::CollectionIndex` finds it.
+    CollectionElement {
+        collection: LocalId,
+        index: LocalId,
+        positional: bool,
+        index_span: Span,
+    },
+    /// The value of the `?Name` element `CollectionElement` would name,
+    /// which the enclosing null-safe access found present, in place at its
+    /// payload offset.
+    NullableCollectionElementAssumeNonNull {
+        collection: LocalId,
+        index: LocalId,
+        positional: bool,
+        index_span: Span,
+    },
+    /// Element `index` of the typed array region `region`, in the viewed
+    /// storage.
+    RegionElement {
+        region: LocalId,
+        index: LocalId,
+        index_span: Span,
+    },
+}
+
+impl fmt::Display for ForeignAggregateExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Construct { ty, fields, .. } => {
+                let fields = fields
+                    .iter()
+                    .map(|field| format!("@{}: {}", field.offset, field.value))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, "foreign_aggregate#{}{{{fields}}}", ty.id.0)
+            }
+            Self::Local { local, .. } => {
+                write!(formatter, "copy local{}", local.0)
+            }
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "copy local{}->property{}",
+                object.0, property.index
+            ),
+            Self::Static { id, .. } => {
+                write!(formatter, "copy static{}", id.0)
+            }
+            Self::Call { function, args, .. } => {
+                let args = args
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, "call fn{}({args})", function.0)
+            }
+            Self::NullableLocalAssumeNonNull { local, .. } => {
+                write!(formatter, "copy assume_non_null(local{})", local.0)
+            }
+            Self::CollectionIndex {
+                collection,
+                index,
+                remove,
+                ..
+            } => write_collection_index(formatter, *collection, index, *remove),
+            Self::RegionIndex { region, index, .. } => {
+                write!(formatter, "copy local{}[{index}]", region.0)
+            }
+            Self::MixedPayload { mixed, .. } => {
+                write!(formatter, "copy payload(local{})", mixed.0)
+            }
+        }
+    }
+}
+
+fn write_collection_index(
+    formatter: &mut fmt::Formatter<'_>,
+    collection: LocalId,
+    index: &Rvalue,
+    remove: bool,
+) -> fmt::Result {
+    if remove {
+        write!(formatter, "remove local{}[{index}]", collection.0)
+    } else {
+        write!(formatter, "copy local{}[{index}]", collection.0)
+    }
+}
+
+impl fmt::Display for NullableForeignAggregateExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null(ty) => write!(formatter, "null(?foreign_aggregate#{})", ty.id.0),
+            Self::Present(value) => write!(formatter, "present({value})"),
+            Self::Local { local, .. } => write!(formatter, "copy local{}", local.0),
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "copy local{}->property{}",
+                object.0, property.index
+            ),
+            Self::Static { id, .. } => write!(formatter, "copy static{}", id.0),
+            Self::Call { function, args, .. } => {
+                let args = args
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, "call fn{}({args})", function.0)
+            }
+            Self::CollectionIndex {
+                collection,
+                index,
+                remove,
+                ..
+            } => write_collection_index(formatter, *collection, index, *remove),
+            Self::CollectionGet {
+                collection,
+                key,
+                access,
+                ..
+            } => write!(formatter, "{access:?} local{}[{key}]", collection.0),
+        }
+    }
+}
+
+impl InlinePlace {
+    /// The place that holds the `?T` value whose present payload this
+    /// narrowed place is, or `None` for a place that is not narrowed.
+    pub fn nullable_holder(self) -> Option<Self> {
+        match self {
+            Self::NullableLocalAssumeNonNull(local) => Some(Self::Local(local)),
+            Self::NullablePropertyAssumeNonNull { object, property } => {
+                Some(Self::Property { object, property })
+            }
+            Self::NullableStaticAssumeNonNull(id) => Some(Self::Static(id)),
+            Self::NullableCollectionElementAssumeNonNull {
+                collection,
+                index,
+                positional,
+                index_span,
+            } => Some(Self::CollectionElement {
+                collection,
+                index,
+                positional,
+                index_span,
+            }),
+            Self::Local(_)
+            | Self::Property { .. }
+            | Self::Static(_)
+            | Self::CollectionElement { .. }
+            | Self::RegionElement { .. } => None,
+        }
+    }
+
+    /// The stored class property this place is in, narrowed or not, as its
+    /// object local and property.
+    pub fn stored_property(self) -> Option<(LocalId, PropertyId)> {
+        match self.nullable_holder().unwrap_or(self) {
+            Self::Property { object, property } => Some((object, property)),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for InlinePlace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(local) => write!(formatter, "local{}", local.0),
+            Self::NullableLocalAssumeNonNull(local) => {
+                write!(formatter, "assume_non_null(local{})", local.0)
+            }
+            Self::Property { object, property } => {
+                write!(formatter, "local{}->property{}", object.0, property.index)
+            }
+            Self::NullablePropertyAssumeNonNull { object, property } => write!(
+                formatter,
+                "assume_non_null(local{}->property{})",
+                object.0, property.index
+            ),
+            Self::Static(id) => write!(formatter, "static{}", id.0),
+            Self::NullableStaticAssumeNonNull(id) => {
+                write!(formatter, "assume_non_null(static{})", id.0)
+            }
+            Self::CollectionElement {
+                collection, index, ..
+            } => write!(formatter, "local{}[local{}]", collection.0, index.0),
+            Self::NullableCollectionElementAssumeNonNull {
+                collection, index, ..
+            } => write!(
+                formatter,
+                "assume_non_null(local{}[local{}])",
+                collection.0, index.0
+            ),
+            Self::RegionElement { region, index, .. } => {
+                write!(formatter, "local{}[local{}]", region.0, index.0)
+            }
+        }
+    }
+}
+
+/// One field a construction stores: `value`, of the field's type, at
+/// `offset` bytes from the start of the aggregate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignFieldValue {
+    pub offset: u64,
+    pub value: Rvalue,
+    /// A fixed-length array field `T[N]` supplied from a region (Decision
+    /// 0148 section 6, amended 2026-11-16): `Some(N)`, and `value` is a
+    /// readonly typed array region whose `N` elements are copied. Another
+    /// length panics with P1704 at the construction.
+    pub copied_elements: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1837,8 +2692,8 @@ impl Rvalue {
         match self {
             Self::Value(value) => Type::Scalar(value.ty()),
             Self::String(_) => Type::String,
-            Self::ByteRegion(value) => Type::ByteRegion(value.kind()),
-            Self::NullableByteRegion(value) => Type::NullableByteRegion(value.kind()),
+            Self::Region(value) => Type::Region(value.kind()),
+            Self::NullableRegion(value) => Type::NullableRegion(value.kind()),
             Self::Mixed(_) => Type::Mixed,
             Self::NullableScalar(value) => Type::NullableScalar(value.ty()),
             Self::NullableString(_) => Type::NullableString,
@@ -1867,6 +2722,8 @@ impl Rvalue {
             Self::NullablePayloadEnum(value) => Type::NullablePayloadEnum(value.ty()),
             Self::Function(value) => Type::Function(value.function_type()),
             Self::NullableFunction(value) => Type::NullableFunction(value.function_type()),
+            Self::ForeignAggregate(value) => Type::ForeignAggregate(value.ty()),
+            Self::NullableForeignAggregate(value) => Type::NullableForeignAggregate(value.ty()),
         }
     }
 
@@ -1878,8 +2735,8 @@ impl Rvalue {
             | Self::NullableCollection(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -1899,7 +2756,9 @@ impl Rvalue {
             | Self::SharedReferenceAccess(_)
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
-            | Self::NullablePayloadEnum(_) => None,
+            | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_) => None,
         }
     }
 
@@ -1907,8 +2766,8 @@ impl Rvalue {
         match self {
             Self::Collection(value) => value.owned_temporary_collection(),
             Self::NullableCollection(value) => value.owned_temporary_collection(),
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -1931,6 +2790,8 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -1976,8 +2837,8 @@ impl Rvalue {
                     OwnedSharedTemporary::ReadonlyAccess
                 })
             }
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -1992,6 +2853,8 @@ impl Rvalue {
             | Self::NullableCollection(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -2009,8 +2872,8 @@ impl Rvalue {
         match self {
             Self::Class(value) => value.borrows_class_value(),
             Self::NullableClass(value) => value.borrows_class_value(),
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -2033,6 +2896,8 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => false,
         }
@@ -2043,8 +2908,8 @@ impl Rvalue {
             return false;
         }
         match self {
-            Self::ByteRegion(value) => value.borrows_descriptor(),
-            Self::NullableByteRegion(value) => value.borrows_descriptor(),
+            Self::Region(value) => value.borrows_descriptor(),
+            Self::NullableRegion(value) => value.borrows_descriptor(),
             Self::Class(value) => value.borrows_class_value(),
             Self::NullableClass(value) => value.borrows_class_value(),
             Self::Collection(value) => value.owned_temporary_collection().is_none(),
@@ -2076,7 +2941,11 @@ impl Rvalue {
                 matches!(value.ty(), ScalarType::Inline(ty) if ty.requires_owned_cleanup())
                     && !value.owned_inline_temporary()
             }
-            Self::Value(_) | Self::String(_) | Self::NullableString(_) => false,
+            Self::Value(_)
+            | Self::String(_)
+            | Self::NullableString(_)
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_) => false,
         }
     }
 
@@ -2087,7 +2956,7 @@ impl Rvalue {
         matches!(
             self,
             Self::NullableScalar(NullableScalarExpression::Null(_))
-                | Self::NullableByteRegion(NullableByteRegionExpression::Null { .. })
+                | Self::NullableRegion(NullableRegionExpression::Null { .. })
                 | Self::NullableCollection(NullableCollectionExpression::Null(_))
                 | Self::NullableSharedReference(NullableSharedReferenceExpression::Null(_))
                 | Self::NullableWeakReference(NullableWeakReferenceExpression::Null(_))
@@ -2153,26 +3022,26 @@ impl Rvalue {
                 NullableScalarExpression::Local { local, .. } => Some(*local),
                 _ => None,
             },
-            Self::ByteRegion(ByteRegionExpression::Local {
+            Self::Region(RegionExpression::Local {
                 local,
                 transfer: true,
                 ..
             })
-            | Self::NullableByteRegion(NullableByteRegionExpression::Local {
+            | Self::NullableRegion(NullableRegionExpression::Local {
                 local,
                 transfer: true,
                 ..
             }) => Some(*local),
-            Self::ByteRegion(ByteRegionExpression::AssumePresent { value, .. }) => match &**value {
-                NullableByteRegionExpression::Local {
+            Self::Region(RegionExpression::AssumePresent { value, .. }) => match &**value {
+                NullableRegionExpression::Local {
                     local,
                     transfer: true,
                     ..
                 } => Some(*local),
                 _ => None,
             },
-            Self::NullableByteRegion(NullableByteRegionExpression::Present(value)) => match value {
-                ByteRegionExpression::Local {
+            Self::NullableRegion(NullableRegionExpression::Present(value)) => match value {
+                RegionExpression::Local {
                     local,
                     transfer: true,
                     ..
@@ -2292,8 +3161,8 @@ impl Rvalue {
                 transfer: true,
                 ..
             }) => Some(*local),
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -2314,6 +3183,8 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => None,
         }
@@ -2380,10 +3251,8 @@ impl Rvalue {
                 NullableScalarExpression::Local { local, .. } => Some(*local),
                 _ => None,
             },
-            Self::ByteRegion(ByteRegionExpression::Local { local, .. })
-            | Self::NullableByteRegion(NullableByteRegionExpression::Local { local, .. }) => {
-                Some(*local)
-            }
+            Self::Region(RegionExpression::Local { local, .. })
+            | Self::NullableRegion(NullableRegionExpression::Local { local, .. }) => Some(*local),
             Self::String(
                 StringExpression::Local(local)
                 | StringExpression::NullableLocalAssumeNonNull(local),
@@ -2453,6 +3322,14 @@ impl Rvalue {
                 place:
                     PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
                 ..
+            })
+            | Self::ForeignAggregate(
+                ForeignAggregateExpression::Local { local, .. }
+                | ForeignAggregateExpression::NullableLocalAssumeNonNull { local, .. },
+            )
+            | Self::NullableForeignAggregate(NullableForeignAggregateExpression::Local {
+                local,
+                ..
             }) => Some(*local),
             _ => None,
         }
@@ -2462,8 +3339,8 @@ impl Rvalue {
         match self {
             Self::Mixed(value) => value.ownership(),
             Self::NullableMixed(value) => value.ownership(),
-            Self::ByteRegion(_)
-            | Self::NullableByteRegion(_)
+            Self::Region(_)
+            | Self::NullableRegion(_)
             | Self::Value(_)
             | Self::String(_)
             | Self::NullableScalar(_)
@@ -2486,6 +3363,8 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
             | Self::NullablePayloadEnum(_)
+            | Self::ForeignAggregate(_)
+            | Self::NullableForeignAggregate(_)
             | Self::Function(_)
             | Self::NullableFunction(_) => MixedOwnership::None,
         }
@@ -3861,9 +4740,9 @@ impl SharedReferenceAccessExpression {
 
 /// A region owns only its inline descriptor, never its source byte storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ByteRegionExpression {
+pub enum RegionExpression {
     CollectionIndex {
-        kind: ByteRegionKind,
+        kind: RegionType,
         collection: LocalId,
         index: Box<Rvalue>,
         index_span: Span,
@@ -3871,44 +4750,56 @@ pub enum ByteRegionExpression {
         remove: bool,
     },
     Region {
-        kind: ByteRegionKind,
+        kind: RegionType,
         source: Box<Rvalue>,
         offset: Box<Rvalue>,
         length: Box<Rvalue>,
         span: Span,
     },
     Local {
-        kind: ByteRegionKind,
+        kind: RegionType,
         local: LocalId,
         transfer: bool,
     },
     Call {
-        kind: ByteRegionKind,
+        kind: RegionType,
         function: FunctionId,
         args: Vec<Rvalue>,
         span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
     AssumePresent {
-        kind: ByteRegionKind,
-        value: Box<NullableByteRegionExpression>,
+        kind: RegionType,
+        value: Box<NullableRegionExpression>,
     },
     Coalesce {
-        kind: ByteRegionKind,
-        left: Box<NullableByteRegionExpression>,
-        right: Box<ByteRegionExpression>,
+        kind: RegionType,
+        left: Box<NullableRegionExpression>,
+        right: Box<RegionExpression>,
+    },
+    /// A region over foreign memory (Decision 0148 section 10): `length`
+    /// elements at `data`, a pointer local a
+    /// [`PointerOperation::ForeignRange`] checked. The region borrows
+    /// `owner`, the place whose destructor releases the memory, as a
+    /// region borrows its source; reading `owner` has no effect.
+    Foreign {
+        kind: RegionType,
+        owner: Box<Rvalue>,
+        data: LocalId,
+        length: LocalId,
     },
 }
 
-impl ByteRegionExpression {
-    pub const fn kind(&self) -> ByteRegionKind {
+impl RegionExpression {
+    pub const fn kind(&self) -> RegionType {
         match self {
             Self::Region { kind, .. }
             | Self::Local { kind, .. }
             | Self::Call { kind, .. }
             | Self::AssumePresent { kind, .. }
             | Self::CollectionIndex { kind, .. }
-            | Self::Coalesce { kind, .. } => *kind,
+            | Self::Coalesce { kind, .. }
+            | Self::Foreign { kind, .. } => *kind,
         }
     }
 
@@ -3921,15 +4812,15 @@ impl ByteRegionExpression {
                 Self::Coalesce { left, right, .. } => {
                     left.borrows_descriptor() || right.borrows_descriptor()
                 }
-                Self::Region { .. } | Self::Call { .. } => false,
+                Self::Region { .. } | Self::Call { .. } | Self::Foreign { .. } => false,
             }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NullableByteRegionExpression {
+pub enum NullableRegionExpression {
     CollectionIndex {
-        kind: ByteRegionKind,
+        kind: RegionType,
         collection: LocalId,
         index: Box<Rvalue>,
         index_span: Span,
@@ -3937,23 +4828,23 @@ pub enum NullableByteRegionExpression {
         remove: bool,
     },
     CollectionGet {
-        kind: ByteRegionKind,
+        kind: RegionType,
         collection: LocalId,
         key: Box<Rvalue>,
         index_span: Span,
         access: NullableCollectionAccess,
     },
     Null {
-        kind: ByteRegionKind,
+        kind: RegionType,
     },
-    Present(ByteRegionExpression),
+    Present(RegionExpression),
     Local {
-        kind: ByteRegionKind,
+        kind: RegionType,
         local: LocalId,
         transfer: bool,
     },
     Call {
-        kind: ByteRegionKind,
+        kind: RegionType,
         function: FunctionId,
         args: Vec<Rvalue>,
         span: Span,
@@ -3961,8 +4852,8 @@ pub enum NullableByteRegionExpression {
     },
 }
 
-impl NullableByteRegionExpression {
-    pub const fn kind(&self) -> ByteRegionKind {
+impl NullableRegionExpression {
+    pub const fn kind(&self) -> RegionType {
         match self {
             Self::Null { kind }
             | Self::Local { kind, .. }
@@ -4072,6 +4963,14 @@ pub enum CollectionExpression {
     ReadStdinBytes {
         collection: CollectionTypeId,
     },
+    /// `CString::from($text)` and `Utf16String::from($text)` (Decision
+    /// 0148 section 9): a new NUL-terminated buffer of the text's code
+    /// units. Text that contains NUL panics with P1705 at `span`.
+    ForeignString {
+        collection: CollectionTypeId,
+        text: Box<StringExpression>,
+        span: Span,
+    },
     StringIntrinsic(Box<StringIntrinsicCall>),
     Call {
         collection: CollectionTypeId,
@@ -4085,6 +4984,13 @@ pub enum CollectionExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NullableCollectionExpression {
     Null(CollectionTypeId),
+    /// `CString::tryFrom($text)` and `Utf16String::tryFrom($text)`: as
+    /// [`CollectionExpression::ForeignString`], absent for text that
+    /// contains NUL.
+    TryForeignString {
+        collection: CollectionTypeId,
+        text: Box<StringExpression>,
+    },
     Collection(CollectionExpression),
     Local {
         collection: CollectionTypeId,
@@ -4130,6 +5036,7 @@ impl NullableCollectionExpression {
     pub const fn collection(&self) -> CollectionTypeId {
         match self {
             Self::Null(collection)
+            | Self::TryForeignString { collection, .. }
             | Self::Local { collection, .. }
             | Self::Index { collection, .. }
             | Self::CollectionGet { collection, .. }
@@ -4167,7 +5074,8 @@ impl NullableCollectionExpression {
                 collection,
                 transfer: true,
                 ..
-            } => Some(*collection),
+            }
+            | Self::TryForeignString { collection, .. } => Some(*collection),
             Self::CollectionGet {
                 collection, access, ..
             } if access.removes_element() => Some(*collection),
@@ -4231,6 +5139,7 @@ impl CollectionExpression {
             | Self::BytesAllocate { collection, .. }
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
+            | Self::ForeignString { collection, .. }
             | Self::Call { collection, .. } => *collection,
             Self::StringIntrinsic(call) => match call.result {
                 Type::Collection(collection) => collection,
@@ -4261,6 +5170,7 @@ impl CollectionExpression {
             | Self::BytesAllocate { collection, .. }
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
+            | Self::ForeignString { collection, .. }
             | Self::Call {
                 collection,
                 return_borrow:
@@ -4315,6 +5225,15 @@ pub enum MixedTag {
     PayloadEnum(PayloadEnumType),
     Function(FunctionTypeId),
     Inline(crate::inline_value::InlineValueType),
+    /// A data or C function pointer of the exact checked pointer type. Its
+    /// payload is the one-word inline pointer value.
+    Pointer(PointerTypeId),
+    /// A foreign struct or union (Decision 0148 section 6), boxed as a copy
+    /// of its C layout.
+    ForeignAggregate(ForeignAggregateType),
+    /// A C boundary value (Decision 0148 section 5): the target integer of
+    /// its width, distinct from that integer.
+    Boundary(crate::foreign::CBoundaryType),
 }
 
 impl MixedTag {
@@ -4332,6 +5251,13 @@ impl MixedTag {
             Self::PayloadEnum(ty) => Type::PayloadEnum(ty),
             Self::Function(ty) => Type::Function(ty),
             Self::Inline(ty) => Type::Scalar(ScalarType::Inline(ty)),
+            Self::Pointer(_) => Type::Scalar(ScalarType::Inline(
+                crate::inline_value::InlineValueType::Pointer,
+            )),
+            Self::ForeignAggregate(ty) => Type::ForeignAggregate(ty),
+            Self::Boundary(boundary) => Type::Scalar(ScalarType::Integer(
+                crate::c_layout::CTarget::host().boundary_integer(boundary),
+            )),
         }
     }
 
@@ -4344,6 +5270,9 @@ impl MixedTag {
                 | Self::PayloadEnum(_)
                 | Self::Function(_)
                 | Self::Inline(_)
+                | Self::Pointer(_)
+                | Self::ForeignAggregate(_)
+                | Self::Boundary(_)
         )
     }
 }
@@ -4378,7 +5307,14 @@ pub enum MixedExpression {
         span: Span,
         return_borrow: Option<ReturnBorrow>,
     },
-    BoxValue(ValueExpression),
+    /// A scalar boxed with its exact tag. The tag is the scalar's type,
+    /// except that a pointer's names its checked pointer type.
+    BoxValue {
+        value: ValueExpression,
+        tag: MixedTag,
+    },
+    /// A copy of a foreign struct or union, tagged with its type.
+    BoxForeignAggregate(ForeignAggregateExpression),
     BoxString {
         value: StringExpression,
         payload_owned: bool,
@@ -4425,7 +5361,7 @@ impl MixedExpression {
                     }),
                 ..
             } => MixedOwnership::Owned,
-            Self::BoxValue(_) => MixedOwnership::ShellOnly,
+            Self::BoxValue { .. } | Self::BoxForeignAggregate(_) => MixedOwnership::ShellOnly,
             Self::BoxPayloadEnum { .. } => MixedOwnership::Owned,
             Self::BoxString { payload_owned, .. }
             | Self::BoxClass { payload_owned, .. }
@@ -4604,11 +5540,28 @@ pub enum NullableScalarExpression {
         collection: LocalId,
         value: Box<Rvalue>,
     },
+    /// Element `index` of the typed array region `region`, whose elements
+    /// are `?ty`: a nullable pointer stored as its word, absent at address
+    /// zero (Decision 0148 sections 3 and 8).
+    RegionIndex {
+        ty: ScalarType,
+        region: LocalId,
+        index: Box<Rvalue>,
+        index_span: Span,
+    },
     /// `Int::parse(string)` / `Float::parse(string)`: parses the string and yields
     /// `?ty`, producing the absent value when the text is not a valid number.
     Parse {
         ty: ScalarType,
         value: Box<StringExpression>,
+    },
+    /// `CLong::tryFrom($value)` and the other boundary types' `tryFrom`
+    /// (Decision 0148 section 5): `value` converted to `ty`, the integer of
+    /// `boundary` on this target, or the absent value when it does not fit.
+    TryConvert {
+        ty: IntegerType,
+        boundary: crate::foreign::CBoundaryType,
+        value: Box<IntegerExpression>,
     },
     StringIntrinsic(Box<StringIntrinsicCall>),
 }
@@ -4625,9 +5578,11 @@ impl NullableScalarExpression {
             | Self::NullSafeCall { ty, .. }
             | Self::Coalesce { ty, .. }
             | Self::DictionaryGet { ty, .. }
+            | Self::RegionIndex { ty, .. }
             | Self::Parse { ty, .. } => *ty,
             Self::EnumBacking { .. } => ScalarType::Integer(IntegerType::Int64),
             Self::CollectionIndexOf { .. } => ScalarType::Integer(IntegerType::Int64),
+            Self::TryConvert { ty, .. } => ScalarType::Integer(*ty),
             Self::TransferGroupKey { key, .. } => ScalarType::Inline(*key),
             Self::InlineClaim { ty, .. } => ScalarType::Inline(*ty),
             Self::StringIntrinsic(call) => match call.result {
@@ -5057,6 +6012,9 @@ pub enum IntegerBinaryOp {
 pub enum IntegerExpression {
     /// The bits of a one-word inline value, as `int64`.
     InlineWord(Box<InlineValueExpression>),
+    /// `ForeignCall::lastSystemCode` (Decision 0148 section 16): the code
+    /// the last capturing foreign call stored on this thread, as `int64`.
+    LastSystemCode,
     Use {
         ty: IntegerType,
         operand: Operand,
@@ -5075,11 +6033,16 @@ pub enum IntegerExpression {
         span: Span,
         right_span: Span,
     },
+    /// A checked conversion to `ty`. `boundary` names the C boundary type
+    /// (Decision 0148 section 5) the result stands for: `CLong::from`
+    /// converts to the integer of `long`'s width on this target, and a value
+    /// outside it fails with P1701 instead of P1109.
     Convert {
         ty: IntegerType,
         value: Box<IntegerExpression>,
         span: Span,
         value_span: Span,
+        boundary: Option<crate::foreign::CBoundaryType>,
     },
     FloatToInt {
         value: Box<FloatExpression>,
@@ -5104,7 +6067,7 @@ pub enum IntegerExpression {
     /// `WritableByteRegion::copyFrom`: copies the leading bytes of the
     /// readonly `source` region into the writable `destination` region and
     /// yields the count copied, the smaller of the two lengths.
-    CopyByteRegion {
+    CopyRegion {
         destination: Box<Rvalue>,
         source: Box<Rvalue>,
         span: Span,
@@ -5142,6 +6105,7 @@ impl PartialEq for IntegerExpression {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::InlineWord(left), Self::InlineWord(right)) => left == right,
+            (Self::LastSystemCode, Self::LastSystemCode) => true,
             (
                 Self::Use {
                     ty: left_ty,
@@ -5191,14 +6155,16 @@ impl PartialEq for IntegerExpression {
                 Self::Convert {
                     ty: left_ty,
                     value: left,
+                    boundary: left_boundary,
                     ..
                 },
                 Self::Convert {
                     ty: right_ty,
                     value: right,
+                    boundary: right_boundary,
                     ..
                 },
-            ) => left_ty == right_ty && left == right,
+            ) => left_ty == right_ty && left == right && left_boundary == right_boundary,
             (Self::FloatToInt { value: left, .. }, Self::FloatToInt { value: right, .. }) => {
                 left == right
             }
@@ -5239,12 +6205,12 @@ impl PartialEq for IntegerExpression {
                 },
             ) => left_enum == right_enum && left == right,
             (
-                Self::CopyByteRegion {
+                Self::CopyRegion {
                     destination: left_destination,
                     source: left_source,
                     ..
                 },
-                Self::CopyByteRegion {
+                Self::CopyRegion {
                     destination: right_destination,
                     source: right_source,
                     ..
@@ -5269,8 +6235,10 @@ impl IntegerExpression {
             | Self::Convert { ty, .. }
             | Self::Call { ty, .. }
             | Self::Coalesce { ty, .. } => *ty,
-            Self::FloatToInt { .. } | Self::InlineWord(_) => IntegerType::Int64,
-            Self::EnumBacking { .. } | Self::CopyByteRegion { .. } | Self::Terminal { .. } => {
+            Self::FloatToInt { .. } | Self::InlineWord(_) | Self::LastSystemCode => {
+                IntegerType::Int64
+            }
+            Self::EnumBacking { .. } | Self::CopyRegion { .. } | Self::Terminal { .. } => {
                 IntegerType::Int64
             }
         }
@@ -5715,7 +6683,7 @@ pub enum BoolExpression {
         target: ClassId,
     },
     NullableCollectionIsPresent(Box<NullableCollectionExpression>),
-    NullableByteRegionIsPresent(Box<NullableByteRegionExpression>),
+    NullableByteRegionIsPresent(Box<NullableRegionExpression>),
     NullableSharedReferenceIsPresent(Box<NullableSharedReferenceExpression>),
     NullableWeakReferenceIsPresent(Box<NullableWeakReferenceExpression>),
     NullableWritableSharedReferenceIsPresent(Box<NullableWritableSharedReferenceExpression>),
@@ -5724,6 +6692,7 @@ pub enum BoolExpression {
     NullableMixedIsPresent(Box<NullableMixedExpression>),
     NullableErrorIsPresent(Box<NullableInterfaceExpression>),
     NullablePayloadEnumIsPresent(Box<NullablePayloadEnumExpression>),
+    NullableForeignAggregateIsPresent(Box<NullableForeignAggregateExpression>),
     NullableFunctionIsPresent(Box<NullableFunctionExpression>),
     PayloadEnumCompare {
         op: CompareOp,
@@ -5815,7 +6784,7 @@ pub enum Statement {
     EndBorrow {
         local: LocalId,
     },
-    AssignByteRegionIndex {
+    AssignRegionIndex {
         region: LocalId,
         index: Rvalue,
         value: Rvalue,
@@ -6029,6 +6998,280 @@ pub enum Statement {
         function_type: FunctionTypeId,
         nullable: bool,
     },
+    /// One pointer operation (Decision 0148 section 4), assigning its
+    /// result, if it has one, to `target`. `span` is the operation's
+    /// source, where a misaligned access (P1702) or an address that
+    /// leaves the address space (P1703) panics.
+    Pointer {
+        target: Option<LocalId>,
+        operation: PointerOperation,
+        span: Span,
+    },
+    /// A call into C (Decision 0148 sections 12, 14 and 15), passing
+    /// `args` by copy and assigning its result, if it has one, to
+    /// `target`. A call of the symbol an extern declaration binds is the
+    /// whole body of the declaration's MIR function, so every Doria call of
+    /// a declaration reaches C through the ordinary call path. A call of a
+    /// C function pointer value is a statement of the function that calls
+    /// it.
+    ForeignCall {
+        function: Box<ForeignFunction>,
+        args: Vec<LocalId>,
+        target: Option<LocalId>,
+        span: Span,
+    },
+    /// One field access of the foreign struct or union at `aggregate`
+    /// (Decision 0148 section 6): the field, or the nested field, whose C
+    /// layout starts `offset` bytes into the aggregate. A union member
+    /// starts at offset zero, so reading one reads the bytes written last
+    /// through any member.
+    ForeignField {
+        aggregate: InlinePlace,
+        offset: u64,
+        access: ForeignFieldAccess,
+        span: Span,
+    },
+    /// Points the pointer local `target` at `size` zero-filled bytes of the
+    /// companion entry's own frame, aligned to `align`: a host operation's
+    /// argument or result record. Only companion entries
+    /// (`CompanionRegion::entry`) contain it.
+    HostRecord {
+        target: LocalId,
+        size: u64,
+        align: u64,
+    },
+    /// Moves `slot`'s value between the record the pointer local `record`
+    /// addresses and the slot's local (Decision 0148 section 23). Only
+    /// companion entries contain it.
+    RegionSlot {
+        record: LocalId,
+        slot: CompanionSlot,
+        access: SlotAccess,
+    },
+    /// `host->call(host, operation, arguments, results)` through the
+    /// `DrRegionHostV1` the pointer local `host` addresses, or, when `host`
+    /// is `None`, the host attached at load, which a callback entry calls
+    /// since C passes it none; an absent record passes a null pointer. In
+    /// version 1 every operation returns status 0, and a panic on the host
+    /// never returns. Only companion entries contain it.
+    CallHost {
+        host: Option<LocalId>,
+        operation: u32,
+        arguments: Option<LocalId>,
+        results: Option<LocalId>,
+    },
+}
+
+/// What a `Statement::ForeignField` does. The field's type is the type of
+/// `target` or of `value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignFieldAccess {
+    /// Copies the field into `target`.
+    Read { target: LocalId },
+    /// Stores `value` into the field. For a fixed-length array field `T[N]`
+    /// (Decision 0148 section 6, amended 2026-11-17), `copied_elements` is
+    /// `Some(N)` and `value` is a readonly typed array region whose `N`
+    /// elements are copied, as `ForeignFieldValue::copied_elements` at
+    /// construction; another length panics with P1704.
+    Write {
+        value: Rvalue,
+        copied_elements: Option<u64>,
+    },
+    /// A fixed-length array field `T[N]` as a typed array region of its
+    /// `length` elements (section 6), assigned to `target`. The region
+    /// borrows the aggregate; checking keeps the aggregate in place.
+    Region { target: LocalId, length: u64 },
+}
+
+/// A C function as a foreign call reaches it: how the call finds it and
+/// its C signature over MIR types.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForeignFunction {
+    pub callee: ForeignCallee,
+    /// `#[CaptureSystemCode(source)]` (section 16): the code read
+    /// immediately after the call, before any other code runs.
+    pub system_code: Option<crate::foreign::SystemCodeSource>,
+    pub parameters: Vec<Type>,
+    /// `None` for `void`.
+    pub return_type: Option<Type>,
+    /// `Some(n)` for a variadic binding with `n` fixed parameters.
+    pub fixed_parameters: Option<usize>,
+}
+
+/// Where a foreign call finds its C function.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ForeignCallee {
+    /// The symbol an extern declaration binds, in the `#[Library]` logical
+    /// library `library`; `None` is the platform C runtime (section 15).
+    Symbol {
+        symbol: String,
+        library: Option<String>,
+    },
+    /// The C function pointer value (section 12) this pointer local holds.
+    Pointer(LocalId),
+}
+
+impl ForeignFunction {
+    /// The C layout of each parameter and of the result, which
+    /// [`crate::native_abi::c_abi::classify`] takes. `None` when a type has
+    /// no C form a foreign call carries.
+    pub fn c_signature(
+        &self,
+        aggregates: &[ForeignAggregateDefinition],
+        target: crate::c_layout::CTarget,
+    ) -> Option<(Vec<crate::c_layout::CType>, Option<crate::c_layout::CType>)> {
+        let parameters = self
+            .parameters
+            .iter()
+            .map(|ty| foreign_c_type(*ty, aggregates, target))
+            .collect::<Option<Vec<_>>>()?;
+        let return_type = match self.return_type {
+            Some(ty) => Some(foreign_c_type(ty, aggregates, target)?),
+            None => None,
+        };
+        Some((parameters, return_type))
+    }
+}
+
+/// The C layout of a MIR value that crosses the C boundary: a scalar with a
+/// C layout, a pointer, whose null is address zero, or a foreign struct or
+/// union with the layout its definition records.
+pub fn foreign_c_type(
+    ty: Type,
+    aggregates: &[ForeignAggregateDefinition],
+    target: crate::c_layout::CTarget,
+) -> Option<crate::c_layout::CType> {
+    use crate::c_layout::{CScalar, CType};
+    if let Type::ForeignAggregate(aggregate) = ty {
+        let definition = aggregates.get(aggregate.id.0)?;
+        return (definition.ty() == aggregate).then(|| CType::Record(definition.layout.clone()));
+    }
+    let scalar = match ty {
+        Type::Scalar(ScalarType::Integer(integer)) => CScalar::Integer {
+            bytes: (integer.bit_width() / 8) as u8,
+            signed: integer.is_signed(),
+        },
+        Type::Scalar(ScalarType::Float(float)) => CScalar::Float {
+            bytes: (float.bit_width() / 8) as u8,
+        },
+        Type::Scalar(ScalarType::Bool) => CScalar::Bool,
+        Type::Scalar(ScalarType::Inline(crate::inline_value::InlineValueType::Pointer))
+        | Type::NullableScalar(ScalarType::Inline(crate::inline_value::InlineValueType::Pointer)) => {
+            CScalar::Pointer
+        }
+        _ => return None,
+    };
+    debug_assert_eq!(target.pointer_bytes(), 8);
+    Some(CType::Scalar(scalar))
+}
+
+/// What a `Statement::Pointer` does. Every pointer is the inline pointer
+/// value of the local it names; `ty` is what the C layout reads or writes:
+/// a scalar, aligned to its size, or a foreign struct or union, aligned as
+/// its layout is (`native_abi::pointee_layout`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointerOperation {
+    /// `read` and `readUnaligned`: the value of type `ty` at the address.
+    Read {
+        pointer: LocalId,
+        ty: Type,
+        aligned: bool,
+    },
+    /// `write` and `writeUnaligned`: stores `value` of type `ty`.
+    Write {
+        pointer: LocalId,
+        value: Rvalue,
+        aligned: bool,
+    },
+    /// `offset` (`scale` is the pointee's size) and `byteOffset` (`scale`
+    /// is 1): the pointer `count * scale` bytes away.
+    Offset {
+        pointer: LocalId,
+        count: IntegerExpression,
+        scale: u64,
+    },
+    /// `$pointer->address`, as `uint64`.
+    Address { pointer: LocalId },
+    /// `Pointer::fromAddress`: `?Pointer`, absent for address zero.
+    FromAddress { address: IntegerExpression },
+    /// `Pointer::to($place)` and `WritablePointer::to($place)`: the address
+    /// of `place` (for a local, its own storage or the place it borrows),
+    /// `offset` bytes in: zero for the whole value, a field's offset for a
+    /// field of a foreign struct or union. Checking pins that place, or the
+    /// value containing it, for the enclosing unsafe context.
+    AddressOf { place: InlinePlace, offset: u64 },
+    /// `$region->pointer` and `$region->writablePointer` (section 7): the
+    /// address of the first element of the region local `region`. An empty
+    /// region may have no storage; its pointer is then `align`, a non-null
+    /// address aligned for the element, which must not be dereferenced.
+    /// Checking pins the region's storage for the enclosing unsafe context.
+    RegionData { region: LocalId, align: u64 },
+    /// `$text->pointer` on a `CString` or `Utf16String` local (section 9):
+    /// the address of its buffer's first code unit. Checking pins the value
+    /// for the enclosing unsafe context.
+    ForeignStringData { string: LocalId },
+    /// `String::fromCString` and `String::fromUtf16`: the `?string` the
+    /// NUL-terminated text at `pointer` holds, absent when it is not valid
+    /// Unicode.
+    ReadForeignString {
+        pointer: LocalId,
+        encoding: crate::foreign::ForeignStringEncoding,
+    },
+    /// The name of a C-callable Doria function as a value (section 12): the
+    /// address of the C entry of `function`, one of `Program::c_entries`,
+    /// as a C function pointer.
+    CEntryAddress { function: FunctionId },
+    /// The memory `ByteRegion::fromPointer($owner, $pointer, $length)` and
+    /// its three siblings view (section 10): `pointer` itself, once
+    /// `length` elements of `stride` bytes from it are a range. A pointer
+    /// not a multiple of `align`, the element's C alignment, panics with
+    /// P1702; a negative length or a range past the end of the address
+    /// space panics with P1703. [`RegionExpression::Foreign`] forms the
+    /// region.
+    ForeignRange {
+        pointer: LocalId,
+        length: IntegerExpression,
+        stride: u64,
+        align: u64,
+    },
+    /// `Handle::create(take $value)` and `$reference->toHandle()` (section
+    /// 11): the handle that holds `value`, an owned class value or a shared
+    /// reference whose ownership moves into the handle. A one-word value
+    /// is its own handle and a two-word carrier is boxed
+    /// ([`Program::handle_carrier`]).
+    CreateHandle { value: Rvalue },
+    /// `Handle::reclaim`, the shared references' `reclaim` (`reclaim`), and
+    /// every `borrow`: the value of type `ty` the handle local `handle`
+    /// holds. A reclaimed value is owned again and a boxed carrier's box is
+    /// released; a borrowed one is lent, and the handle keeps it.
+    FromHandle {
+        handle: LocalId,
+        ty: Type,
+        reclaim: bool,
+    },
+}
+
+impl PointerOperation {
+    /// The pointer local the operation reads, if any.
+    pub const fn pointer(&self) -> Option<LocalId> {
+        match self {
+            Self::Read { pointer, .. }
+            | Self::Write { pointer, .. }
+            | Self::Offset { pointer, .. }
+            | Self::Address { pointer }
+            | Self::ReadForeignString { pointer, .. }
+            | Self::ForeignRange { pointer, .. }
+            | Self::FromHandle {
+                handle: pointer, ..
+            } => Some(*pointer),
+            Self::FromAddress { .. }
+            | Self::AddressOf { .. }
+            | Self::RegionData { .. }
+            | Self::ForeignStringData { .. }
+            | Self::CEntryAddress { .. }
+            | Self::CreateHandle { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6385,8 +7628,7 @@ impl RetainedSourcesPlan {
         contract: Option<ReturnBorrow>,
         source: impl Fn(BorrowSource) -> LocalId,
     ) {
-        let ReturnType::Value(Type::ByteRegion(_) | Type::NullableByteRegion(_)) = return_type
-        else {
+        let ReturnType::Value(Type::Region(_) | Type::NullableRegion(_)) = return_type else {
             return;
         };
         let Some(borrow) = contract.filter(|borrow| borrow.kind == ReturnBorrowKind::Retained)
@@ -6979,6 +8221,471 @@ pub enum Terminator {
     },
 }
 
+impl Terminator {
+    /// The blocks control can reach next, in a fixed order. A terminator
+    /// that returns, propagates an Error, panics or is unreachable has none.
+    /// Every target of the terminator, in `targets` order, to retarget.
+    pub fn targets_mut(&mut self) -> Vec<&mut BlockId> {
+        match self {
+            Self::Jump(target) => vec![target],
+            Self::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![then_block, else_block],
+            Self::CheckedCall {
+                success, failure, ..
+            }
+            | Self::CheckedIndirectCall {
+                success, failure, ..
+            }
+            | Self::CheckedConstruct {
+                success, failure, ..
+            }
+            | Self::CheckedIo {
+                success, failure, ..
+            }
+            | Self::CheckedDeadlineFromNow {
+                success, failure, ..
+            }
+            | Self::CheckedCancellationRequest {
+                success, failure, ..
+            } => vec![success, failure],
+            Self::IndirectCall { continuation, .. } => vec![continuation],
+            Self::ErrorSwitch {
+                cases,
+                catch_all,
+                fallback,
+                ..
+            } => cases
+                .iter_mut()
+                .map(|(_, target)| target)
+                .chain(catch_all.iter_mut())
+                .chain(std::iter::once(fallback))
+                .collect(),
+            Self::Return(_)
+            | Self::ReturnVoid
+            | Self::Panic { .. }
+            | Self::Unreachable
+            | Self::PropagateError { .. } => Vec::new(),
+        }
+    }
+
+    pub fn targets(&self) -> Vec<BlockId> {
+        match self {
+            Self::Jump(target) => vec![*target],
+            Self::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![*then_block, *else_block],
+            Self::CheckedCall {
+                success, failure, ..
+            }
+            | Self::CheckedIndirectCall {
+                success, failure, ..
+            }
+            | Self::CheckedConstruct {
+                success, failure, ..
+            }
+            | Self::CheckedIo {
+                success, failure, ..
+            }
+            | Self::CheckedDeadlineFromNow {
+                success, failure, ..
+            }
+            | Self::CheckedCancellationRequest {
+                success, failure, ..
+            } => vec![*success, *failure],
+            Self::IndirectCall { continuation, .. } => vec![*continuation],
+            Self::ErrorSwitch {
+                cases,
+                catch_all,
+                fallback,
+                ..
+            } => cases
+                .iter()
+                .map(|(_, target)| *target)
+                .chain(catch_all.iter().copied())
+                .chain(std::iter::once(*fallback))
+                .collect(),
+            Self::Return(_)
+            | Self::ReturnVoid
+            | Self::Panic { .. }
+            | Self::Unreachable
+            | Self::PropagateError { .. } => Vec::new(),
+        }
+    }
+}
+
+/// One unsafe context written outside every other one, in one lowered
+/// function (Decision 0148 sections 22 and 23). Cranelift and LLVM compile
+/// its blocks inline. For the interpreter and PHP output the native
+/// companion library runs them as one function, and the host resumes at
+/// `continuation` or at the exit the region took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsafeRegion {
+    /// SHA-256 over package identity, source identity, span and type
+    /// arguments, in lowercase hexadecimal. Every lowering of one
+    /// specialization yields the same region and the same identity.
+    pub id: String,
+    pub form: crate::foreign::UnsafeContextForm,
+    /// The `unsafe` keyword.
+    pub keyword: Span,
+    /// The block of `unsafe { }`, or the whole `unsafe(<expression>)`.
+    pub span: Span,
+    /// The region's first block, the only one code outside it reaches.
+    pub entry: BlockId,
+    /// Every block of the region in ascending order, `entry` first.
+    pub blocks: Vec<BlockId>,
+    /// Where control continues when the region falls through (status 0).
+    pub continuation: BlockId,
+    /// The local holding an expression region's value: written inside the
+    /// region and read after it.
+    pub result: Option<LocalId>,
+    /// One slot per local the region reads or writes from its surroundings,
+    /// in order of first use inside it.
+    pub inputs: Vec<UnsafeRegionValue>,
+    /// The inputs the region writes, moves or destroys: their final values
+    /// cross back before the host resumes, on every exit. A local the region
+    /// writes and the host uses after it (a result, an Error, a temporary
+    /// the enclosing statement destroys) is one of them.
+    pub outputs: Vec<UnsafeRegionValue>,
+    /// Every edge that leaves the region other than fallthrough, in the
+    /// order lowering produced them. A break or continue target index is
+    /// the position of its exit here.
+    pub exits: Vec<UnsafeRegionExit>,
+}
+
+impl UnsafeRegion {
+    pub fn contains(&self, block: BlockId) -> bool {
+        self.blocks
+            .binary_search_by_key(&block.0, |block| block.0)
+            .is_ok()
+    }
+}
+
+/// The native companion library's plan (Decision 0148 sections 22 and 23,
+/// entry ABI version 1), built by `companion::plan`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Companion {
+    /// One entry per region identity, in identity order.
+    pub regions: Vec<CompanionRegion>,
+    /// Operation `n` is `host_operations[n - 1]`; operation 0
+    /// (`ACCEPT_OUTPUT_OPERATION`) hands an output to the host.
+    pub host_operations: Vec<HostOperation>,
+    /// One callback per C-callable function, in `Program::c_entries` order;
+    /// their operations follow every host operation.
+    pub callbacks: Vec<CompanionCallback>,
+    /// One binding entry per extern declaration's function a region
+    /// reaches, in function order.
+    pub bindings: Vec<CompanionBinding>,
+}
+
+/// The entry through which a host calls an extern declaration's function
+/// (Decision 0148 section 23): a host operation's statement can call one,
+/// and the foreign call it makes runs in the companion. The companion
+/// exports it as
+/// `int32 doria_binding_v1_<n>(DrRegionHostV1 *, const void *callerFrame,
+/// void *arguments, void *results)`: it checks the thread, runs at the
+/// caller's frame, loads the parameters from `arguments`, calls the
+/// function and stores its return value in `results`, and returns 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionBinding {
+    /// The binding's position, which its exported name carries.
+    pub index: usize,
+    pub function: FunctionId,
+    pub arguments: SlotRecord,
+    pub results: SlotRecord,
+    /// The generated entry. Its id follows every callback's forwarder.
+    pub entry: Function,
+}
+
+impl CompanionBinding {
+    pub fn entry_symbol(&self) -> String {
+        format!("doria_binding_v1_{}", self.index)
+    }
+}
+
+/// A C-callable function (Decision 0148 section 23, Callbacks): the
+/// companion holds its C entry, exported as `doria_callback_v1_<n>`, which
+/// checks the thread and forwards the call to the host as operation
+/// `operation`, whose arguments are the function's parameters and whose
+/// results are its return value. The body runs on the host, which holds
+/// the function's C function pointer value as that entry's address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionCallback {
+    pub operation: u32,
+    pub function: FunctionId,
+    pub arguments: SlotRecord,
+    pub results: SlotRecord,
+    /// The forwarding function the C entry calls. Its id follows every
+    /// region entry, and region entries take its C entry address in place
+    /// of the function's.
+    pub forwarder: Function,
+}
+
+impl CompanionCallback {
+    /// The exported C entry, numbered by the callback's operation.
+    pub fn entry_symbol(&self) -> String {
+        format!("doria_callback_v1_{}", self.operation)
+    }
+}
+
+impl Companion {
+    /// Whether `function` is a region entry, whose C entry links its frame
+    /// to the host frame it receives.
+    pub fn is_region_entry(&self, function: FunctionId) -> bool {
+        self.regions
+            .iter()
+            .any(|region| region.entry.id == function)
+    }
+
+    /// Whether `function` is a binding entry, whose C entry runs at the
+    /// host frame it receives.
+    pub fn is_binding_entry(&self, function: FunctionId) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.entry.id == function)
+    }
+}
+
+/// The reserved host operation through which the companion hands each
+/// output whose content it owns (a string, a buffer or a foreign string)
+/// to the host before its own cleanup. Its arguments and results are both
+/// the output slot: the host reads the content, and writes the host token
+/// it returns into the slot's first word, 0 when the slot holds no value.
+pub const ACCEPT_OUTPUT_OPERATION: u32 = 0;
+
+/// One region identity and its C-ABI entry
+/// `int32 doria_region_v1_<id>(DrRegionHostV1 *, const void *, void *, void *)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionRegion {
+    pub id: String,
+    /// Every lowering of the region, ordinary and direct, in function
+    /// order. The companion compiles the first; the others have the same
+    /// inputs, outputs, result and exits.
+    pub lowerings: Vec<RegionLowering>,
+    /// The `inputs` record: the region's inputs other than host tokens.
+    pub inputs: SlotRecord,
+    /// The `outputs` record: the region's outputs other than host tokens
+    /// and its result, then the result, then the `int32` index of the exit
+    /// taken.
+    pub outputs: SlotRecord,
+    /// The entry itself, generated from the first lowering's region
+    /// blocks. Its id follows every function of the program, and its
+    /// parameters are the host, the caller's frame, `inputs` and `outputs`.
+    pub entry: Function,
+}
+
+impl CompanionRegion {
+    pub fn entry_symbol(&self) -> String {
+        format!("doria_region_v1_{}", self.id)
+    }
+}
+
+/// A C-layout record of companion slots (Decision 0148 section 23, entry
+/// ABI version 1): a region's inputs or outputs, or a host operation's
+/// arguments or results. The host allocates every record zero-filled; a
+/// slot nobody writes holds no value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlotRecord {
+    pub slots: Vec<CompanionSlot>,
+    /// The offset of the trailing `int32` index: the exit a region took, or
+    /// the target a host operation at a terminator took.
+    pub index: Option<u64>,
+    pub size: u64,
+    pub align: u64,
+}
+
+/// One value of a slot record, `offset` bytes into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompanionSlot {
+    pub value: UnsafeRegionValue,
+    pub offset: u64,
+}
+
+/// How a `Statement::RegionSlot` moves a value between a slot and its local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAccess {
+    /// Assigns the slot's value to the local, releasing the value it
+    /// replaces. Content (a string, a buffer, a foreign string) is copied
+    /// into a value the companion owns; a region views the slot's memory.
+    /// A null data pointer assigns the zero value.
+    Load,
+    /// Writes the local's value into the slot. Content is lent: the slot
+    /// points at the companion's own storage until the companion changes
+    /// or releases it. A local holding no value writes a null data pointer.
+    Store,
+}
+
+/// A region of one lowered function: `functions[function].unsafe_regions[region]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionLowering {
+    pub function: FunctionId,
+    pub region: usize,
+}
+
+/// One statement or terminator of a region that runs on the host, inside
+/// the host frame suspended at the region entry, through
+/// `host->call(host, id, arguments, results)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostOperation {
+    pub id: u32,
+    /// The index of its region in `Companion::regions`; the site is in that
+    /// region's first lowering.
+    pub region: usize,
+    pub block: BlockId,
+    pub site: HostOperationSite,
+    /// The values the operation touches, in order of first touch, with
+    /// their current values. Host tokens stay in the host frame.
+    pub arguments: SlotRecord,
+    /// The arguments the operation writes or moves, crossing back after
+    /// it; a moved one crosses back with no value. A terminator's results
+    /// end with the `int32` index of the target the host took.
+    pub results: SlotRecord,
+    /// For a terminator, its targets in `Terminator::targets` order.
+    pub successors: Vec<BlockId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOperationSite {
+    Statement(usize),
+    Terminator,
+}
+
+/// One local crossing an unsafe region's edge (Decision 0148 section 23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsafeRegionValue {
+    pub local: LocalId,
+    pub kind: UnsafeRegionValueKind,
+    /// A nullable Copy value crosses as its non-null form does, plus its
+    /// presence: native values and regions in their native nullable layout
+    /// (a nullable pointer is one word whose null is zero), a `?string` as
+    /// nullable text. A nullable Move value is a host token and records no
+    /// presence of its own.
+    pub nullable: bool,
+}
+
+impl UnsafeRegionValue {
+    pub fn of(local: LocalId, ty: Type, collections: &[CollectionType]) -> Self {
+        let kind = UnsafeRegionValueKind::of(ty, collections);
+        let nullable = kind != UnsafeRegionValueKind::HostToken
+            && matches!(
+                ty,
+                Type::NullableScalar(_)
+                    | Type::NullableString
+                    | Type::NullableRegion(_)
+                    | Type::NullableForeignAggregate(_)
+            );
+        Self {
+            local,
+            kind,
+            nullable,
+        }
+    }
+}
+
+/// How a value crosses between the host and the companion library, by
+/// section 23's marshalling table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsafeRegionValueKind {
+    /// By value in its native layout: integers, floats, `bool`, enums,
+    /// boundary types, pointers, C function pointers, handles, foreign
+    /// aggregates and Copy inline values.
+    Native,
+    /// A `string`, as UTF-8 bytes.
+    Text,
+    /// `Bytes` or a `T[]` of C-layout elements (those a region over the
+    /// array addresses): copied into a native buffer, and copied back at
+    /// every exit when the region writes it.
+    Buffer,
+    /// A byte or typed array region: over host storage it crosses as a
+    /// buffer does; over foreign memory, as address and length.
+    Region,
+    /// `CString` or `Utf16String`, re-materialized natively.
+    ForeignString,
+    /// Every other value stays on the host as an opaque token: class
+    /// instances, interfaces, other collections, closures, `mixed`, shared
+    /// references and nullable Move values.
+    HostToken,
+}
+
+impl UnsafeRegionValueKind {
+    /// The crossing of `ty`. A nullable Copy value has the kind of its
+    /// non-null form; `UnsafeRegionValue::nullable` records its presence.
+    pub fn of(ty: Type, collections: &[CollectionType]) -> Self {
+        match ty {
+            Type::Scalar(scalar) | Type::NullableScalar(scalar) => Self::of_scalar(scalar),
+            Type::ForeignAggregate(_) | Type::NullableForeignAggregate(_) => Self::Native,
+            Type::String | Type::NullableString => Self::Text,
+            Type::Region(_) | Type::NullableRegion(_) => Self::Region,
+            Type::Collection(id) => {
+                let collection = collections
+                    .get(id.0)
+                    .filter(|collection| collection.id == id)
+                    .expect("a lowered collection type has its registry slot");
+                match collection.kind {
+                    CollectionKind::Bytes => Self::Buffer,
+                    CollectionKind::ForeignString(_) => Self::ForeignString,
+                    // Its elements cross as `{data, length}`, so they keep
+                    // the C layout a region over the array addresses
+                    // (section 8).
+                    CollectionKind::TypedArray
+                        if crate::native_abi::pointee_layout(collection.value).is_some() =>
+                    {
+                        Self::Buffer
+                    }
+                    _ => Self::HostToken,
+                }
+            }
+            _ => Self::HostToken,
+        }
+    }
+
+    const fn of_scalar(scalar: ScalarType) -> Self {
+        match scalar {
+            ScalarType::Integer(_)
+            | ScalarType::Float(_)
+            | ScalarType::Bool
+            | ScalarType::Enum(_) => Self::Native,
+            ScalarType::Inline(inline) if !inline.requires_owned_cleanup() => Self::Native,
+            ScalarType::Inline(_) => Self::HostToken,
+        }
+    }
+}
+/// One edge out of an unsafe region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsafeRegionExit {
+    /// The region block whose terminator leaves.
+    pub source: BlockId,
+    pub kind: UnsafeRegionExitKind,
+    /// The landing block outside the region where the host finishes the
+    /// route: it destroys the values the region does not own, crosses
+    /// finalizers and reaches the loop target, catch or return. `None` when
+    /// the source block's own terminator returns from the function.
+    pub target: Option<BlockId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsafeRegionExitKind {
+    Return,
+    Break,
+    Continue,
+    CheckedError { error: LocalId },
+}
+
+impl UnsafeRegionExitKind {
+    /// The status a region entry returns for this exit; 0 is fallthrough.
+    pub const fn status(self) -> i32 {
+        match self {
+            Self::Return => 1,
+            Self::Break => 2,
+            Self::Continue => 3,
+            Self::CheckedError { .. } => 4,
+        }
+    }
+}
 pub(crate) fn class_temporary_capacity(function: &Function) -> usize {
     function
         .blocks
@@ -7007,7 +8714,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::CollectionSet { key, value, .. } => {
             rvalue_class_temporary_capacity(key) + rvalue_class_temporary_capacity(value)
         }
-        Statement::AssignByteRegionIndex { index, value, .. }
+        Statement::AssignRegionIndex { index, value, .. }
         | Statement::AssignCollectionIndex { index, value, .. } => {
             rvalue_class_temporary_capacity(index) + rvalue_class_temporary_capacity(value)
         }
@@ -7047,6 +8754,32 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropCollection { .. }
         | Statement::DropFunction { .. }
         | Statement::WriteStreamBytes { .. } => 0,
+        Statement::ForeignCall { .. }
+        | Statement::HostRecord { .. }
+        | Statement::RegionSlot { .. }
+        | Statement::CallHost { .. } => 0,
+        Statement::ForeignField { access, .. } => match access {
+            ForeignFieldAccess::Read { .. } | ForeignFieldAccess::Region { .. } => 0,
+            ForeignFieldAccess::Write { value, .. } => rvalue_class_temporary_capacity(value),
+        },
+        Statement::Pointer { operation, .. } => match operation {
+            PointerOperation::Write { value, .. } | PointerOperation::CreateHandle { value } => {
+                rvalue_class_temporary_capacity(value)
+            }
+            PointerOperation::Offset { count, .. } => integer_class_temporary_capacity(count),
+            PointerOperation::FromAddress { address } => integer_class_temporary_capacity(address),
+            PointerOperation::ForeignRange { length, .. } => {
+                integer_class_temporary_capacity(length)
+            }
+            PointerOperation::Read { .. }
+            | PointerOperation::Address { .. }
+            | PointerOperation::AddressOf { .. }
+            | PointerOperation::RegionData { .. }
+            | PointerOperation::ForeignStringData { .. }
+            | PointerOperation::ReadForeignString { .. }
+            | PointerOperation::CEntryAddress { .. }
+            | PointerOperation::FromHandle { .. } => 0,
+        },
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
         }
@@ -7164,10 +8897,8 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
         )
         + match value {
             Rvalue::Value(value) => value_class_temporary_capacity(value),
-            Rvalue::ByteRegion(value) => byte_region_class_temporary_capacity(value),
-            Rvalue::NullableByteRegion(value) => {
-                nullable_byte_region_class_temporary_capacity(value)
-            }
+            Rvalue::Region(value) => byte_region_class_temporary_capacity(value),
+            Rvalue::NullableRegion(value) => nullable_byte_region_class_temporary_capacity(value),
             Rvalue::String(value) => string_class_temporary_capacity(value),
             Rvalue::Mixed(value) => mixed_class_temporary_capacity(value),
             Rvalue::NullableScalar(value) => nullable_scalar_class_temporary_capacity(value),
@@ -7292,15 +9023,59 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             }
             Rvalue::Function(value) => function_class_temporary_capacity(value),
             Rvalue::NullableFunction(value) => nullable_function_class_temporary_capacity(value),
+            Rvalue::ForeignAggregate(value) => foreign_aggregate_class_temporary_capacity(value),
+            Rvalue::NullableForeignAggregate(value) => {
+                nullable_foreign_aggregate_class_temporary_capacity(value)
+            }
         }
 }
 
-fn byte_region_class_temporary_capacity(value: &ByteRegionExpression) -> usize {
+fn foreign_aggregate_class_temporary_capacity(value: &ForeignAggregateExpression) -> usize {
     match value {
-        ByteRegionExpression::CollectionIndex { index, .. } => {
+        ForeignAggregateExpression::Construct { fields, .. } => fields
+            .iter()
+            .map(|field| rvalue_class_temporary_capacity(&field.value))
+            .sum(),
+        ForeignAggregateExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        ForeignAggregateExpression::CollectionIndex { index, .. }
+        | ForeignAggregateExpression::RegionIndex { index, .. } => {
             rvalue_class_temporary_capacity(index)
         }
-        ByteRegionExpression::Region {
+        ForeignAggregateExpression::Local { .. }
+        | ForeignAggregateExpression::Property { .. }
+        | ForeignAggregateExpression::Static { .. }
+        | ForeignAggregateExpression::NullableLocalAssumeNonNull { .. }
+        | ForeignAggregateExpression::MixedPayload { .. } => 0,
+    }
+}
+
+fn nullable_foreign_aggregate_class_temporary_capacity(
+    value: &NullableForeignAggregateExpression,
+) -> usize {
+    match value {
+        NullableForeignAggregateExpression::Present(value) => {
+            foreign_aggregate_class_temporary_capacity(value)
+        }
+        NullableForeignAggregateExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableForeignAggregateExpression::CollectionIndex { index: key, .. }
+        | NullableForeignAggregateExpression::CollectionGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
+        }
+        NullableForeignAggregateExpression::Null(_)
+        | NullableForeignAggregateExpression::Local { .. }
+        | NullableForeignAggregateExpression::Property { .. }
+        | NullableForeignAggregateExpression::Static { .. } => 0,
+    }
+}
+
+fn byte_region_class_temporary_capacity(value: &RegionExpression) -> usize {
+    match value {
+        RegionExpression::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
+        RegionExpression::Region {
             source,
             offset,
             length,
@@ -7310,29 +9085,30 @@ fn byte_region_class_temporary_capacity(value: &ByteRegionExpression) -> usize {
                 + rvalue_class_temporary_capacity(offset)
                 + rvalue_class_temporary_capacity(length)
         }
-        ByteRegionExpression::Local { .. } => 0,
-        ByteRegionExpression::Call { args, .. } => {
+        RegionExpression::Local { .. } => 0,
+        RegionExpression::Foreign { owner, .. } => rvalue_class_temporary_capacity(owner),
+        RegionExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
-        ByteRegionExpression::AssumePresent { value, .. } => {
+        RegionExpression::AssumePresent { value, .. } => {
             nullable_byte_region_class_temporary_capacity(value)
         }
-        ByteRegionExpression::Coalesce { left, right, .. } => {
+        RegionExpression::Coalesce { left, right, .. } => {
             nullable_byte_region_class_temporary_capacity(left)
                 + byte_region_class_temporary_capacity(right)
         }
     }
 }
 
-fn nullable_byte_region_class_temporary_capacity(value: &NullableByteRegionExpression) -> usize {
+fn nullable_byte_region_class_temporary_capacity(value: &NullableRegionExpression) -> usize {
     match value {
-        NullableByteRegionExpression::CollectionIndex { index: key, .. }
-        | NullableByteRegionExpression::CollectionGet { key, .. } => {
+        NullableRegionExpression::CollectionIndex { index: key, .. }
+        | NullableRegionExpression::CollectionGet { key, .. } => {
             rvalue_class_temporary_capacity(key)
         }
-        NullableByteRegionExpression::Null { .. } | NullableByteRegionExpression::Local { .. } => 0,
-        NullableByteRegionExpression::Present(value) => byte_region_class_temporary_capacity(value),
-        NullableByteRegionExpression::Call { args, .. } => {
+        NullableRegionExpression::Null { .. } | NullableRegionExpression::Local { .. } => 0,
+        NullableRegionExpression::Present(value) => byte_region_class_temporary_capacity(value),
+        NullableRegionExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
     }
@@ -7437,6 +9213,9 @@ fn nullable_collection_class_temporary_capacity(value: &NullableCollectionExpres
         NullableCollectionExpression::Coalesce { left, right, .. } => {
             nullable_collection_class_temporary_capacity(left)
                 + nullable_collection_class_temporary_capacity(right)
+        }
+        NullableCollectionExpression::TryForeignString { text, .. } => {
+            string_class_temporary_capacity(text)
         }
         NullableCollectionExpression::Null(_)
         | NullableCollectionExpression::Local { .. }
@@ -7676,7 +9455,10 @@ fn nullable_weak_class_temporary_capacity(value: &NullableWeakReferenceExpressio
 
 fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
     match value {
-        MixedExpression::BoxValue(value) => value_class_temporary_capacity(value),
+        MixedExpression::BoxValue { value, .. } => value_class_temporary_capacity(value),
+        MixedExpression::BoxForeignAggregate(value) => {
+            foreign_aggregate_class_temporary_capacity(value)
+        }
         MixedExpression::BoxString { value, .. } => string_class_temporary_capacity(value),
         MixedExpression::BoxClass { value, .. } => class_expression_temporary_capacity(value),
         MixedExpression::BoxInterface { value, .. } => {
@@ -7752,7 +9534,8 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
             CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
             CollectionExpression::Property { .. }
             | CollectionExpression::SharedAccessPayload { .. } => 0,
-            CollectionExpression::ReadFileBytes { path, .. } => {
+            CollectionExpression::ReadFileBytes { path, .. }
+            | CollectionExpression::ForeignString { text: path, .. } => {
                 string_class_temporary_capacity(path)
             }
         }
@@ -7796,7 +9579,7 @@ fn enum_class_temporary_capacity(value: &EnumExpression) -> usize {
 fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
     match value {
         IntegerExpression::InlineWord(value) => inline_class_temporary_capacity(value),
-        IntegerExpression::Use { .. } => 0,
+        IntegerExpression::Use { .. } | IntegerExpression::LastSystemCode => 0,
         IntegerExpression::Unary { operand, .. }
         | IntegerExpression::Convert { value: operand, .. } => {
             integer_class_temporary_capacity(operand)
@@ -7812,7 +9595,7 @@ fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
             nullable_scalar_class_temporary_capacity(left) + integer_class_temporary_capacity(right)
         }
         IntegerExpression::EnumBacking { value, .. } => enum_class_temporary_capacity(value),
-        IntegerExpression::CopyByteRegion {
+        IntegerExpression::CopyRegion {
             destination,
             source,
             ..
@@ -7980,8 +9763,14 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
                 + nullable_scalar_class_temporary_capacity(right)
         }
         NullableScalarExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
+        NullableScalarExpression::RegionIndex { index, .. } => {
+            rvalue_class_temporary_capacity(index)
+        }
         NullableScalarExpression::CollectionIndexOf { value, .. } => {
             rvalue_class_temporary_capacity(value)
+        }
+        NullableScalarExpression::TryConvert { value, .. } => {
+            integer_class_temporary_capacity(value)
         }
         NullableScalarExpression::StringIntrinsic(call) => {
             call.args.iter().map(rvalue_class_temporary_capacity).sum()
@@ -8082,6 +9871,9 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
             nullable_payload_enum_class_temporary_capacity(value)
         }
         BoolExpression::NullableFunctionIsPresent(_) => 0,
+        BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            nullable_foreign_aggregate_class_temporary_capacity(value)
+        }
         BoolExpression::PayloadEnumCompare { left, right, .. } => {
             payload_enum_class_temporary_capacity(left)
                 + payload_enum_class_temporary_capacity(right)
@@ -8308,13 +10100,27 @@ impl fmt::Display for Local {
     }
 }
 
+impl fmt::Display for RegionType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.array {
+            None => write!(formatter, "{}", self.access.source_name()),
+            Some(array) => write!(
+                formatter,
+                "{}<collection#{}>",
+                self.access.array_source_name(),
+                array.0
+            ),
+        }
+    }
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Scalar(ty) => write!(formatter, "{ty}"),
             Type::String => write!(formatter, "string"),
-            Type::ByteRegion(kind) => write!(formatter, "{}", kind.source_name()),
-            Type::NullableByteRegion(kind) => write!(formatter, "?{}", kind.source_name()),
+            Type::Region(region) => write!(formatter, "{region}"),
+            Type::NullableRegion(region) => write!(formatter, "?{region}"),
             Type::Mixed => write!(formatter, "mixed"),
             Type::NullableScalar(ty) => write!(formatter, "?{ty}"),
             Type::NullableString => write!(formatter, "?string"),
@@ -8365,6 +10171,10 @@ impl fmt::Display for Type {
             Type::NullablePayloadEnum(ty) => {
                 write!(formatter, "?payload-enum#{}", ty.id.0)
             }
+            Type::ForeignAggregate(ty) => write!(formatter, "foreign-aggregate#{}", ty.id.0),
+            Type::NullableForeignAggregate(ty) => {
+                write!(formatter, "?foreign-aggregate#{}", ty.id.0)
+            }
             Type::Function(function_type) => {
                 write!(formatter, "function-type#{}", function_type.0)
             }
@@ -8402,8 +10212,8 @@ impl fmt::Display for BasicBlock {
 impl fmt::Display for Operand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ByteRegionLength(local) => write!(formatter, "region_length(local{})", local.0),
-            Self::ByteRegionIndex { region, index, .. } => {
+            Self::RegionLength(local) => write!(formatter, "region_length(local{})", local.0),
+            Self::RegionIndex { region, index, .. } => {
                 write!(formatter, "region local{}[{index}]", region.0)
             }
             Operand::CollectionIteratorPosition { receiver, vtable } => write!(
@@ -8448,8 +10258,8 @@ impl fmt::Display for Operand {
 impl fmt::Display for Rvalue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ByteRegion(value) => write!(formatter, "{value}"),
-            Self::NullableByteRegion(value) => write!(formatter, "{value}"),
+            Self::Region(value) => write!(formatter, "{value}"),
+            Self::NullableRegion(value) => write!(formatter, "{value}"),
             Self::Interface(InterfaceExpression {
                 value: InterfaceValue::FromValue { value, vtable },
                 ..
@@ -8689,6 +10499,8 @@ impl fmt::Display for Rvalue {
             }
             Rvalue::Function(value) => write!(formatter, "{value}"),
             Rvalue::NullableFunction(value) => write!(formatter, "{value}"),
+            Rvalue::ForeignAggregate(value) => write!(formatter, "{value}"),
+            Rvalue::NullableForeignAggregate(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -8815,7 +10627,7 @@ impl fmt::Display for NullableFunctionExpression {
     }
 }
 
-impl fmt::Display for ByteRegionExpression {
+impl fmt::Display for RegionExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CollectionIndex {
@@ -8838,10 +10650,16 @@ impl fmt::Display for ByteRegionExpression {
                 offset,
                 length,
                 ..
+            } => write!(formatter, "{kind}({source}, {offset}, {length})"),
+            Self::Foreign {
+                kind,
+                owner,
+                data,
+                length,
             } => write!(
                 formatter,
-                "{}({source}, {offset}, {length})",
-                kind.source_name()
+                "{kind} foreign({owner}, local{}, local{})",
+                data.0, length.0
             ),
             Self::Local {
                 local, transfer, ..
@@ -8866,7 +10684,7 @@ impl fmt::Display for ByteRegionExpression {
     }
 }
 
-impl fmt::Display for NullableByteRegionExpression {
+impl fmt::Display for NullableRegionExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CollectionIndex {
@@ -9015,6 +10833,13 @@ impl fmt::Display for CollectionExpression {
             }
             Self::ReadFileBytes { path, .. } => write!(formatter, "read_file_bytes({path})"),
             Self::ReadStdinBytes { .. } => formatter.write_str("read_stdin_bytes()"),
+            Self::ForeignString {
+                collection, text, ..
+            } => write!(
+                formatter,
+                "foreign_string collection#{}({text})",
+                collection.0
+            ),
             Self::StringIntrinsic(call) => write!(formatter, "{call}"),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
         }
@@ -9279,6 +11104,9 @@ impl fmt::Display for MixedTag {
             Self::Class(class) => write!(formatter, "class#{}", class.0),
             Self::Interface(interface) => write!(formatter, "interface#{}", interface.0),
             Self::PayloadEnum(ty) => write!(formatter, "payload-enum#{}", ty.id.0),
+            Self::Pointer(ty) => write!(formatter, "pointer-type#{}", ty.0),
+            Self::ForeignAggregate(ty) => write!(formatter, "foreign-aggregate#{}", ty.id.0),
+            Self::Boundary(boundary) => write!(formatter, "c-boundary:{boundary:?}"),
         }
     }
 }
@@ -9301,7 +11129,8 @@ impl fmt::Display for MixedExpression {
                 object.0, property.class.0, property.index
             ),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
-            Self::BoxValue(value) => write!(formatter, "mixed({value})"),
+            Self::BoxValue { value, tag } => write!(formatter, "mixed<{tag}>({value})"),
+            Self::BoxForeignAggregate(value) => write!(formatter, "mixed({value})"),
             Self::BoxString { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxFunction { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxClass { value, .. } => write!(formatter, "mixed({value})"),
@@ -9519,8 +11348,9 @@ impl fmt::Display for IntegerExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InlineWord(value) => write!(formatter, "inlineWord({value})"),
+            Self::LastSystemCode => write!(formatter, "last_system_code: int64"),
             IntegerExpression::Use { ty, operand } => match operand {
-                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                Operand::RegionLength(_) | Operand::RegionIndex { .. } => {
                     write!(formatter, "{operand}: {ty}")
                 }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: {ty}"),
@@ -9568,9 +11398,22 @@ impl fmt::Display for IntegerExpression {
                 right,
                 ..
             } => write!(formatter, "({left} {op} {right}): {ty}"),
-            IntegerExpression::Convert { ty, value, .. } => {
-                write!(formatter, "convert<{ty}>({value}): {ty}")
-            }
+            IntegerExpression::Convert {
+                ty,
+                value,
+                boundary: None,
+                ..
+            } => write!(formatter, "convert<{ty}>({value}): {ty}"),
+            IntegerExpression::Convert {
+                ty,
+                value,
+                boundary: Some(boundary),
+                ..
+            } => write!(
+                formatter,
+                "convert<{ty}, {}>({value}): {ty}",
+                boundary.short_name()
+            ),
             IntegerExpression::FloatToInt { value, .. } => {
                 write!(formatter, "Float::toInt({value}): int")
             }
@@ -9586,7 +11429,7 @@ impl fmt::Display for IntegerExpression {
             IntegerExpression::EnumBacking { enum_id, value } => {
                 write!(formatter, "enum_backing<{:?}>({value})", enum_id)
             }
-            IntegerExpression::CopyByteRegion {
+            IntegerExpression::CopyRegion {
                 destination,
                 source,
                 ..
@@ -9631,7 +11474,7 @@ impl fmt::Display for FloatExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Use { ty, operand } => match operand {
-                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                Operand::RegionLength(_) | Operand::RegionIndex { .. } => {
                     write!(formatter, "{operand}: {ty}")
                 }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: {ty}"),
@@ -9818,7 +11661,7 @@ impl fmt::Display for BoolExpression {
             Self::NullableByteRegionIsPresent(value) => write!(formatter, "is_present({value})"),
             Self::NominalIs { local, target } => write!(formatter, "local{} is {target}", local.0),
             Self::Use { operand } => match operand {
-                Operand::ByteRegionLength(_) | Operand::ByteRegionIndex { .. } => {
+                Operand::RegionLength(_) | Operand::RegionIndex { .. } => {
                     write!(formatter, "{operand}: bool")
                 }
                 Operand::CollectionIteratorPosition { .. } => write!(formatter, "{operand}: bool"),
@@ -9904,6 +11747,9 @@ impl fmt::Display for BoolExpression {
                 write!(formatter, "present(?payload-enum#{})", value.ty().id.0)
             }
             Self::NullableFunctionIsPresent(value) => write!(formatter, "present({value})"),
+            Self::NullableForeignAggregateIsPresent(value) => {
+                write!(formatter, "present(?foreign-aggregate#{})", value.ty().id.0)
+            }
             Self::PayloadEnumCompare { op, left, right } => {
                 write!(formatter, "{left:?} {op} {right:?}")
             }
@@ -9969,6 +11815,15 @@ impl fmt::Display for NullableScalarExpression {
             Self::EnumBacking { enum_id, value } => {
                 write!(formatter, "nullable_enum_backing<{enum_id:?}>({value})")
             }
+            Self::TryConvert {
+                ty,
+                boundary,
+                value,
+            } => write!(
+                formatter,
+                "try_convert<{ty}, {}>({value})",
+                boundary.short_name()
+            ),
             Self::NullSafeProperty {
                 object, property, ..
             } => {
@@ -9991,6 +11846,9 @@ impl fmt::Display for NullableScalarExpression {
             }
             Self::CollectionIndexOf { collection, value } => {
                 write!(formatter, "local{}.indexOf({value})", collection.0)
+            }
+            Self::RegionIndex { region, index, .. } => {
+                write!(formatter, "region local{}[{index}]", region.0)
             }
             Self::Parse { ty, value } => write!(formatter, "parse::<{ty}>({value})"),
             Self::StringIntrinsic(call) => write!(formatter, "{call}"),
@@ -10016,6 +11874,9 @@ impl fmt::Display for StringIntrinsicKind {
         formatter.write_str(match self {
             Self::Hash => "hash",
             Self::GraphemeLength => "graphemeLength",
+            Self::DisplayWidth => "displayWidth",
+            Self::GraphemeBoundaryAfter => "graphemeBoundaryAfter",
+            Self::TextBetween => "textBetween",
             Self::ByteLength => "byteLength",
             Self::IsEmpty => "isEmpty",
             Self::ToBytes => "toBytes",
@@ -10139,7 +12000,7 @@ impl fmt::Display for Statement {
                 request.0, outcome.0
             ),
             Self::EndBorrow { local } => write!(formatter, "end_borrow local{}", local.0),
-            Self::AssignByteRegionIndex {
+            Self::AssignRegionIndex {
                 region,
                 index,
                 value,
@@ -10429,6 +12290,197 @@ impl fmt::Display for Statement {
                 function_type.0,
                 local.0
             ),
+            Statement::Pointer {
+                target, operation, ..
+            } => {
+                if let Some(target) = target {
+                    write!(formatter, "local{} = ", target.0)?;
+                }
+                match operation {
+                    PointerOperation::Read {
+                        pointer,
+                        ty,
+                        aligned,
+                    } => write!(
+                        formatter,
+                        "pointer_read<{ty}{}>(local{})",
+                        if *aligned { "" } else { ", unaligned" },
+                        pointer.0
+                    ),
+                    PointerOperation::Write {
+                        pointer,
+                        value,
+                        aligned,
+                    } => write!(
+                        formatter,
+                        "pointer_write{}(local{}, {value})",
+                        if *aligned { "" } else { "_unaligned" },
+                        pointer.0
+                    ),
+                    PointerOperation::Offset {
+                        pointer,
+                        count,
+                        scale,
+                    } => write!(
+                        formatter,
+                        "pointer_offset(local{}, {count} * {scale})",
+                        pointer.0
+                    ),
+                    PointerOperation::Address { pointer } => {
+                        write!(formatter, "pointer_address(local{})", pointer.0)
+                    }
+                    PointerOperation::FromAddress { address } => {
+                        write!(formatter, "pointer_from_address({address})")
+                    }
+                    PointerOperation::CEntryAddress { function } => {
+                        write!(formatter, "c_entry_address(function{})", function.0)
+                    }
+                    PointerOperation::CreateHandle { value } => {
+                        write!(formatter, "create_handle({value})")
+                    }
+                    PointerOperation::FromHandle {
+                        handle,
+                        ty,
+                        reclaim,
+                    } => write!(
+                        formatter,
+                        "{}_handle<{ty}>(local{})",
+                        if *reclaim { "reclaim" } else { "borrow" },
+                        handle.0
+                    ),
+                    PointerOperation::ForeignRange {
+                        pointer,
+                        length,
+                        stride,
+                        align,
+                    } => write!(
+                        formatter,
+                        "foreign_range(local{}, {length} * {stride} @{align})",
+                        pointer.0
+                    ),
+                    PointerOperation::AddressOf { place, offset } => {
+                        write!(formatter, "pointer_to({place} @{offset})")
+                    }
+                    PointerOperation::RegionData { region, align } => {
+                        write!(
+                            formatter,
+                            "region_pointer(local{}, empty @{align})",
+                            region.0
+                        )
+                    }
+                    PointerOperation::ForeignStringData { string } => {
+                        write!(formatter, "foreign_string_pointer(local{})", string.0)
+                    }
+                    PointerOperation::ReadForeignString { pointer, encoding } => write!(
+                        formatter,
+                        "read_foreign_string<{}>(local{})",
+                        encoding.short_name(),
+                        pointer.0
+                    ),
+                }
+            }
+            Statement::HostRecord {
+                target,
+                size,
+                align,
+            } => write!(
+                formatter,
+                "local{} = host_record({size} @{align})",
+                target.0
+            ),
+            Statement::RegionSlot {
+                record,
+                slot,
+                access,
+            } => {
+                let place = format!(
+                    "slot<{:?}{}>(local{}, @{})",
+                    slot.value.kind,
+                    if slot.value.nullable { "?" } else { "" },
+                    record.0,
+                    slot.offset
+                );
+                match access {
+                    SlotAccess::Load => write!(formatter, "local{} = {place}", slot.value.local.0),
+                    SlotAccess::Store => write!(formatter, "{place} = local{}", slot.value.local.0),
+                }
+            }
+            Statement::CallHost {
+                host,
+                operation,
+                arguments,
+                results,
+            } => {
+                let record = |record: &Option<LocalId>| match record {
+                    Some(local) => format!("local{}", local.0),
+                    None => "null".to_string(),
+                };
+                write!(
+                    formatter,
+                    "call_host({}, {operation}, {}, {})",
+                    host.map_or_else(|| "attached".to_string(), |host| format!("local{}", host.0)),
+                    record(arguments),
+                    record(results)
+                )
+            }
+            Statement::ForeignField {
+                aggregate,
+                offset,
+                access,
+                ..
+            } => match access {
+                ForeignFieldAccess::Read { target } => write!(
+                    formatter,
+                    "local{} = foreign_field({aggregate}, @{offset})",
+                    target.0
+                ),
+                ForeignFieldAccess::Write {
+                    value,
+                    copied_elements: None,
+                } => write!(formatter, "foreign_field({aggregate}, @{offset}) = {value}"),
+                ForeignFieldAccess::Write {
+                    value,
+                    copied_elements: Some(length),
+                } => write!(
+                    formatter,
+                    "foreign_field({aggregate}, @{offset}) = copy_elements({value}, {length})"
+                ),
+                ForeignFieldAccess::Region { target, length } => write!(
+                    formatter,
+                    "local{} = foreign_field_region({aggregate}, @{offset}, {length})",
+                    target.0
+                ),
+            },
+            Statement::ForeignCall {
+                function,
+                args,
+                target,
+                ..
+            } => {
+                if let Some(target) = target {
+                    write!(formatter, "local{} = ", target.0)?;
+                }
+                let args = args
+                    .iter()
+                    .map(|local| format!("local{}", local.0))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match &function.callee {
+                    ForeignCallee::Symbol { symbol, library } => {
+                        write!(formatter, "foreign_call {symbol}({args})")?;
+                        if let Some(library) = library {
+                            write!(formatter, " in {library}")?;
+                        }
+                    }
+                    ForeignCallee::Pointer(pointer) => {
+                        write!(formatter, "foreign_call *local{}({args})", pointer.0)?;
+                    }
+                }
+                if let Some(source) = function.system_code {
+                    write!(formatter, " capturing {source:?}")?;
+                }
+                Ok(())
+            }
             Statement::DropInlineValue {
                 local,
                 ty,

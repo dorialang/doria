@@ -84,6 +84,10 @@ pub struct CompilationContext {
     pub edition: Edition,
     pub package: PackageIdentity,
     pub source: SourceIdentity,
+    /// The unsafe policy the package sets for every source (Decision 0148
+    /// section 25). A file directive may deny unsafe code where this allows
+    /// it, never the reverse.
+    pub unsafe_policy: crate::build_plan::UnsafePolicy,
 }
 
 impl CompilationContext {
@@ -92,6 +96,7 @@ impl CompilationContext {
             edition: Edition::Doria2026,
             package: PackageIdentity::Standalone,
             source: SourceIdentity(source.into()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         }
     }
 }
@@ -115,9 +120,16 @@ pub enum CompilerSymbolIdentity {
     StandardConcurrency(String),
     StandardTerm(String),
     StandardTest(String),
+    /// A member of `Doria\Std\Ffi` (Decision 0148).
+    StandardFfi(String),
     Attribute(String),
 }
 
+/// The one way authored source reaches a compiler-known type: its canonical
+/// name is in a module's public canonical-type list. A compiler-known
+/// declaration outside every list, such as the `Doria\Std\Text` view and
+/// cursor behind `$text->graphemes` (Decision 0147), is compiler-private: no
+/// authored name resolves to it, and only lowering the compiler owns reaches it.
 pub(crate) fn standard_type_identity(canonical: &str) -> Option<CompilerSymbolIdentity> {
     if crate::compiler_known_concurrency::CANONICAL_TYPES.contains(&canonical) {
         Some(CompilerSymbolIdentity::StandardConcurrency(
@@ -127,6 +139,8 @@ pub(crate) fn standard_type_identity(canonical: &str) -> Option<CompilerSymbolId
         Some(CompilerSymbolIdentity::StandardTime(canonical.to_string()))
     } else if crate::compiler_known_term::CANONICAL_TYPES.contains(&canonical) {
         Some(CompilerSymbolIdentity::StandardTerm(canonical.to_string()))
+    } else if crate::compiler_known_ffi::is_canonical_type(canonical) {
+        Some(CompilerSymbolIdentity::StandardFfi(canonical.to_string()))
     } else if crate::compiler_known_io::is_canonical_type(canonical) {
         Some(CompilerSymbolIdentity::StandardIo(canonical.to_string()))
     } else {
@@ -154,6 +168,8 @@ pub enum GlobalSymbolKind {
     Trait,
     Function,
     Constant,
+    /// An `extern "C" struct` or `union` (Decision 0148 section 6).
+    ForeignAggregate,
     CompilerKnownType,
     CompilerKnownIntrinsic,
     CompilerKnownAttribute,
@@ -231,6 +247,7 @@ pub enum CompilerKnownProvenance {
     StandardConcurrency,
     StandardTerm,
     StandardTest,
+    StandardFfi,
     Attribute,
 }
 
@@ -276,6 +293,86 @@ pub struct ResolvedProgram {
 pub struct ResolutionAnalysis {
     pub resolved: ResolvedProgram,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// How name resolution reads each call candidate of `program`, keyed by the
+/// span of its `<` (Decision 0105, Amendment: Type Arguments At The Call):
+/// as type arguments when every name resolves to a type and none to a
+/// value, and otherwise as comparisons, as before type arguments at a call
+/// existed. A name that resolves only to a type cannot be a comparison
+/// operand, so the reading needs no knowledge of the callee. This is the one
+/// place a candidate is read; a tree whose readings differ is parsed again
+/// with these.
+pub fn call_readings(
+    program: &Program,
+    context: &CompilationContext,
+    environment: Option<&NameResolutionEnvironment>,
+) -> HashMap<Span, CallReading> {
+    if program.call_candidates.is_empty() {
+        return HashMap::new();
+    }
+    let mut resolver = Resolver::new(program, context);
+    resolver.environment = environment;
+    resolver.collect_declarations();
+    resolver.collect_imports();
+    let regions = type_parameter_regions(program);
+    program
+        .call_candidates
+        .iter()
+        .map(|candidate| {
+            resolver.type_parameter_scopes = vec![regions
+                .iter()
+                .filter(|(span, _)| span.contains(candidate.open_span))
+                .flat_map(|(_, names)| names.iter().cloned())
+                .collect()];
+            (candidate.open_span, resolver.call_reading(candidate))
+        })
+        .collect()
+}
+
+/// The span of every declaration that introduces type parameters, with
+/// their names.
+fn type_parameter_regions(program: &Program) -> Vec<(Span, Vec<String>)> {
+    fn names(params: &[TypeParamDecl]) -> Vec<String> {
+        params.iter().map(|param| param.name.clone()).collect()
+    }
+    fn members(regions: &mut Vec<(Span, Vec<String>)>, members: &[ClassMember]) {
+        for member in members {
+            if let ClassMember::Method(method) = member {
+                regions.push((method.span, names(&method.type_params)));
+            }
+        }
+    }
+    let mut regions = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Class(class) => {
+                regions.push((class.span, names(&class.type_params)));
+                members(&mut regions, &class.members);
+            }
+            Item::Trait(declaration) => {
+                regions.push((declaration.span, names(&declaration.type_params)));
+                members(&mut regions, &declaration.members);
+            }
+            Item::Interface(declaration) => {
+                regions.push((declaration.span, names(&declaration.type_params)));
+                for requirement in &declaration.requirements {
+                    regions.push((requirement.span, names(&requirement.type_params)));
+                }
+            }
+            Item::Enum(definition) => {
+                regions.push((definition.span, names(&definition.type_params)));
+            }
+            Item::Function(function) => {
+                regions.push((function.span, names(&function.type_params)));
+            }
+            Item::Constant(_)
+            | Item::ExternBlock(_)
+            | Item::ForeignAggregate(_)
+            | Item::Statement(_) => {}
+        }
+    }
+    regions
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +479,14 @@ pub const EDITION_2026_PRELUDE: &[PreludeEntry] = &[
         reserved: true,
     },
     PreludeEntry {
+        name: "ArrayRegion",
+        reserved: true,
+    },
+    PreludeEntry {
+        name: "WritableArrayRegion",
+        reserved: true,
+    },
+    PreludeEntry {
         name: "List",
         reserved: true,
     },
@@ -456,16 +561,15 @@ pub fn compiler_known_attribute_id(name: &str) -> GlobalSymbolId {
     }
 }
 
+/// Resolves a program; only an error fails it. Use
+/// [`resolve_program_for_ide`] to receive warnings with the result.
 pub fn resolve_program(
     program: &Program,
     context: &CompilationContext,
 ) -> DiagnosticResult<ResolvedProgram> {
     let analysis = resolve_program_for_ide(program, context);
-    if analysis.diagnostics.is_empty() {
-        Ok(analysis.resolved)
-    } else {
-        Err(analysis.diagnostics)
-    }
+    crate::diagnostics::separate_errors(analysis.diagnostics)?;
+    Ok(analysis.resolved)
 }
 
 pub fn resolve_program_for_ide(
@@ -556,7 +660,14 @@ pub fn graph_declaration_headers(
                     GlobalSymbolKind::Constant,
                     value.access,
                 ),
-                Item::Statement(_) => return None,
+                Item::ForeignAggregate(value) => (
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::ForeignAggregate,
+                    value.access,
+                ),
+                Item::ExternBlock(_) | Item::Statement(_) => return None,
             };
             let qualified_name = canonical(name);
             Some(GlobalSymbolDeclaration {
@@ -716,7 +827,11 @@ impl<'a> Resolver<'a> {
                     unresolved: self.unresolved,
                 },
             },
-            diagnostics: self.diagnostics,
+            diagnostics: {
+                let mut diagnostics = self.diagnostics;
+                diagnostics.extend(crate::unsafe_policy::check(self.authored, self.context));
+                diagnostics
+            },
         }
     }
 
@@ -796,7 +911,14 @@ impl<'a> Resolver<'a> {
                     GlobalSymbolKind::Constant,
                     value.access,
                 )),
-                Item::Statement(_) => None,
+                Item::ForeignAggregate(value) => Some((
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::ForeignAggregate,
+                    value.access,
+                )),
+                Item::ExternBlock(_) | Item::Statement(_) => None,
             };
             let Some((source_name, name_span, declaration_span, kind, access)) = declaration else {
                 continue;
@@ -1372,6 +1494,16 @@ impl<'a> Resolver<'a> {
                 constant.name = self.canonical_declaration_name(&constant.name);
                 self.normalize_const(constant);
             }
+            Item::ForeignAggregate(aggregate) => {
+                aggregate.name = self.canonical_declaration_name(&aggregate.name);
+                for field in aggregate.fields.iter_mut().flatten() {
+                    self.normalize_type(&mut field.ty, field.type_span, GlobalReferenceRole::Type);
+                    if let Some(default) = &mut field.default {
+                        self.normalize_expression(default);
+                    }
+                }
+            }
+            Item::ExternBlock(_) => {}
             Item::Statement(statement) => self.normalize_statement(statement),
         }
     }
@@ -1597,6 +1729,86 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    fn normalize_call_type_arguments(&mut self, type_arguments: &mut Option<CallTypeArguments>) {
+        if let Some(list) = type_arguments {
+            for argument in &mut list.arguments {
+                self.normalize_type(argument, list.span, GlobalReferenceRole::Type);
+            }
+        }
+    }
+
+    /// The reading [`call_readings`] gives one candidate.
+    fn call_reading(&self, candidate: &CallCandidate) -> CallReading {
+        if candidate.names.iter().all(|name| {
+            let (is_type, is_value) = self.candidate_name_meanings(&name.name);
+            is_type && !is_value
+        }) {
+            CallReading::TypeArguments
+        } else {
+            CallReading::Comparison
+        }
+    }
+
+    /// Whether `name` resolves to a type and whether it resolves to a value,
+    /// through the one resolution chain, without recording a reference.
+    fn candidate_name_meanings(&self, name: &str) -> (bool, bool) {
+        let type_parameter = !name.contains('\\')
+            && self
+                .type_parameter_scopes
+                .iter()
+                .any(|scope| scope.contains(name));
+        let canonical = if name.contains('\\') {
+            name.to_string()
+        } else if let Some(import) = self.imports.get(name) {
+            import.target.clone()
+        } else {
+            let current = self.namespace.as_ref().map_or_else(
+                || name.to_string(),
+                |namespace| format!("{namespace}\\{name}"),
+            );
+            if self.has_symbol(&current) {
+                current
+            } else {
+                name.to_string()
+            }
+        };
+        let kind = self
+            .declarations
+            .get(&canonical)
+            .map(|declaration| declaration.kind)
+            .or_else(|| {
+                self.environment
+                    .and_then(|environment| environment.declarations.get(&canonical))
+                    .map(|declaration| declaration.kind)
+            });
+        let (global_type, value) = match kind {
+            Some(
+                GlobalSymbolKind::Class
+                | GlobalSymbolKind::Enum
+                | GlobalSymbolKind::Interface
+                | GlobalSymbolKind::Trait
+                | GlobalSymbolKind::ForeignAggregate
+                | GlobalSymbolKind::CompilerKnownType,
+            ) => (true, false),
+            Some(
+                GlobalSymbolKind::Function
+                | GlobalSymbolKind::Constant
+                | GlobalSymbolKind::CompilerKnownIntrinsic
+                | GlobalSymbolKind::CompilerKnownTestDeclaration,
+            ) => (false, true),
+            Some(GlobalSymbolKind::CompilerKnownAttribute) => (false, false),
+            None => (
+                is_language_type_name(&canonical)
+                    || standard_type_identity(&canonical).is_some()
+                    || edition_prelude(self.context.edition)
+                        .iter()
+                        .any(|entry| entry.name == canonical),
+                Builtin::from_name(&canonical).is_some(),
+            ),
+        };
+        (type_parameter || global_type, value)
+    }
+
     fn normalize_arguments(&mut self, arguments: &mut [Argument]) {
         for argument in arguments {
             self.normalize_expression(&mut argument.value);
@@ -1611,7 +1823,9 @@ impl<'a> Resolver<'a> {
 
     fn normalize_statement(&mut self, statement: &mut Stmt) {
         match statement {
-            Stmt::Block(block) => self.normalize_block(block),
+            Stmt::Block(block) | Stmt::Unsafe(UnsafeBlock { block, .. }) => {
+                self.normalize_block(block)
+            }
             Stmt::VarDecl(declaration) => {
                 if let Some(ty) = &mut declaration.ty {
                     self.normalize_type(ty, declaration.span, GlobalReferenceRole::Type);
@@ -1795,15 +2009,27 @@ impl<'a> Resolver<'a> {
                 self.normalize_expression(index);
             }
             Expr::PropertyAccess { object, .. } => self.normalize_expression(object),
-            Expr::MethodCall { object, args, .. } => {
+            Expr::MethodCall {
+                object,
+                type_arguments,
+                args,
+                ..
+            } => {
                 self.normalize_expression(object);
+                self.normalize_call_type_arguments(type_arguments);
                 self.normalize_arguments(args);
             }
             Expr::IsType { expr, ty, span } => {
                 self.normalize_expression(expr);
                 self.normalize_type(ty, *span, GlobalReferenceRole::TypeTest);
             }
-            Expr::FunctionCall { name, args, span } => {
+            Expr::FunctionCall {
+                name,
+                type_arguments,
+                args,
+                span,
+            } => {
+                self.normalize_call_type_arguments(type_arguments);
                 let source_name = name.clone();
                 let source_span = self.occurrence_span(&source_name, *span);
                 if let Some(resolved) = self.resolve_name(
@@ -1823,6 +2049,7 @@ impl<'a> Resolver<'a> {
             Expr::StaticCall {
                 qualifier,
                 qualifier_span,
+                type_arguments,
                 args,
                 ..
             } => {
@@ -1831,6 +2058,7 @@ impl<'a> Resolver<'a> {
                     *qualifier_span,
                     GlobalReferenceRole::StaticQualifier,
                 );
+                self.normalize_call_type_arguments(type_arguments);
                 self.normalize_arguments(args);
             }
             Expr::StaticMember {
@@ -1851,7 +2079,7 @@ impl<'a> Resolver<'a> {
                 self.normalize_type(class_type, *span, GlobalReferenceRole::Constructor);
                 self.normalize_arguments(args);
             }
-            Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } | Expr::Unary { expr, .. } => {
                 self.normalize_expression(expr);
             }
             Expr::Binary { left, right, .. }
@@ -2012,6 +2240,7 @@ fn is_type_declaration_kind(kind: GlobalSymbolKind) -> bool {
             | GlobalSymbolKind::Enum
             | GlobalSymbolKind::Interface
             | GlobalSymbolKind::Trait
+            | GlobalSymbolKind::ForeignAggregate
     )
 }
 
@@ -2084,6 +2313,19 @@ pub fn compiler_known_symbol_facts(edition: Edition) -> Vec<CompilerKnownSymbolF
             kind: GlobalSymbolKind::CompilerKnownType,
             source_name: canonical.to_string(),
             provenance: CompilerKnownProvenance::StandardTerm,
+        }),
+    );
+    facts.extend(
+        crate::compiler_known_ffi::canonical_types().map(|canonical| CompilerKnownSymbolFact {
+            id: GlobalSymbolId {
+                owner: GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardFfi(
+                    canonical.to_string(),
+                )),
+                qualified_name: canonical.to_string(),
+            },
+            kind: GlobalSymbolKind::CompilerKnownType,
+            source_name: canonical.to_string(),
+            provenance: CompilerKnownProvenance::StandardFfi,
         }),
     );
     facts.extend(

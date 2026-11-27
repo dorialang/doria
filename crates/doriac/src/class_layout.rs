@@ -50,6 +50,26 @@ pub enum FieldType {
     Aggregate { size: u32, align: u32 },
 }
 
+impl FieldType {
+    /// The field of an inline value, `?T` when `nullable`. A nullable
+    /// pointer is its word; any other nullable inline value carries a
+    /// presence word ahead of it (`native_closure_abi::NullableScalarForm`).
+    pub const fn inline(ty: crate::inline_value::InlineValueType, nullable: bool) -> Self {
+        let bytes = ty.storage_bytes();
+        let zero_is_null = crate::native_closure_abi::nullable_scalar_is_zero_is_null(
+            crate::mir::ScalarType::Inline(ty),
+        );
+        Self::Aggregate {
+            size: if nullable && !zero_is_null {
+                bytes * 2
+            } else {
+                bytes
+            },
+            align: bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertyLayout {
     pub id: PropertyId,

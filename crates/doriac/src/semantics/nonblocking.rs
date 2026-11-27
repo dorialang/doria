@@ -691,7 +691,9 @@ impl Checker<'_> {
             Expr::Closure(closure) => {
                 graph.origins.entry(value).or_default().insert(closure.span);
             }
-            Expr::Grouped { expr, .. } => graph.alias(Value::Expression(expr.span()), value),
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } => {
+                graph.alias(Value::Expression(expr.span()), value)
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => {

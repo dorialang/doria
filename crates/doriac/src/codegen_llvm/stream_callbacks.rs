@@ -399,7 +399,7 @@ impl<'ctx> Emitter<'_, 'ctx> {
                             build(self.builder.build_store(slot, params[2]))?;
                             slot
                         }
-                        mir::Type::ByteRegion(_) => {
+                        mir::Type::Region(_) => {
                             let slot = build(
                                 self.builder
                                     .build_alloca(word.array_type(2), "stream.region.carrier"),
@@ -846,7 +846,7 @@ mod tests {
         let context = Context::create();
         let machine = host_target_machine().unwrap();
         let target = machine.get_target_data();
-        let module = build_module(&context, &machine, &program, None).unwrap();
+        let module = build_module(&context, &machine, &program, None, None).unwrap();
         let declarations = DeclaredProgram {
             functions: program
                 .functions

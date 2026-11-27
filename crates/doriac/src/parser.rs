@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::ast::*;
 use crate::diagnostics::{
     Diagnostic, DiagnosticResult, DiagnosticSource, FixApplicability, FixEdit,
@@ -10,14 +12,75 @@ use crate::types::{
     FunctionTypeParameterRef, FunctionTypeRef, FunctionTypeThrowsRef, TypeRef,
 };
 
+mod foreign;
+
+pub(crate) use foreign::{documentation_comments, DocCommentText};
+
 pub struct Parser {
     tokens: Vec<Token>,
+    /// Documentation comments of the source, in order (Decision 0148
+    /// section 27). Empty when the caller has no source comments to give.
+    doc_comments: Vec<DocCommentText>,
+    /// True while parsing a foreign struct or union field's type, the one
+    /// place a fixed-length array type `T[N]` is written.
+    foreign_field_type: bool,
+    /// The member a foreign block or aggregate last began at. Recovery that
+    /// returns to the same token skips it, so a malformed member cannot stall.
+    recovery_stalled_at: Option<usize>,
     source_id: SourceId,
     current: usize,
     pending_type_argument_close: Option<Span>,
     qualified_names: Vec<QualifiedNameRef>,
     attributes: Vec<AttributeAttachment>,
     diagnostics: Vec<Diagnostic>,
+    /// `Some` while answering [`crate::syntax::completion_context`]: the
+    /// construct that first reached the end of the text, once one has.
+    completion: Option<Option<crate::syntax::CompletionContext>>,
+    /// How many diagnostics existed when the parser reached the end of the
+    /// tokens. A construct marks the cursor only while no diagnostic has been
+    /// added since, so recovery from an error at the cursor marks nothing.
+    cursor_arrival: Option<usize>,
+    /// How many loop bodies enclose the statement being parsed, counted
+    /// from the innermost function or closure body. Completion reports it,
+    /// so `break` and `continue` are offered only inside a loop.
+    loop_depth: usize,
+    /// True while parsing the name after `namespace`, which names only
+    /// namespaces, never a declaration.
+    declaring_namespace: bool,
+    /// `Some` while asking whether the parser accepts the token at an index.
+    token_trial: Option<TokenTrial>,
+    /// The token kinds a trial's parse paths tested right after the trial
+    /// token, once they had consumed it.
+    trial_followers: std::cell::RefCell<Vec<TokenKind>>,
+    /// Every `callee<A, B>(` whose type arguments are all plain names, with
+    /// the reading this parse gave it (Decision 0105, Amendment: Type
+    /// Arguments At The Call).
+    call_candidates: Vec<CallCandidate>,
+    /// The readings name resolution chose, keyed by the span of each
+    /// candidate's `<`; a candidate without one reads as type arguments.
+    call_readings: HashMap<Span, CallReading>,
+}
+
+/// What a token trial found: whether a parse path took the token, and which
+/// tokens the paths that consumed it asked for next.
+pub(crate) struct TokenTrialOutcome {
+    pub(crate) accepted: bool,
+    pub(crate) followers: Vec<TokenKind>,
+}
+
+/// Whether some parse path takes the token at `index`: it consumes the token
+/// with no error since reaching it, and the first error it reports afterwards,
+/// if any, is not on the token.
+#[derive(Clone, Copy)]
+struct TokenTrial {
+    index: usize,
+    span: Span,
+    /// How many diagnostics existed when the parser reached the token.
+    arrival: Option<usize>,
+    /// How many diagnostics existed when a path consumed the token, until that
+    /// path's next diagnostic is judged.
+    consumed: Option<usize>,
+    accepted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -27,6 +90,7 @@ struct ParserCheckpoint {
     qualified_names_len: usize,
     attributes_len: usize,
     diagnostics_len: usize,
+    call_candidates_len: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -37,9 +101,12 @@ struct FunctionModifiers {
     writable_span: Option<Span>,
     consuming_span: Option<Span>,
     static_span: Option<Span>,
+    unsafe_span: Option<Span>,
     start_span: Span,
     is_member: bool,
     allow_requirement: bool,
+    /// A declaration inside an `extern` block: it ends with `;`, not a body.
+    foreign_declaration: bool,
 }
 
 impl Parser {
@@ -49,12 +116,136 @@ impl Parser {
             .map_or_else(SourceId::default, |token| token.span.source);
         Self {
             tokens,
+            doc_comments: Vec::new(),
+            foreign_field_type: false,
+            recovery_stalled_at: None,
             source_id,
             current: 0,
             pending_type_argument_close: None,
             qualified_names: Vec::new(),
             attributes: Vec::new(),
             diagnostics: Vec::new(),
+            completion: None,
+            cursor_arrival: None,
+            loop_depth: 0,
+            declaring_namespace: false,
+            token_trial: None,
+            trial_followers: std::cell::RefCell::new(Vec::new()),
+            call_candidates: Vec::new(),
+            call_readings: HashMap::new(),
+        }
+    }
+
+    /// Reads each plain-name call candidate as name resolution chose.
+    pub fn with_call_readings(mut self, readings: HashMap<Span, CallReading>) -> Self {
+        self.call_readings = readings;
+        self
+    }
+
+    /// Whether the parser accepts the token at `index`: some parse path,
+    /// speculative ones included, consumes it before reporting an error after
+    /// reaching it (see [`crate::syntax`]).
+    pub(crate) fn token_trial_at(mut self, index: usize) -> TokenTrialOutcome {
+        self.token_trial = Some(TokenTrial {
+            index,
+            span: self.tokens[index].span,
+            arrival: None,
+            consumed: None,
+            accepted: false,
+        });
+        self.note_trial_arrival();
+        let _ = self.parse_source_items();
+        self.judge_trial();
+        TokenTrialOutcome {
+            accepted: self.token_trial.is_some_and(|trial| trial.accepted),
+            followers: self.trial_followers.take(),
+        }
+    }
+
+    /// Judges the path that consumed the trial token by its next diagnostic:
+    /// one on the token rejects it there; one elsewhere, or none by the end,
+    /// accepts it.
+    fn judge_trial(&mut self) {
+        let Some(trial) = self.token_trial.as_mut() else {
+            return;
+        };
+        let Some(count) = trial.consumed else {
+            return;
+        };
+        match self.diagnostics.get(count) {
+            Some(diagnostic) => {
+                let span = diagnostic.span;
+                let on_token = span.start >= trial.span.start && span.start < trial.span.end;
+                trial.accepted |= !on_token;
+                trial.consumed = None;
+            }
+            None if self.current + 1 >= self.tokens.len() => {
+                trial.accepted = true;
+                trial.consumed = None;
+            }
+            None => {}
+        }
+    }
+
+    fn note_trial_arrival(&mut self) {
+        let current = self.current;
+        let count = self.diagnostics.len();
+        if let Some(trial) = self.token_trial.as_mut() {
+            if current == trial.index && trial.arrival.is_none() {
+                trial.arrival = Some(count);
+            }
+        }
+    }
+
+    /// The construct that first reaches the end of the tokens, which is where
+    /// the cursor is (see [`crate::syntax`]). `None` when no recorded
+    /// construct reaches it.
+    pub(crate) fn completion_context(mut self) -> Option<crate::syntax::CompletionContext> {
+        self.completion = Some(None);
+        self.note_cursor_arrival();
+        let _ = self.parse_source_items();
+        self.completion.flatten()
+    }
+
+    /// Records `context` for completion when the parser is at the end of the
+    /// tokens. The first construct to record wins: it is the outermost one
+    /// that reaches the cursor.
+    fn mark_cursor(&mut self, context: crate::syntax::CompletionContext) {
+        self.mark_cursor_at(self.current, context);
+    }
+
+    /// As [`Self::mark_cursor`], for the token at `index`, used where the
+    /// parser decides by looking one token ahead.
+    fn mark_cursor_at(&mut self, index: usize, context: crate::syntax::CompletionContext) {
+        let undisturbed = self
+            .cursor_arrival
+            .is_none_or(|count| count == self.diagnostics.len());
+        if let Some(slot @ None) = self.completion.as_mut() {
+            if undisturbed
+                && self
+                    .tokens
+                    .get(index)
+                    .is_some_and(|token| matches!(token.kind, TokenKind::Eof))
+            {
+                *slot = Some(context);
+            }
+        }
+    }
+
+    fn note_cursor_arrival(&mut self) {
+        if self.completion.is_some() && self.cursor_arrival.is_none() && self.is_at_end() {
+            self.cursor_arrival = Some(self.diagnostics.len());
+        }
+    }
+
+    /// `function` followed by a name declares a function. The cursor right
+    /// after `function` is where that name goes.
+    fn mark_function_name(&mut self) {
+        if self.check(&TokenKind::Function) {
+            self.mark_cursor_at(
+                self.current + 1,
+                crate::syntax::CompletionContext::DeclarationName,
+            );
         }
     }
 
@@ -62,7 +253,54 @@ impl Parser {
         Span::in_source(self.source_id, start, end)
     }
 
-    pub fn parse_program(mut self) -> DiagnosticResult<Program> {
+    pub fn parse_program(self) -> DiagnosticResult<Program> {
+        self.parse_program_with_candidates().0
+    }
+
+    /// The program, with the call candidates the parse met even when it
+    /// failed.
+    pub fn parse_program_with_candidates(
+        mut self,
+    ) -> (DiagnosticResult<Program>, Vec<CallCandidate>) {
+        let (directives, namespace, imports, includes, items) = self.parse_source_items();
+        let candidates = self.call_candidates.clone();
+        let program = if self.diagnostics.is_empty() {
+            Ok(Program {
+                directives,
+                namespace,
+                imports,
+                includes,
+                qualified_names: self.qualified_names,
+                attributes: self.attributes,
+                call_candidates: self.call_candidates,
+                items,
+            })
+        } else {
+            Err(self.diagnostics)
+        };
+        (program, candidates)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn parse_source_items(
+        &mut self,
+    ) -> (
+        Vec<DeclareDirective>,
+        Option<NamespaceDecl>,
+        Vec<UseDecl>,
+        Vec<IncludeDecl>,
+        Vec<Item>,
+    ) {
+        use crate::syntax::CompletionContext;
+        self.mark_cursor(CompletionContext::TopLevel);
+        let mut directives = Vec::new();
+        while self.match_kind(&TokenKind::Declare) {
+            match self.parse_declare_directive() {
+                Some(directive) => directives.push(directive),
+                None => self.synchronize(),
+            }
+            self.mark_cursor(CompletionContext::TopLevel);
+        }
         let mut namespace_seen = false;
         let namespace = if self.match_kind(&TokenKind::Namespace) {
             namespace_seen = true;
@@ -74,7 +312,27 @@ impl Parser {
         let mut includes = Vec::new();
         let mut items = Vec::new();
 
-        while !self.is_at_end() {
+        loop {
+            self.mark_cursor(CompletionContext::TopLevel);
+            if self.is_at_end() {
+                break;
+            }
+            if self.match_kind(&TokenKind::Declare) {
+                let keyword_span = self.previous().span;
+                let directive = self.parse_declare_directive();
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "`declare` directives come first in a file, before `namespace`, `use` and every declaration",
+                        keyword_span,
+                    )
+                    .with_title("Declare Directive Is Not First"),
+                );
+                if directive.is_none() {
+                    self.synchronize();
+                }
+                continue;
+            }
             if self.match_kind(&TokenKind::Namespace) {
                 let keyword_span = self.previous().span;
                 let duplicate = namespace_seen;
@@ -116,24 +374,12 @@ impl Parser {
                 }
             } else {
                 match self.parse_item() {
-                    Some(item) => items.push(item),
+                    Some(parsed) => items.extend(parsed),
                     None => self.synchronize(),
                 }
             }
         }
-
-        if self.diagnostics.is_empty() {
-            Ok(Program {
-                namespace,
-                imports,
-                includes,
-                qualified_names: self.qualified_names,
-                attributes: self.attributes,
-                items,
-            })
-        } else {
-            Err(self.diagnostics)
-        }
+        (directives, namespace, imports, includes, items)
     }
 
     fn checkpoint(&self) -> ParserCheckpoint {
@@ -143,19 +389,43 @@ impl Parser {
             qualified_names_len: self.qualified_names.len(),
             attributes_len: self.attributes.len(),
             diagnostics_len: self.diagnostics.len(),
+            call_candidates_len: self.call_candidates.len(),
         }
     }
 
     fn restore_checkpoint(&mut self, checkpoint: ParserCheckpoint) {
+        if self.tokens[checkpoint.current].kind != TokenKind::Eof {
+            self.cursor_arrival = None;
+        }
+        if self.token_trial.is_some() {
+            self.judge_trial();
+            if let Some(trial) = self.token_trial.as_mut() {
+                if checkpoint.current <= trial.index {
+                    trial.arrival = None;
+                    // A path that ends without a diagnostic after the token
+                    // took it.
+                    if trial.consumed.is_some() {
+                        trial.accepted = true;
+                        trial.consumed = None;
+                    }
+                }
+            }
+        }
         self.current = checkpoint.current;
         self.pending_type_argument_close = checkpoint.pending_type_argument_close;
         self.qualified_names
             .truncate(checkpoint.qualified_names_len);
         self.attributes.truncate(checkpoint.attributes_len);
         self.diagnostics.truncate(checkpoint.diagnostics_len);
+        self.call_candidates
+            .truncate(checkpoint.call_candidates_len);
     }
 
     fn parse_namespace(&mut self) -> Option<NamespaceDecl> {
+        self.mark_cursor(crate::syntax::CompletionContext::NamespacePath {
+            qualifier: String::new(),
+            declarations_allowed: false,
+        });
         let keyword_span = self.previous().span;
         if self.check(&TokenKind::Semicolon) || self.is_at_end() {
             self.diagnostics.push(
@@ -168,7 +438,10 @@ impl Parser {
             );
             return None;
         }
-        let name = self.expect_qualified_name_ref("expected namespace name")?;
+        self.declaring_namespace = true;
+        let name = self.expect_qualified_name_ref("expected namespace name");
+        self.declaring_namespace = false;
+        let name = name?;
         if self.check(&TokenKind::Backslash) {
             self.report_incomplete_qualified_name("namespace name");
             return None;
@@ -197,6 +470,10 @@ impl Parser {
     }
 
     fn parse_use_decl(&mut self) -> Option<UseDecl> {
+        self.mark_cursor(crate::syntax::CompletionContext::NamespacePath {
+            qualifier: String::new(),
+            declarations_allowed: true,
+        });
         let keyword_span = self.previous().span;
         if self.check(&TokenKind::Function) || self.check(&TokenKind::Const) {
             let rejected = self.advance().clone();
@@ -446,8 +723,32 @@ impl Parser {
         })
     }
 
-    fn parse_item(&mut self) -> Option<Item> {
+    fn parse_item(&mut self) -> Option<Vec<Item>> {
+        let documentation = self.documentation_before(self.current);
         let attributes = self.parse_attribute_groups()?;
+        if self.match_kind(&TokenKind::Extern) {
+            return self.parse_extern_items(
+                MemberAccess::External,
+                None,
+                documentation,
+                attributes,
+            );
+        }
+        if self.check(&TokenKind::Internal)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Extern))
+        {
+            let internal_span = self.advance().span;
+            self.advance();
+            return self.parse_extern_items(
+                MemberAccess::Internal,
+                Some(internal_span),
+                documentation,
+                attributes,
+            );
+        }
         let open_span = self
             .match_kind(&TokenKind::Open)
             .then(|| self.previous().span);
@@ -467,6 +768,8 @@ impl Parser {
         let declaration_start = open_span
             .or(override_span)
             .map_or_else(|| self.peek().span.start, |span| span.start);
+        let unsafe_span = self.match_unsafe_function_modifier();
+        self.mark_function_name();
         let item = if self.match_kind(&TokenKind::Class) {
             if let Some(span) = override_span {
                 self.diagnostics.push(
@@ -494,7 +797,8 @@ impl Parser {
                 .map(Item::Trait)
         } else if self.match_kind(&TokenKind::Internal) {
             self.reject_type_modifier(open_span, override_span, "`internal`");
-            self.parse_internal_item(self.previous().span)
+            let internal_span = self.previous().span;
+            return self.parse_internal_item(internal_span, documentation, attributes);
         } else if self.match_kind(&TokenKind::Consuming) {
             let consuming_span = self.previous().span;
             self.expect(TokenKind::Function, "expected `function` after `consuming`")?;
@@ -505,9 +809,11 @@ impl Parser {
                 writable_span: None,
                 consuming_span: Some(consuming_span),
                 static_span: None,
+                unsafe_span,
                 start_span: self.span(declaration_start, self.previous().span.end),
                 is_member: false,
                 allow_requirement: false,
+                foreign_declaration: false,
             })
             .map(Item::Function)
         } else if self.check(&TokenKind::Function)
@@ -524,11 +830,16 @@ impl Parser {
                 writable_span: None,
                 consuming_span: None,
                 static_span: None,
+                unsafe_span,
                 start_span: self.span(declaration_start, self.previous().span.end),
                 is_member: false,
                 allow_requirement: false,
+                foreign_declaration: false,
             })
-            .map(Item::Function)
+            .map(|mut function| {
+                function.documentation = documentation.clone().map(Box::new);
+                Item::Function(function)
+            })
         } else if self.match_kind(&TokenKind::Const) {
             self.reject_type_modifier(open_span, override_span, "a constant");
             let start = self.previous().span.start;
@@ -554,7 +865,22 @@ impl Parser {
                 self.attach_item_attributes(attributes, item);
             }
         }
-        item
+        item.map(|item| vec![item])
+    }
+
+    /// `unsafe` before `function` and a name; any other `unsafe` begins a
+    /// statement.
+    fn match_unsafe_function_modifier(&mut self) -> Option<Span> {
+        let is_modifier = self.check(&TokenKind::Unsafe)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Function))
+            && self
+                .tokens
+                .get(self.current + 2)
+                .is_some_and(Self::is_callable_name_token);
+        is_modifier.then(|| self.advance().span)
     }
 
     fn reject_type_modifier(
@@ -758,6 +1084,16 @@ impl Parser {
             Item::Trait(value) => (AttributeTargetKind::Trait, value.span, value.name_span),
             Item::Function(value) => (AttributeTargetKind::Function, value.span, value.name_span),
             Item::Constant(value) => (AttributeTargetKind::Constant, value.span, value.name_span),
+            Item::ExternBlock(value) => (
+                AttributeTargetKind::ExternBlock,
+                value.span,
+                value.extern_span,
+            ),
+            Item::ForeignAggregate(value) => (
+                AttributeTargetKind::ForeignAggregate,
+                value.span,
+                value.name_span,
+            ),
             Item::Statement(_) => return,
         };
         self.attach_attributes(
@@ -849,7 +1185,12 @@ impl Parser {
         );
     }
 
-    fn parse_internal_item(&mut self, internal_span: Span) -> Option<Item> {
+    fn parse_internal_item(
+        &mut self,
+        internal_span: Span,
+        documentation: Option<DocComment>,
+        attributes: Vec<AttributeGroup>,
+    ) -> Option<Vec<Item>> {
         if self.check(&TokenKind::AttributeOpen) {
             self.reject_attribute_after_modifier(internal_span);
             let _ = self.parse_attribute_groups();
@@ -860,7 +1201,18 @@ impl Parser {
         let override_span = self
             .match_kind(&TokenKind::Override)
             .then(|| self.previous().span);
-        if self.match_kind(&TokenKind::Class) {
+        if self.match_kind(&TokenKind::Extern) {
+            self.reject_type_modifier(open_span, override_span, "an `extern` declaration");
+            return self.parse_extern_items(
+                MemberAccess::Internal,
+                Some(internal_span),
+                documentation,
+                attributes,
+            );
+        }
+        let unsafe_span = self.match_unsafe_function_modifier();
+        self.mark_function_name();
+        let item = if self.match_kind(&TokenKind::Class) {
             if let Some(span) = override_span {
                 self.reject_type_modifier(None, Some(span), "a class");
             }
@@ -888,9 +1240,11 @@ impl Parser {
                 writable_span: None,
                 consuming_span: Some(consuming_span),
                 static_span: None,
+                unsafe_span,
                 start_span: internal_span.merge(self.previous().span),
                 is_member: false,
                 allow_requirement: false,
+                foreign_declaration: false,
             })
             .map(Item::Function)
         } else if self.check(&TokenKind::Function)
@@ -907,11 +1261,16 @@ impl Parser {
                 writable_span: None,
                 consuming_span: None,
                 static_span: None,
+                unsafe_span,
                 start_span: internal_span.merge(self.previous().span),
                 is_member: false,
                 allow_requirement: false,
+                foreign_declaration: false,
             })
-            .map(Item::Function)
+            .map(|mut function| {
+                function.documentation = documentation.map(Box::new);
+                Item::Function(function)
+            })
         } else if self.match_kind(&TokenKind::Const) {
             self.reject_type_modifier(open_span, override_span, "a constant");
             self.parse_const_decl(MemberAccess::Internal, internal_span.start)
@@ -926,10 +1285,15 @@ impl Parser {
                 .with_title("Internal Declaration Is Incomplete"),
             );
             None
+        };
+        if let Some(item) = &item {
+            self.attach_item_attributes(attributes, item);
         }
+        item.map(|item| vec![item])
     }
 
     fn parse_enum(&mut self, access: MemberAccess, start: usize) -> Option<EnumDecl> {
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_type_declaration_name("expected enum name")?;
         let name_span = self.previous().span;
         let (type_params, _) = self.parse_type_params()?;
@@ -945,6 +1309,7 @@ impl Parser {
             let attributes = self.parse_attribute_groups()?;
             let case_start = self.peek().span.start;
             self.expect(TokenKind::Case, "expected `case` in enum body")?;
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             let name = self.expect_identifier("expected enum case name")?;
             let name_span = self.previous().span;
             let payload = if self.match_kind(&TokenKind::LeftParen) {
@@ -1003,6 +1368,7 @@ impl Parser {
             let attributes = self.parse_attribute_groups()?;
             let start = self.peek().span.start;
             let ty = self.parse_type_ref()?;
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             let (name, name_span) = self.expect_variable("expected enum payload variable")?;
             let field = EnumPayloadField {
                 ty,
@@ -1032,6 +1398,7 @@ impl Parser {
         start: usize,
     ) -> Option<ClassDecl> {
         let keyword_span = self.previous().span;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_type_declaration_name("expected class name")?;
         let name_span = self.previous().span;
         let (type_params, type_parameters) = self.parse_type_params()?;
@@ -1091,6 +1458,7 @@ impl Parser {
 
     fn parse_trait(&mut self, access: MemberAccess, start: usize) -> Option<TraitDecl> {
         let keyword_span = self.previous().span;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_type_declaration_name("expected trait name")?;
         let name_span = self.previous().span;
         let (type_params, type_parameters) = self.parse_type_params()?;
@@ -1121,6 +1489,7 @@ impl Parser {
     }
 
     fn parse_class_member(&mut self, allow_requirement: bool) -> Option<ClassMember> {
+        let documentation = self.documentation_before(self.current);
         let attributes = self.parse_attribute_groups()?;
         if self.match_kind(&TokenKind::Uses) {
             self.reject_attribute_target(&attributes, "trait composition");
@@ -1202,15 +1571,17 @@ impl Parser {
         let mut writable_span = None;
         let mut consuming_span = None;
         let mut readonly_span = None;
+        let mut unsafe_span = None;
         while matches!(
             self.peek().kind,
-            TokenKind::Writable | TokenKind::Consuming | TokenKind::Readonly
+            TokenKind::Writable | TokenKind::Consuming | TokenKind::Readonly | TokenKind::Unsafe
         ) {
             let token = self.advance().clone();
             let slot = match token.kind {
                 TokenKind::Writable => &mut writable_span,
                 TokenKind::Consuming => &mut consuming_span,
                 TokenKind::Readonly => &mut readonly_span,
+                TokenKind::Unsafe => &mut unsafe_span,
                 _ => unreachable!("receiver modifier was checked above"),
             };
             if slot.replace(token.span).is_some() {
@@ -1249,6 +1620,7 @@ impl Parser {
             self.reject_attribute_after_modifier(self.peek().span);
             let _ = self.parse_attribute_groups();
         }
+        self.mark_function_name();
         if self.check(&TokenKind::Function)
             && self.tokens.get(self.current + 1).is_some_and(|token| {
                 Self::is_callable_name_token(token) || matches!(token.kind, TokenKind::Reserved(_))
@@ -1264,11 +1636,16 @@ impl Parser {
                     writable_span,
                     consuming_span,
                     static_span,
+                    unsafe_span,
                     start_span: self.span(member_start, start),
                     is_member: true,
                     allow_requirement,
+                    foreign_declaration: false,
                 })
-                .map(ClassMember::Method);
+                .map(|mut method| {
+                    method.documentation = documentation.map(Box::new);
+                    ClassMember::Method(method)
+                });
             if let Some(member) = &member {
                 self.attach_member_attributes(attributes, member);
             }
@@ -1285,8 +1662,19 @@ impl Parser {
                 .with_title("Consuming Modifier Requires A Method"),
             );
         }
+        if let Some(span) = unsafe_span {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`unsafe` can modify only a function or method",
+                    span,
+                )
+                .with_title("Unsafe Modifier Requires A Function"),
+            );
+        }
         let start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected property variable name")?;
         let availability = self.parse_nominal_condition()?;
         let initializer = if self.match_kind(&TokenKind::Equals) {
@@ -1455,7 +1843,7 @@ impl Parser {
                 statements: vec![statement],
             })
         } else {
-            FunctionBody::Block(self.parse_block()?)
+            FunctionBody::Block(self.parse_callable_body()?)
         };
         Some(PropertyHook {
             kind,
@@ -1522,6 +1910,7 @@ impl Parser {
         } else {
             Some(self.parse_type_ref()?)
         };
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_identifier("expected constant name")?;
         let name_span = self.previous().span;
         self.expect(TokenKind::Equals, "expected `=` after constant name")?;
@@ -1555,12 +1944,15 @@ impl Parser {
             writable_span,
             consuming_span,
             static_span,
+            unsafe_span,
             start_span,
             is_member,
             allow_requirement,
+            foreign_declaration,
         } = modifiers;
         let keyword_span = self.previous().span;
         let start = start_span.start;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = if is_member && matches!(self.peek().kind, TokenKind::Reserved(_)) {
             self.expect_member_name("expected function name")?
         } else {
@@ -1611,12 +2003,36 @@ impl Parser {
         };
 
         let availability = self.parse_nominal_condition()?;
-        let body = if allow_requirement && self.match_kind(&TokenKind::Semicolon) {
+        let body = if foreign_declaration {
+            if self.check(&TokenKind::LeftBrace) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "a declaration in an `extern` block names a foreign symbol and has no body",
+                        self.peek().span,
+                    )
+                    .with_title("Extern Declaration Has A Body")
+                    .with_help(
+                        "end the declaration with `;`, or write a C-callable Doria function as `extern \"C\" function` outside the block",
+                    ),
+                );
+                let _ = self.parse_callable_body();
+                return None;
+            }
+            FunctionBody::Foreign {
+                semicolon_span: self
+                    .expect(
+                        TokenKind::Semicolon,
+                        "expected `;` after the extern declaration",
+                    )?
+                    .span,
+            }
+        } else if allow_requirement && self.match_kind(&TokenKind::Semicolon) {
             FunctionBody::Requirement {
                 semicolon_span: self.previous().span,
             }
         } else {
-            FunctionBody::Block(self.parse_block()?)
+            FunctionBody::Block(self.parse_callable_body()?)
         };
         let span = self.span(start, body.span().end);
         Some(FunctionDecl {
@@ -1632,6 +2048,9 @@ impl Parser {
             consuming_span,
             is_static: static_span.is_some(),
             static_span,
+            unsafe_span,
+            linkage: FunctionLinkage::Doria,
+            documentation: None,
             name,
             name_span,
             type_params,
@@ -1688,6 +2107,7 @@ impl Parser {
             let attributes = self.parse_attribute_groups()?;
             self.reject_attribute_target(&attributes, "type parameters");
             let start = self.peek().span.start;
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             let name = self.expect_identifier("expected type-parameter name")?;
             let mut constraints = Vec::new();
             if self.match_kind(&TokenKind::Implements) {
@@ -1743,6 +2163,7 @@ impl Parser {
 
     fn parse_interface(&mut self, access: MemberAccess, start: usize) -> Option<InterfaceDecl> {
         let keyword_span = self.previous().span;
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let name = self.expect_type_declaration_name("expected interface name")?;
         let name_span = self.previous().span;
         let (type_params, type_parameters) = self.parse_type_params()?;
@@ -1915,7 +2336,11 @@ impl Parser {
 
     fn parse_declaration_members(&mut self, allow_requirement: bool) -> Vec<ClassMember> {
         let mut members = Vec::new();
-        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+        loop {
+            self.mark_cursor(crate::syntax::CompletionContext::MemberDeclaration);
+            if self.check(&TokenKind::RightBrace) || self.is_at_end() {
+                break;
+            }
             if matches!(
                 self.peek().kind,
                 TokenKind::Class
@@ -1958,6 +2383,7 @@ impl Parser {
                 | TokenKind::Internal
                 | TokenKind::Writable
                 | TokenKind::Consuming
+                | TokenKind::Unsafe
                 | TokenKind::Static
                 | TokenKind::Open
                 | TokenKind::Override
@@ -2052,6 +2478,9 @@ impl Parser {
         let separator_span = self
             .expect(TokenKind::DoubleColon, "expected `::` after adapted trait")?
             .span;
+        self.mark_cursor(crate::syntax::CompletionContext::Static {
+            qualifier: origin.name.clone(),
+        });
         let text = self.expect_callable_name("expected trait method name")?;
         let method = NameRef {
             text,
@@ -2092,6 +2521,7 @@ impl Parser {
             let alias = if internal_span.is_some() && self.check(&TokenKind::Semicolon) {
                 None
             } else {
+                self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
                 let text = self.expect_identifier("expected an alias or `internal` after `as`")?;
                 Some(NameRef {
                     text,
@@ -2123,13 +2553,15 @@ impl Parser {
     }
 
     fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: true,
+            constructor_roles_allowed: is_constructor,
+        });
         let attributes = self.parse_attribute_groups()?;
         let start = self.peek().span.start;
         let mut authored_roles = Vec::new();
-        while matches!(
-            self.peek().kind,
-            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
-        ) {
+        while CONSTRUCTOR_ROLE_KEYWORDS.contains(&self.peek().kind) {
             authored_roles.push(self.advance().clone());
         }
         let duplicate_role = authored_roles.len() > 1
@@ -2384,6 +2816,7 @@ impl Parser {
             );
             return None;
         }
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected parameter variable name")?;
         let default = if self.match_kind(&TokenKind::Equals) {
             Some(self.parse_expression()?)
@@ -2501,7 +2934,7 @@ impl Parser {
             );
             return None;
         }
-        let block = self.parse_block()?;
+        let block = self.parse_callable_body()?;
         let span = self.span(keyword_span.start, block.span.end);
         Some(Expr::Closure(Box::new(ClosureExpression {
             form: ClosureForm::AnonymousBlock,
@@ -2541,6 +2974,11 @@ impl Parser {
     }
 
     fn parse_closure_parameter(&mut self) -> Option<ClosureParameter> {
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: true,
+            constructor_roles_allowed: false,
+        });
         let start = self.peek().span.start;
         let ownership_modifier_insert = self.span(start, start);
         let mut take_span = None;
@@ -2587,6 +3025,7 @@ impl Parser {
         let type_start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
         let type_span = self.span(type_start, self.previous().span.end);
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected closure parameter variable name")?;
         if self.match_kind(&TokenKind::Equals) {
             let equals = self.previous().span;
@@ -2773,7 +3212,13 @@ impl Parser {
             .start;
         let mut statements = Vec::new();
 
-        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+        loop {
+            self.mark_cursor(crate::syntax::CompletionContext::Statement {
+                in_loop: self.loop_depth > 0,
+            });
+            if self.check(&TokenKind::RightBrace) || self.is_at_end() {
+                break;
+            }
             if let Some(statement) = self.parse_statement() {
                 statements.push(statement);
             } else {
@@ -2825,6 +3270,15 @@ impl Parser {
         }
         if self.check(&TokenKind::LeftBrace) {
             return self.parse_block().map(Stmt::Block);
+        }
+        if self.check(&TokenKind::Unsafe)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::LeftBrace))
+        {
+            self.advance();
+            return self.parse_unsafe_block();
         }
         if self.check(&TokenKind::Finally) {
             self.reject_disallowed_finally();
@@ -2964,10 +3418,12 @@ impl Parser {
             return None;
         }
         if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
+            self.reject_unsafe_place(&expr);
             return self.parse_post_increment_statement(expr);
         }
 
         if let Some(op) = self.parse_assignment_op() {
+            self.reject_unsafe_place(&expr);
             let start = expr.span().start;
             let value = self.parse_expression()?;
             let end = self
@@ -3081,6 +3537,7 @@ impl Parser {
         semicolon_message: &str,
     ) -> Option<VarDecl> {
         let writable = self.match_kind(&TokenKind::Writable);
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected variable name after `let`")?;
         self.parse_var_decl_after_first_name(
             start,
@@ -3108,6 +3565,7 @@ impl Parser {
         let start = self.peek().span.start;
         let writable = self.match_kind(&TokenKind::Writable);
         if let Some(ty) = self.parse_type_ref() {
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             if let Some(first_name) = self.consume_variable() {
                 return self
                     .parse_var_decl_after_first_name(
@@ -3212,6 +3670,7 @@ impl Parser {
                 return None;
             }
 
+            self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
             let (name, span) =
                 self.expect_variable("expected variable name after `,` in grouped declaration")?;
             bindings.push(VarBinding { name, span });
@@ -3361,6 +3820,22 @@ impl Parser {
         })
     }
 
+    /// A loop body: `break` and `continue` may appear in it.
+    fn parse_loop_body(&mut self) -> Option<Block> {
+        self.loop_depth += 1;
+        let body = self.parse_block();
+        self.loop_depth -= 1;
+        body
+    }
+
+    /// A function or closure body starts outside every loop.
+    fn parse_callable_body(&mut self) -> Option<Block> {
+        let enclosing = std::mem::take(&mut self.loop_depth);
+        let body = self.parse_block();
+        self.loop_depth = enclosing;
+        body
+    }
+
     fn parse_while(&mut self) -> Option<WhileStmt> {
         let start = self.previous().span.start;
         self.parse_while_after_keyword(start, None)
@@ -3374,7 +3849,7 @@ impl Parser {
         self.expect(TokenKind::LeftParen, "expected `(` after while")?;
         let condition = self.parse_expression()?;
         self.expect(TokenKind::RightParen, "expected `)` after while condition")?;
-        let body = self.parse_block()?;
+        let body = self.parse_loop_body()?;
         let finally = self.parse_optional_finally()?;
         let end = finally
             .as_ref()
@@ -3390,7 +3865,7 @@ impl Parser {
 
     fn parse_do_while(&mut self) -> Option<DoWhileStmt> {
         let start = self.previous().span.start;
-        let body = self.parse_block()?;
+        let body = self.parse_loop_body()?;
         self.expect(TokenKind::While, "expected `while` after `do` block")?;
         self.expect(TokenKind::LeftParen, "expected `(` after while")?;
         let condition = self.parse_expression()?;
@@ -3517,6 +3992,7 @@ impl Parser {
             Some(ForInitializer::VarDecl(declaration))
         } else {
             let target = self.parse_expression()?;
+            self.reject_unsafe_place(&target);
             let Some(op) = self.parse_assignment_op() else {
                 self.error(
                     "expected a local declaration or an assignment in for initializer",
@@ -3552,7 +4028,7 @@ impl Parser {
         };
 
         self.expect(TokenKind::RightParen, "expected `)` after for clauses")?;
-        let body = self.parse_block()?;
+        let body = self.parse_loop_body()?;
         let span = self.span(start, body.span.end);
         Some(ForStmt {
             initializer,
@@ -3572,6 +4048,7 @@ impl Parser {
         }
 
         let target = self.parse_expression()?;
+        self.reject_unsafe_place(&target);
         if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
             return self
                 .parse_post_increment(target, false)
@@ -3614,6 +4091,7 @@ impl Parser {
             _ => unreachable!("pre-increment parser called without increment token"),
         };
         let target = self.parse_postfix()?;
+        self.reject_unsafe_place(&target);
         let end = if expect_semicolon {
             self.expect(
                 TokenKind::Semicolon,
@@ -3674,7 +4152,7 @@ impl Parser {
             (None, first)
         };
         self.expect(TokenKind::RightParen, "expected `)` after foreach bindings")?;
-        let body = self.parse_block()?;
+        let body = self.parse_loop_body()?;
         let span = self.span(start, body.span.end);
         Some(Stmt::Foreach(Box::new(ForeachStmt {
             iterable,
@@ -3705,6 +4183,7 @@ impl Parser {
         let type_start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
         let type_span = self.span(type_start, self.previous().span.end);
+        self.mark_cursor(crate::syntax::CompletionContext::DeclarationName);
         let (name, name_span) = self.expect_variable("expected foreach binding variable")?;
         let start = writable_span.map_or(type_span.start, |modifier| modifier.start);
         Some(ForeachBinding {
@@ -3720,6 +4199,100 @@ impl Parser {
 
     fn parse_expression(&mut self) -> Option<Expr> {
         self.parse_ternary()
+    }
+
+    /// The names between a candidate's `<` and `>`.
+    fn candidate_names(&self, open: usize) -> Vec<CandidateTypeName> {
+        let mut names = Vec::new();
+        let mut index = open + 1;
+        let mut name = String::new();
+        let mut name_start = None;
+        let mut name_end = 0;
+        loop {
+            let token = &self.tokens[index];
+            match &token.kind {
+                TokenKind::Identifier(segment) => {
+                    name_start.get_or_insert(token.span.start);
+                    name_end = token.span.end;
+                    name.push_str(segment);
+                }
+                TokenKind::Backslash => name.push('\\'),
+                _ => {
+                    if let Some(start) = name_start.take() {
+                        names.push(CandidateTypeName {
+                            name: std::mem::take(&mut name),
+                            span: self.span(start, name_end),
+                        });
+                    }
+                    if !matches!(token.kind, TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            index += 1;
+        }
+        names
+    }
+
+    /// `<T, ...>` stated at a call, when the tokens from `<` form a type
+    /// argument list followed by `(`. Returns the list, and records the call
+    /// as a candidate when every argument is a plain or namespaced name.
+    /// Leaves the position unchanged when they do not.
+    fn parse_call_type_arguments(&mut self) -> Option<CallTypeArguments> {
+        if !self.check(&TokenKind::Less) {
+            return None;
+        }
+        let open = self.current;
+        let checkpoint = self.checkpoint();
+        // A list that does not parse leaves completion as it found it.
+        let completion = self.completion.clone();
+        let open_span = self.advance().span;
+        let mut arguments = Vec::new();
+        let parsed = loop {
+            let Some(argument) = self.parse_type_ref_inner() else {
+                break false;
+            };
+            arguments.push(argument);
+            if self.pending_type_argument_close.is_some() || !self.match_kind(&TokenKind::Comma) {
+                break self.expect_type_argument_close().is_some();
+            }
+        };
+        if !parsed
+            || self.pending_type_argument_close.is_some()
+            || !self.check(&TokenKind::LeftParen)
+            || self.diagnostics.len() != checkpoint.diagnostics_len
+        {
+            self.restore_checkpoint(checkpoint);
+            self.completion = completion;
+            return None;
+        }
+        let span = open_span.merge(self.previous().span);
+        if arguments.iter().all(TypeRef::is_plain_name) {
+            // The same tokens also read as comparisons. Name resolution
+            // chooses; until it has, a candidate reads as type arguments,
+            // which every argument list parses as.
+            let read_as = self
+                .call_readings
+                .get(&open_span)
+                .copied()
+                .unwrap_or(CallReading::TypeArguments);
+            let candidate = CallCandidate {
+                open_span,
+                names: self.candidate_names(open),
+                read_as,
+            };
+            if read_as == CallReading::Comparison {
+                // Restoring drops the candidates recorded since the
+                // checkpoint, so this one is recorded after it: the tree
+                // keeps every candidate with the reading it was given.
+                self.restore_checkpoint(checkpoint);
+                self.completion = completion;
+                self.call_candidates.push(candidate);
+                return None;
+            }
+            self.call_candidates.push(candidate);
+        }
+        Some(CallTypeArguments { arguments, span })
     }
 
     fn parse_ternary(&mut self) -> Option<Expr> {
@@ -3796,6 +4369,9 @@ impl Parser {
         let mut left = self.parse_unary()?;
 
         loop {
+            self.mark_cursor(crate::syntax::CompletionContext::Expression {
+                after_operand: true,
+            });
             if self.check(&TokenKind::Is) {
                 const IS_PRECEDENCE: u8 = 8;
                 if IS_PRECEDENCE < min_prec {
@@ -3839,6 +4415,9 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Option<Expr> {
+        self.mark_cursor(crate::syntax::CompletionContext::Expression {
+            after_operand: false,
+        });
         let op = if self.match_kind(&TokenKind::Bang) || self.match_kind(&TokenKind::Not) {
             Some(UnaryOp::Not)
         } else if self.match_kind(&TokenKind::Minus) {
@@ -3911,7 +4490,7 @@ impl Parser {
                     || Self::has_unparenthesized_logical_binary(left)
                     || Self::has_unparenthesized_logical_binary(right)
             }
-            Expr::Grouped { .. } => false,
+            Expr::Grouped { .. } | Expr::Unsafe { .. } => false,
             Expr::Unary { expr, .. } => Self::has_unparenthesized_logical_binary(expr),
             _ => false,
         }
@@ -3926,7 +4505,7 @@ impl Parser {
                     || Self::has_unparenthesized_xor_binary(left)
                     || Self::has_unparenthesized_xor_binary(right)
             }
-            Expr::Grouped { .. } => false,
+            Expr::Grouped { .. } | Expr::Unsafe { .. } => false,
             Expr::Unary { expr, .. } => Self::has_unparenthesized_xor_binary(expr),
             _ => false,
         }
@@ -3944,9 +4523,11 @@ impl Parser {
                 None
             };
             if let Some(null_safe) = null_safe {
+                self.mark_cursor(crate::syntax::CompletionContext::Member);
                 let property = self
                     .expect_member_name("expected property or method name after member access")?;
                 let member_span = self.previous().span;
+                let type_arguments = self.parse_call_type_arguments();
                 if self.match_kind(&TokenKind::LeftParen) {
                     let argument_list_start = self.previous().span.start;
                     let args = self.parse_argument_list_after_open()?;
@@ -3957,6 +4538,7 @@ impl Parser {
                         object: Box::new(expr),
                         method: property,
                         member_span,
+                        type_arguments,
                         args,
                         argument_list_span,
                         null_safe,
@@ -3994,6 +4576,23 @@ impl Parser {
                 continue;
             }
 
+            if matches!(expr, Expr::Identifier { .. }) {
+                if let Some(type_arguments) = self.parse_call_type_arguments() {
+                    let Expr::Identifier { name, span } = expr else {
+                        unreachable!("the callee was matched as a name");
+                    };
+                    self.advance();
+                    let args = self.parse_argument_list_after_open()?;
+                    expr = Expr::FunctionCall {
+                        name,
+                        type_arguments: Some(type_arguments),
+                        args,
+                        span: self.span(span.start, self.previous().span.end),
+                    };
+                    continue;
+                }
+            }
+
             if self.match_kind(&TokenKind::LeftParen) {
                 let open_span = self.previous().span;
                 let callee_span = expr.span();
@@ -4003,6 +4602,7 @@ impl Parser {
                     Expr::Identifier { name, span } => {
                         expr = Expr::FunctionCall {
                             name,
+                            type_arguments: None,
                             args,
                             span: self.span(span.start, close_span.end),
                         };
@@ -4051,6 +4651,7 @@ impl Parser {
         }
         let token = self.advance().clone();
         match token.kind {
+            TokenKind::Unsafe => self.parse_unsafe_expression(token.span),
             TokenKind::Backslash => {
                 self.report_leading_namespace_separator(token.span);
                 let name_token = self.advance().clone();
@@ -4287,6 +4888,9 @@ impl Parser {
             )?;
             let qualifier_span = self.span(qualifier_token.span.start, self.previous().span.end);
             if self.match_kind(&TokenKind::DoubleColon) {
+                self.mark_cursor(crate::syntax::CompletionContext::Static {
+                    qualifier: name.clone(),
+                });
                 let case_token = self.advance().clone();
                 let TokenKind::Identifier(case) = case_token.kind else {
                     self.error("expected enum case after `::`", case_token.span);
@@ -4384,11 +4988,19 @@ impl Parser {
         qualifier_span: Span,
         start: usize,
     ) -> Option<Expr> {
+        self.mark_cursor(crate::syntax::CompletionContext::Static {
+            qualifier: match &qualifier {
+                StaticQualifier::Class(name) => name.clone(),
+                StaticQualifier::SelfType => "self".to_string(),
+                StaticQualifier::Parent => "parent".to_string(),
+                StaticQualifier::InvalidStatic => "static".to_string(),
+            },
+        });
         let token = self.advance().clone();
-        let (member, member_sigil_span) = match token.kind {
-            TokenKind::Identifier(name) | TokenKind::Reserved(name) => (name, None),
-            TokenKind::Variable(name) => (
-                name,
+        let (member, member_sigil_span) = match (&token.kind, Self::member_name(&token.kind)) {
+            (_, Some(name)) => (name, None),
+            (TokenKind::Variable(name), None) => (
+                name.clone(),
                 Some(self.span(token.span.start, token.span.start + 1)),
             ),
             _ => {
@@ -4397,6 +5009,7 @@ impl Parser {
             }
         };
 
+        let type_arguments = self.parse_call_type_arguments();
         if self.match_kind(&TokenKind::LeftParen) {
             let argument_list_start = self.previous().span.start;
             let args = self.parse_argument_list_after_open()?;
@@ -4407,6 +5020,7 @@ impl Parser {
                 method: member,
                 member_span: token.span,
                 member_sigil_span,
+                type_arguments,
                 args,
                 argument_list_span,
                 span: self.span(start, self.previous().span.end),
@@ -4615,7 +5229,7 @@ impl Parser {
                         .iter()
                         .any(|arg| Self::contains_bare_identifier(&arg.value))
             }
-            Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
+            Expr::Grouped { expr, .. } | Expr::Unsafe { expr, .. } | Expr::Unary { expr, .. } => {
                 Self::contains_bare_identifier(expr)
             }
             Expr::IsType { expr, .. } => Self::contains_bare_identifier(expr),
@@ -4687,6 +5301,11 @@ impl Parser {
     }
 
     fn parse_new(&mut self, start: usize, shared: bool) -> Option<Expr> {
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: true,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        });
         let type_start = self.peek().span.start;
         let class_type = self.parse_type_ref()?;
         let type_span = self.span(type_start, self.previous().span.end);
@@ -4890,6 +5509,11 @@ impl Parser {
     }
 
     fn parse_type_ref(&mut self) -> Option<TypeRef> {
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        });
         let ty = self.parse_type_ref_inner();
         match (ty, self.pending_type_argument_close.take()) {
             (Some(ty), None) => Some(ty),
@@ -5119,6 +5743,7 @@ impl Parser {
             return_type: Box::new(return_type),
             return_type_span,
             throws_clause,
+            c_abi: None,
             span,
         }))
     }
@@ -5192,7 +5817,20 @@ impl Parser {
     }
 
     fn parse_type_ref_inner(&mut self) -> Option<TypeRef> {
+        // Every type position, type arguments included, is a place a type is
+        // written. An enclosing parameter or `new` marks first, with its flags.
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        });
         let nullable = self.match_kind(&TokenKind::Question);
+        // After `?` the type itself follows.
+        self.mark_cursor(crate::syntax::CompletionContext::Type {
+            new_expression: false,
+            parameter_modifiers_allowed: false,
+            constructor_roles_allowed: false,
+        });
         let token = self.advance().clone();
         let token = if matches!(token.kind, TokenKind::Backslash) {
             self.report_leading_namespace_separator(token.span);
@@ -5202,6 +5840,8 @@ impl Parser {
         };
         let mut ty = if matches!(token.kind, TokenKind::Function) {
             self.parse_function_type_ref(token.span)?
+        } else if matches!(token.kind, TokenKind::Extern) {
+            self.parse_c_function_type_ref(token.span)?
         } else if matches!(token.kind, TokenKind::LeftParen) {
             if self.check(&TokenKind::RightParen) {
                 let close_span = self.advance().span;
@@ -5244,25 +5884,12 @@ impl Parser {
             }
         } else {
             let (name, source_name) = match token.kind {
-                TokenKind::Void => ("void".to_string(), None),
-                TokenKind::IntType => ("int".to_string(), None),
-                TokenKind::Int8Type => ("int8".to_string(), None),
-                TokenKind::Int16Type => ("int16".to_string(), None),
-                TokenKind::Int32Type => ("int32".to_string(), None),
-                TokenKind::Int64Type => ("int64".to_string(), None),
-                TokenKind::UInt8Type => ("uint8".to_string(), None),
-                TokenKind::UInt16Type => ("uint16".to_string(), None),
-                TokenKind::UInt32Type => ("uint32".to_string(), None),
-                TokenKind::UInt64Type => ("uint64".to_string(), None),
-                TokenKind::FloatType => ("float".to_string(), None),
-                TokenKind::Float32Type => ("float32".to_string(), None),
-                TokenKind::Float64Type => ("float64".to_string(), None),
-                TokenKind::StringType => ("string".to_string(), None),
-                TokenKind::BoolType => ("bool".to_string(), None),
-                TokenKind::Null => ("null".to_string(), None),
-                TokenKind::Object => ("object".to_string(), None),
-                TokenKind::Resource => ("resource".to_string(), None),
-                TokenKind::SelfType => ("self".to_string(), None),
+                ref keyword if type_keyword_name(keyword).is_some() => (
+                    type_keyword_name(keyword)
+                        .expect("checked type keyword")
+                        .to_string(),
+                    None,
+                ),
                 TokenKind::Identifier(name) => {
                     let source_name = self.finish_qualified_name_ref(name, token.span)?;
                     if self.check(&TokenKind::Backslash) {
@@ -5330,6 +5957,10 @@ impl Parser {
 
         while self.pending_type_argument_close.is_none() && self.match_kind(&TokenKind::LeftBracket)
         {
+            if self.foreign_field_type && matches!(self.peek().kind, TokenKind::IntLiteral(_)) {
+                ty = self.parse_fixed_array_suffix(ty)?;
+                continue;
+            }
             self.expect(
                 TokenKind::RightBracket,
                 "expected `]` after typed array suffix",
@@ -5459,6 +6090,7 @@ impl Parser {
                 | TokenKind::Resource
                 | TokenKind::SelfType
                 | TokenKind::Function
+                | TokenKind::Extern
                 | TokenKind::Identifier(_)
         )
     }
@@ -5479,6 +6111,7 @@ impl Parser {
         match token.kind {
             TokenKind::Identifier(name) => Some(name),
             TokenKind::Use => Some("use".to_string()),
+            TokenKind::Open => Some("open".to_string()),
             _ => {
                 self.error(message, token.span);
                 None
@@ -5491,19 +6124,39 @@ impl Parser {
     /// begin its own syntax, so it remains a valid member name.
     fn expect_member_name(&mut self, message: &str) -> Option<String> {
         let token = self.advance().clone();
-        match token.kind {
-            TokenKind::Identifier(name) | TokenKind::Reserved(name) => Some(name),
-            TokenKind::Use => Some("use".to_string()),
-            TokenKind::Not => Some("not".to_string()),
-            _ => {
+        match Self::member_name(&token.kind) {
+            Some(name) => Some(name),
+            None => {
                 self.error(message, token.span);
                 None
             }
         }
     }
 
+    /// The member name `kind` spells after `->`, `?->` or `::`, if it can be
+    /// one: an identifier, a reserved future keyword, or a keyword that never
+    /// begins syntax there: `use`, `not`, `borrow`, which Decision 0148
+    /// section 11 spells as `Handle::borrow`, and `open`, which its section 17
+    /// spells as `Win32Window::open`. A method declaration takes a reserved
+    /// future keyword only (`expect_callable_name` otherwise).
+    fn member_name(kind: &TokenKind) -> Option<String> {
+        match kind {
+            TokenKind::Identifier(name) | TokenKind::Reserved(name) => Some(name.clone()),
+            TokenKind::Use | TokenKind::Not | TokenKind::Borrow | TokenKind::Open => {
+                Some(token_name(kind).to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// A callable's name after `function`: an identifier, or `use` or `open`,
+    /// which never begin syntax there (`open` precedes `function` as a
+    /// modifier, so `function open(` names a callable).
     fn is_callable_name_token(token: &Token) -> bool {
-        matches!(token.kind, TokenKind::Identifier(_) | TokenKind::Use)
+        matches!(
+            token.kind,
+            TokenKind::Identifier(_) | TokenKind::Use | TokenKind::Open
+        )
     }
 
     fn is_contextual_use_call(&self) -> bool {
@@ -5573,6 +6226,16 @@ impl Parser {
                 span: segment_span,
             });
             name.span = name.span.merge(segment_span);
+        }
+        // A `\` with nothing after it ends the text at a segment.
+        if self.check(&TokenKind::Backslash) {
+            self.mark_cursor_at(
+                self.current + 1,
+                crate::syntax::CompletionContext::NamespacePath {
+                    qualifier: format!("{}\\", name.canonical()),
+                    declarations_allowed: !self.declaring_namespace,
+                },
+            );
         }
         Some(name)
     }
@@ -5720,6 +6383,14 @@ impl Parser {
     }
 
     fn check(&self, kind: &TokenKind) -> bool {
+        if let Some(trial) = &self.token_trial {
+            if self.current == trial.index + 1 {
+                let mut followers = self.trial_followers.borrow_mut();
+                if !followers.contains(kind) {
+                    followers.push(kind.clone());
+                }
+            }
+        }
         if self.is_at_end() {
             return matches!(kind, TokenKind::Eof);
         }
@@ -5730,7 +6401,16 @@ impl Parser {
         if self.is_at_end() {
             return self.peek();
         }
+        self.judge_trial();
+        let count = self.diagnostics.len();
+        if let Some(trial) = self.token_trial.as_mut() {
+            if self.current == trial.index && trial.arrival == Some(count) {
+                trial.consumed = Some(count);
+            }
+        }
         self.current += 1;
+        self.note_cursor_arrival();
+        self.note_trial_arrival();
         self.previous()
     }
 
@@ -5782,6 +6462,9 @@ impl Parser {
                 | TokenKind::For
                 | TokenKind::Foreach
                 | TokenKind::Internal
+                | TokenKind::Unsafe
+                | TokenKind::Extern
+                | TokenKind::Declare
                 | TokenKind::AttributeOpen => return,
                 _ => {
                     self.advance();
@@ -5791,7 +6474,59 @@ impl Parser {
     }
 }
 
-fn token_name(kind: &TokenKind) -> &'static str {
+/// Source text for one token of `kind`, for a parser trial: a placeholder for
+/// names, variables and literals, the spelling for keywords and punctuation,
+/// and `None` for the end of the text.
+pub(crate) fn token_text(kind: &TokenKind) -> Option<String> {
+    Some(match kind {
+        TokenKind::Eof => return None,
+        TokenKind::Identifier(_) | TokenKind::Reserved(_) => "x".to_string(),
+        TokenKind::Variable(_) => "$x".to_string(),
+        TokenKind::IntLiteral(_) => "1".to_string(),
+        TokenKind::FloatLiteral(_) => "1.0".to_string(),
+        TokenKind::StringLiteral { .. } => "\"\"".to_string(),
+        other => token_name(other).to_string(),
+    })
+}
+
+/// The keywords that name a type, and the type each names. The parser reads
+/// a type keyword through this table; completion asks it which keywords are
+/// types.
+pub(crate) fn type_keyword_name(kind: &TokenKind) -> Option<&'static str> {
+    Some(match kind {
+        TokenKind::Void => "void",
+        TokenKind::IntType => "int",
+        TokenKind::Int8Type => "int8",
+        TokenKind::Int16Type => "int16",
+        TokenKind::Int32Type => "int32",
+        TokenKind::Int64Type => "int64",
+        TokenKind::UInt8Type => "uint8",
+        TokenKind::UInt16Type => "uint16",
+        TokenKind::UInt32Type => "uint32",
+        TokenKind::UInt64Type => "uint64",
+        TokenKind::FloatType => "float",
+        TokenKind::Float32Type => "float32",
+        TokenKind::Float64Type => "float64",
+        TokenKind::StringType => "string",
+        TokenKind::BoolType => "bool",
+        TokenKind::Null => "null",
+        TokenKind::Object => "object",
+        TokenKind::Resource => "resource",
+        TokenKind::SelfType => "self",
+        TokenKind::Function => "function",
+        _ => return None,
+    })
+}
+
+/// The constructor parameter roles (Decision 0131), written before a
+/// parameter's type.
+pub(crate) const CONSTRUCTOR_ROLE_KEYWORDS: [TokenKind; 3] = [
+    TokenKind::Internal,
+    TokenKind::Override,
+    TokenKind::Parameter,
+];
+
+pub(crate) fn token_name(kind: &TokenKind) -> &'static str {
     match kind {
         TokenKind::Class => "class",
         TokenKind::Enum => "enum",
@@ -5821,6 +6556,9 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Borrow => "borrow",
         TokenKind::Once => "once",
         TokenKind::Consuming => "consuming",
+        TokenKind::Unsafe => "unsafe",
+        TokenKind::Extern => "extern",
+        TokenKind::Declare => "declare",
         TokenKind::Writable => "writable",
         TokenKind::Readonly => "readonly",
         TokenKind::Return => "return",

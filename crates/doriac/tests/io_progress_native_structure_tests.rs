@@ -62,6 +62,7 @@ fn lower_development_source(source: &str) -> Program {
                 kind: TargetKind::Binary,
                 entry_source: Some(identity.clone()),
                 active_scopes: vec![SourceScope::Main, SourceScope::Development],
+                windows_subsystem: None,
             },
             packages: vec![Package {
                 identity: PACKAGE.to_owned(),
@@ -80,6 +81,8 @@ fn lower_development_source(source: &str) -> Program {
                     generated_for: None,
                 }],
                 dependencies: Vec::new(),
+                native_libraries: Vec::new(),
+                unsafe_policy: None,
             }],
             compiler: CompilerOptions {
                 target: CompilerTarget::Debug,

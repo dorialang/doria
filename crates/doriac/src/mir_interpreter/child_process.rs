@@ -490,15 +490,7 @@ impl Interpreter<'_> {
         let count = region.length.min(available);
         let chunk = bytes[*read..*read + count].to_vec();
         *read += count;
-        let base = region.source.expect("validated present region");
-        let (entries, _) = self.collection_element_storage(base)?;
-        let mut entries = entries.borrow_mut();
-        for (index, byte) in chunk.into_iter().enumerate() {
-            entries[base.index + index].1 = LocalValue::Scalar(mir::ScalarValue::Integer(
-                IntegerValue::from_i128(IntegerType::UInt8, i128::from(byte)).expect("byte"),
-            ));
-        }
-        drop(entries);
+        self.write_region_bytes(region, &chunk)?;
         let (case, fields) = if region.length != 0 && count == 0 {
             ("EndOfStream", Vec::new())
         } else {
@@ -537,19 +529,7 @@ impl Interpreter<'_> {
         }
         let echo = child.echo_input;
         if echo && region.length != 0 {
-            let base = region.source.expect("validated present region");
-            let (entries, _) = self.collection_element_storage(base)?;
-            let bytes = entries.borrow()[base.index..base.index + region.length]
-                .iter()
-                .map(|(_, value)| match value {
-                    LocalValue::Scalar(mir::ScalarValue::Integer(value)) => {
-                        Ok(value.unsigned_value() as u8)
-                    }
-                    _ => Err(InterpreterError::new(
-                        "pipe write region contains a non-byte",
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let bytes = self.region_bytes(region, region.length)?;
             self.child_processes
                 .get_mut(&pipe.process)
                 .unwrap()

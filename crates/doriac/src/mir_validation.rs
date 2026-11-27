@@ -14,6 +14,7 @@ mod call_origins;
 mod closure_storage;
 mod core_value;
 mod exact_return;
+mod foreign_aggregates;
 mod inline_values;
 mod iteration;
 mod iterator_storage;
@@ -39,6 +40,8 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     validate_error_metadata(program)?;
     validate_interface_metadata(program)?;
     validate_closure_metadata(program)?;
+    validate_c_entries(program)?;
+    validate_companion(program)?;
     for (index, definition) in program.enums.iter().enumerate() {
         if definition.id != crate::enums::EnumId(index) {
             return Err(malformed_mir(format!(
@@ -908,6 +911,13 @@ fn validate_interface_metadata(program: &mir::Program) -> Result<(), BackendErro
                         "interface vtable Error metadata does not belong to its implementing type",
                     ));
                 }
+                // Only a class reachable code constructs or names has its
+                // interface implementations emitted.
+                if !class.implementations_reached {
+                    return Err(malformed_mir(
+                        "interface vtable implements a class whose implementations are unreachable",
+                    ));
+                }
             }
             mir::ImplementingType::Collection(_) | mir::ImplementingType::CollectionIterator(_) => {
                 iteration::builtin_vtable(program, table)?
@@ -1240,7 +1250,8 @@ fn static_value_matches(
             mir::StaticValue::Null,
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
-            | mir::Type::NullablePayloadEnum(_),
+            | mir::Type::NullablePayloadEnum(_)
+            | mir::Type::NullableForeignAggregate(_),
         ) => Ok(true),
         (
             mir::StaticValue::PayloadEnum(value),
@@ -1262,23 +1273,16 @@ fn static_value_matches(
             }
             Ok(true)
         }
+        (
+            mir::StaticValue::ForeignAggregate(value),
+            mir::Type::ForeignAggregate(expected) | mir::Type::NullableForeignAggregate(expected),
+        ) if value.ty == expected => foreign_aggregates::constant_matches(program, value),
         _ => Ok(false),
     }
 }
 
 fn valid_collection_comparator(ty: mir::Type) -> Option<mir::CollectionComparator> {
-    match ty {
-        mir::Type::Scalar(mir::ScalarType::Integer(integer)) if integer.is_signed() => Some(
-            mir::CollectionComparator::SignedInteger(integer.bit_width() as u8),
-        ),
-        mir::Type::Scalar(mir::ScalarType::Integer(integer)) => Some(
-            mir::CollectionComparator::UnsignedInteger(integer.bit_width() as u8),
-        ),
-        mir::Type::Scalar(mir::ScalarType::Bool) => Some(mir::CollectionComparator::Bool),
-        mir::Type::String => Some(mir::CollectionComparator::StringBytes),
-        mir::Type::Class(_) | mir::Type::Interface(_) => Some(mir::CollectionComparator::Core),
-        _ => None,
-    }
+    mir::CollectionComparator::for_element(ty)
 }
 
 fn collection_type_is_copy(ty: mir::Type) -> bool {
@@ -1288,6 +1292,8 @@ fn collection_type_is_copy(ty: mir::Type) -> bool {
             | mir::Type::String
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString
+            | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_)
     ) || matches!(
         ty,
         mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
@@ -1383,6 +1389,9 @@ fn validate_class(
             crate::inline_value::InlineValueType::Terminal(..) => {
                 crate::compiler_known_term::SOURCE_ID
             }
+            crate::inline_value::InlineValueType::Pointer => {
+                return Err(malformed_mir("a pointer is not a class"));
+            }
         };
         if class.source_span.source != source
             || class.arguments.len()
@@ -1446,7 +1455,12 @@ fn validate_class(
         {
             return Err(malformed_mir("inherited retained field changes its type"));
         }
-        if property.borrowed_source.is_some() && property_index >= parent_properties.len() {
+        // Only a constructed class has a constructor to map its retained
+        // sources (Decision 0148 section 17).
+        if property.borrowed_source.is_some()
+            && property_index >= parent_properties.len()
+            && class.constructed
+        {
             let constructor = class
                 .constructor
                 .map(|id| function_in(program, id))
@@ -1527,6 +1541,30 @@ fn validate_class(
         )));
     }
 
+    // A class reachable code never constructs has no instance, so it has no
+    // lifecycle, and constructing a class constructs its ancestors (Decision
+    // 0148 section 17).
+    if !class.constructed && (class.constructor.is_some() || class.destructor.is_some()) {
+        return Err(malformed_mir(format!(
+            "class#{} is never constructed but has a constructor or destructor",
+            class.id.0
+        )));
+    }
+    if class.constructed && parent.is_some_and(|parent| !parent.constructed) {
+        return Err(malformed_mir(format!(
+            "class#{} is constructed but its parent is not",
+            class.id.0
+        )));
+    }
+    if (class.constructed && !class.implementations_reached)
+        || (class.implementations_reached
+            && parent.is_some_and(|parent| !parent.implementations_reached))
+    {
+        return Err(malformed_mir(format!(
+            "class#{} reaches its interface implementations without its own construction or its parent's implementations",
+            class.id.0
+        )));
+    }
     if let Some(constructor) = class.constructor {
         validate_lifecycle(program, class.id, constructor, "constructor", false)?;
     }
@@ -1728,10 +1766,7 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         mir::Type::Scalar(mir::ScalarType::Float(float)) => FieldType::Float(float),
         mir::Type::Scalar(mir::ScalarType::Bool) => FieldType::Bool,
         mir::Type::Scalar(mir::ScalarType::Enum(_)) => FieldType::Integer(IntegerType::UInt32),
-        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => FieldType::Aggregate {
-            size: ty.storage_bytes(),
-            align: ty.storage_bytes(),
-        },
+        mir::Type::Scalar(mir::ScalarType::Inline(ty)) => FieldType::inline(ty, false),
         mir::Type::String => FieldType::String,
         mir::Type::Mixed => FieldType::Mixed,
         mir::Type::NullableScalar(mir::ScalarType::Integer(integer)) => {
@@ -1742,10 +1777,7 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         mir::Type::NullableScalar(mir::ScalarType::Enum(_)) => {
             FieldType::NullableInteger(IntegerType::UInt32)
         }
-        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => FieldType::Aggregate {
-            size: ty.storage_bytes() * 2,
-            align: ty.storage_bytes(),
-        },
+        mir::Type::NullableScalar(mir::ScalarType::Inline(ty)) => FieldType::inline(ty, true),
         mir::Type::NullableString => FieldType::NullableString,
         mir::Type::NullableMixed => FieldType::NullableMixed,
         mir::Type::Interface(_) => FieldType::Error,
@@ -1787,8 +1819,8 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         mir::Type::Collection(_) | mir::Type::NullableCollection(_) => FieldType::Collection,
         mir::Type::Function(_) => FieldType::Function,
         mir::Type::NullableFunction(_) => FieldType::NullableFunction,
-        mir::Type::ByteRegion(kind) => FieldType::ByteRegion(kind),
-        mir::Type::NullableByteRegion(kind) => FieldType::NullableByteRegion(kind),
+        mir::Type::Region(kind) => FieldType::ByteRegion(kind.access),
+        mir::Type::NullableRegion(kind) => FieldType::NullableByteRegion(kind.access),
         mir::Type::ClosureEnvironment(_) => FieldType::SharedReferenceAccess,
         mir::Type::PayloadEnum(ty) => {
             let layout = &program.enums[ty.id.0].layout;
@@ -1804,6 +1836,14 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
                 align: layout.align,
             }
         }
+        mir::Type::ForeignAggregate(ty) => FieldType::Aggregate {
+            size: ty.size,
+            align: ty.align,
+        },
+        mir::Type::NullableForeignAggregate(ty) => FieldType::Aggregate {
+            size: ty.nullable_size,
+            align: ty.align,
+        },
     }
 }
 
@@ -2281,15 +2321,23 @@ fn validate_diagnostic_frame(
     match function.diagnostic_frame {
         mir::DiagnosticFrame::Authored => unreachable!(),
         mir::DiagnosticFrame::Caller => {
-            if !interface_entry.is_some_and(|table| {
-                matches!(
-                    table.implementing_type,
-                    mir::ImplementingType::Collection(_)
-                        | mir::ImplementingType::CollectionIterator(_)
-                )
-            }) {
+            // An extern declaration's function is its foreign call alone;
+            // the Call Path shows the Doria call (Decision 0148 section 13).
+            // A companion's binding entry runs at the host frame it
+            // receives (section 23).
+            if !function.source_span.source.is_compiler_owned()
+                && !function.is_foreign_binding()
+                && !program.companion.is_binding_entry(function.id)
+                && !interface_entry.is_some_and(|table| {
+                    matches!(
+                        table.implementing_type,
+                        mir::ImplementingType::Collection(_)
+                            | mir::ImplementingType::CollectionIterator(_)
+                    )
+                })
+            {
                 return Err(malformed_mir(
-                    "caller diagnostic frame requires a collection interface entry",
+                    "caller diagnostic frame requires a compiler-known function or a collection interface entry",
                 ));
             }
         }
@@ -2551,6 +2599,10 @@ fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendErr
         validate_payload_enum_type(program, payload)?;
         return Ok(());
     }
+    if let mir::Type::ForeignAggregate(aggregate) = ty {
+        foreign_aggregates::definition_in(program, aggregate)?;
+        return Ok(());
+    }
     if let Some(payload) = ty.shared_payload() {
         reject_stored_request(program, payload.ty())?;
         if matches!(
@@ -2634,7 +2686,7 @@ fn validate_payload_enum_type(
             ty.id.0
         )));
     }
-    let nullable = crate::enums::nullable_enum_layout(&definition.layout)
+    let nullable = crate::enums::nullable_inline_layout(definition.layout.shape())
         .map_err(|_| malformed_mir("payload enum has an invalid nullable layout"))?;
     if ty.size != definition.layout.size
         || ty.align != definition.layout.align
@@ -2695,16 +2747,16 @@ fn validate_statement(
             }
             Ok(())
         }
-        mir::Statement::AssignByteRegionIndex {
+        mir::Statement::AssignRegionIndex {
             region,
             index,
             value,
             ..
         } => {
             byte_regions::validate_index(program, function, *region, index, true)?;
-            if value.ty() != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)) {
+            if value.ty() != byte_regions::element(program, function, *region)? {
                 return Err(malformed_mir(
-                    "byte region index assignment value must be uint8",
+                    "a region element assignment stores the region's element type",
                 ));
             }
             validate_rvalue(program, function, value)
@@ -2717,6 +2769,12 @@ fn validate_statement(
             ..
         } => {
             byte_regions::validate_index(program, function, *region, offset, true)?;
+            if matches!(
+                local_in(function, *region)?.ty,
+                mir::Type::Region(mir::RegionType { array: Some(_), .. })
+            ) {
+                return Err(malformed_mir("copyWithin moves bytes inside a byte region"));
+            }
             for operand in [length, destination] {
                 if operand.ty() != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)) {
                     return Err(malformed_mir("byte region copy bounds must be int"));
@@ -2894,20 +2952,38 @@ fn validate_statement(
                             mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => {
                                 ty.capabilities.needs_drop
                             }
-                            ty => {
-                                byte_regions::kind(ty).is_none_or(mir::ByteRegionKind::is_writable)
-                            }
+                            ty => byte_regions::kind(ty).is_none_or(mir::RegionType::is_writable),
                         },
                         ..declared_local.clone()
                     });
             let local = replacement_owner.as_ref().unwrap_or(declared_local);
             match (local.ty, value) {
-                (mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_), _) => {
+                (mir::Type::Region(_) | mir::Type::NullableRegion(_), _) => {
                     byte_regions::validate_assignment(program, function, local, value)
                 }
-                (_, mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_)) => Err(
-                    malformed_mir("byte region assigned to a different carrier type"),
-                ),
+                (_, mir::Rvalue::Region(_) | mir::Rvalue::NullableRegion(_)) => Err(malformed_mir(
+                    "byte region assigned to a different carrier type",
+                )),
+                (
+                    mir::Type::ForeignAggregate(expected),
+                    mir::Rvalue::ForeignAggregate(expression),
+                ) if expression.ty() == expected => {
+                    foreign_aggregates::validate_expression(program, function, expression)
+                }
+                (
+                    mir::Type::NullableForeignAggregate(expected),
+                    mir::Rvalue::NullableForeignAggregate(expression),
+                ) if expression.ty() == expected => {
+                    foreign_aggregates::validate_nullable_expression(program, function, expression)
+                }
+                (mir::Type::ForeignAggregate(_) | mir::Type::NullableForeignAggregate(_), _)
+                | (
+                    _,
+                    mir::Rvalue::ForeignAggregate(_) | mir::Rvalue::NullableForeignAggregate(_),
+                ) => Err(malformed_mir(format!(
+                    "local{} and its foreign aggregate value have different types",
+                    target.0
+                ))),
                 (mir::Type::PayloadEnum(expected), mir::Rvalue::PayloadEnum(expression))
                     if expression.ty() == expected =>
                 {
@@ -3438,8 +3514,14 @@ fn validate_statement(
                     | mir::Type::String
                     | mir::Type::NullableScalar(_)
                     | mir::Type::NullableString
-                    | mir::Type::ByteRegion(mir::ByteRegionKind::Readonly)
-                    | mir::Type::NullableByteRegion(mir::ByteRegionKind::Readonly)
+                    | mir::Type::Region(mir::RegionType {
+                        access: mir::ByteRegionKind::Readonly,
+                        array: None
+                    })
+                    | mir::Type::NullableRegion(mir::RegionType {
+                        access: mir::ByteRegionKind::Readonly,
+                        array: None
+                    })
                     | mir::Type::PayloadEnum(mir::PayloadEnumType {
                         capabilities: crate::enums::EnumCapabilities { copy: true, .. },
                         ..
@@ -4150,6 +4232,70 @@ fn validate_statement(
             }
             validate_type(program, expected)
         }
+        mir::Statement::Pointer {
+            target, operation, ..
+        } => validate_pointer_operation(program, function, *target, operation),
+        mir::Statement::ForeignCall {
+            function: foreign,
+            args,
+            target,
+            ..
+        } => validate_foreign_call(program, function, foreign, args, *target),
+        mir::Statement::HostRecord {
+            target,
+            size,
+            align,
+        } => {
+            require_companion_entry(program, function)?;
+            require_companion_pointer(function, *target)?;
+            if !align.is_power_of_two() || size % align != 0 {
+                return Err(malformed_mir(
+                    "a host record's size is not a multiple of its power-of-two alignment",
+                ));
+            }
+            Ok(())
+        }
+        mir::Statement::RegionSlot { record, slot, .. } => {
+            require_companion_entry(program, function)?;
+            require_companion_pointer(function, *record)?;
+            let local = local_in(function, slot.value.local)?;
+            let crossing =
+                mir::UnsafeRegionValue::of(slot.value.local, local.ty, &program.collection_types);
+            let layout = crate::native_abi::companion_slot_layout(slot.value, local.ty);
+            match layout {
+                Some((_, align)) if crossing == slot.value && slot.offset % align == 0 => Ok(()),
+                _ => Err(malformed_mir(format!(
+                    "a companion slot of local{} does not match its type or alignment",
+                    slot.value.local.0
+                ))),
+            }
+        }
+        mir::Statement::CallHost {
+            host,
+            operation,
+            arguments,
+            results,
+        } => {
+            require_companion_entry(program, function)?;
+            for local in host.iter().chain(arguments).chain(results) {
+                require_companion_pointer(function, *local)?;
+            }
+            let companion = &program.companion;
+            if *operation as usize > companion.host_operations.len() + companion.callbacks.len() {
+                return Err(malformed_mir(format!(
+                    "a companion entry calls host operation {operation}, which the plan lacks"
+                )));
+            }
+            Ok(())
+        }
+        mir::Statement::ForeignField {
+            aggregate,
+            offset,
+            access,
+            ..
+        } => foreign_aggregates::validate_field_access(
+            program, function, *aggregate, *offset, access,
+        ),
         mir::Statement::DropFunction {
             local,
             function_type,
@@ -4457,7 +4603,7 @@ fn validate_terminator(
                     require_owned_inline_claim(expression)?;
                 }
                 let absent = expression.is_null_value();
-                if byte_regions::kind(return_type).is_some_and(mir::ByteRegionKind::is_writable)
+                if byte_regions::kind(return_type).is_some_and(mir::RegionType::is_writable)
                     && expression.borrows_move_value()
                     && !absent
                 {
@@ -4914,7 +5060,10 @@ fn validate_terminator(
                     Some(mir::Type::PayloadEnum(*outcome))
                 }
                 mir::CheckedIoOperation::TransferGroupReadRegion { .. } => {
-                    Some(mir::Type::NullableByteRegion(mir::ByteRegionKind::Readonly))
+                    Some(mir::Type::NullableRegion(mir::RegionType {
+                        access: mir::ByteRegionKind::Readonly,
+                        array: None,
+                    }))
                 }
                 mir::CheckedIoOperation::ConfigureTransferPlan { class, .. }
                 | mir::CheckedIoOperation::WatchTransferPlan { class, .. }
@@ -5339,7 +5488,11 @@ fn validate_checked_io_operation(
             validate_owned_file_local(program, function, *file, false)?;
             validate_file_transfer_kind(program, function, *file, true)?;
             let destination = local_in(function, *destination)?;
-            if destination.ty != mir::Type::ByteRegion(mir::ByteRegionKind::Writable)
+            if destination.ty
+                != mir::Type::Region(mir::RegionType {
+                    access: mir::ByteRegionKind::Writable,
+                    array: None,
+                })
                 || !destination.writable
             {
                 return Err(malformed_mir(
@@ -5356,7 +5509,10 @@ fn validate_checked_io_operation(
             validate_owned_file_local(program, function, *file, false)?;
             validate_file_transfer_kind(program, function, *file, false)?;
             if local_in(function, *source)?.ty
-                != mir::Type::ByteRegion(mir::ByteRegionKind::Readonly)
+                != mir::Type::Region(mir::RegionType {
+                    access: mir::ByteRegionKind::Readonly,
+                    array: None,
+                })
             {
                 return Err(malformed_mir(
                     "file write requires readonly borrowed byte storage",
@@ -5375,7 +5531,9 @@ fn validate_checked_io_operation(
             } else {
                 mir::ByteRegionKind::Readonly
             };
-            if region.ty != mir::Type::ByteRegion(kind) || (stream.is_input() && !region.writable) {
+            if region.ty != mir::Type::Region(mir::RegionType::bytes(kind))
+                || (stream.is_input() && !region.writable)
+            {
                 return Err(malformed_mir(
                     "standard transfer requires its exact borrowed byte-region access",
                 ));
@@ -5411,7 +5569,9 @@ fn validate_checked_io_operation(
             } else {
                 mir::ByteRegionKind::Readonly
             };
-            if region.ty != mir::Type::ByteRegion(kind) || (read && !region.writable) {
+            if region.ty != mir::Type::Region(mir::RegionType::bytes(kind))
+                || (read && !region.writable)
+            {
                 return Err(malformed_mir(
                     "pending preparation requires its matching borrowed byte region",
                 ));
@@ -5840,7 +6000,7 @@ fn validate_indirect_arguments(
             )));
         }
         validate_rvalue(program, caller, argument)?;
-        if byte_regions::kind(parameter.ty).is_some_and(mir::ByteRegionKind::is_writable)
+        if byte_regions::kind(parameter.ty).is_some_and(mir::RegionType::is_writable)
             && parameter.mode == mir::FunctionParameterMode::Writable
         {
             byte_regions::require_writable(program, caller, argument)?;
@@ -5963,6 +6123,7 @@ fn validate_integer_expression(
             }
             validate_inline_value_expression(program, function, value)
         }
+        mir::IntegerExpression::LastSystemCode => Ok(()),
         mir::IntegerExpression::Use { ty, operand } => {
             validate_integer_operand(program, function, *ty, operand)
         }
@@ -5995,7 +6156,19 @@ fn validate_integer_expression(
             validate_integer_expression(program, function, left)?;
             validate_integer_expression(program, function, right)
         }
-        mir::IntegerExpression::Convert { value, .. } => {
+        mir::IntegerExpression::Convert {
+            ty,
+            value,
+            boundary,
+            ..
+        } => {
+            if boundary.is_some_and(|boundary| {
+                crate::c_layout::CTarget::host().boundary_integer(boundary) != *ty
+            }) {
+                return Err(malformed_mir(
+                    "a boundary conversion produces the integer of its C type on this target",
+                ));
+            }
             validate_integer_expression(program, function, value)
         }
         mir::IntegerExpression::FloatToInt { value, .. } => {
@@ -6039,14 +6212,25 @@ fn validate_integer_expression(
             }
             validate_enum_expression(program, function, value)
         }
-        mir::IntegerExpression::CopyByteRegion {
+        mir::IntegerExpression::CopyRegion {
             destination,
             source,
             ..
         } => {
-            if destination.ty() != mir::Type::ByteRegion(mir::ByteRegionKind::Writable)
-                || source.ty() != mir::Type::ByteRegion(mir::ByteRegionKind::Readonly)
-            {
+            // Both regions view the same elements: bytes, or the elements
+            // of one typed array type the targets build regions over.
+            let same_view = match (destination.ty(), source.ty()) {
+                (mir::Type::Region(destination), mir::Type::Region(source)) => {
+                    destination.is_writable()
+                        && !source.is_writable()
+                        && destination.array == source.array
+                        && (destination.array.is_none()
+                            || crate::native_abi::array_region_element(program, destination)
+                                .is_some())
+                }
+                _ => false,
+            };
+            if !same_view {
                 return Err(malformed_mir(
                     "region copy needs a writable destination and a readonly source region",
                 ));
@@ -6234,6 +6418,9 @@ fn validate_inline_value_expression(
             mir::Operand::MixedPayload { mixed, tag } => {
                 validate_mixed_payload_operand(function, *mixed, *tag, expected)
             }
+            mir::Operand::RegionIndex { region, index, .. } => {
+                byte_regions::validate_element_read(program, function, *region, index, expected)
+            }
             _ => Err(malformed_mir(
                 "inline value operand has another nominal type",
             )),
@@ -6387,12 +6574,456 @@ fn validate_enum_operand(
         mir::Operand::MixedPayload { mixed, tag } => {
             validate_mixed_payload_operand(function, *mixed, *tag, expected)
         }
+        mir::Operand::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(program, function, *region, index, expected)
+        }
         mir::Operand::CollectionLength(_)
-        | mir::Operand::ByteRegionLength(_)
-        | mir::Operand::ByteRegionIndex { .. }
+        | mir::Operand::RegionLength(_)
         | mir::Operand::CollectionKeyAt { .. }
         | mir::Operand::StringIntrinsic(_) => Err(malformed_mir(
             "enum expression uses an incompatible operand",
+        )),
+    }
+}
+
+/// Each C entry (Decision 0148 sections 12 and 13) is a distinct Doria
+/// function with its own diagnostic frame, no checked effects, and a C form
+/// for every parameter and its result, which its entry receives and returns
+/// under the target's C convention.
+/// Every unsafe region's blocks, edges and values are well formed, and the
+/// companion plan is the one `mir::companion::plan` derives from them
+/// (Decision 0148 sections 22 and 23).
+fn validate_companion(program: &mir::Program) -> Result<(), BackendError> {
+    for function in &program.functions {
+        let blocks = function.blocks.len();
+        let locals = function.locals.len();
+        for region in &function.unsafe_regions {
+            let fail = |problem: &str| {
+                Err(malformed_mir(format!(
+                    "unsafe region {} of `{}` {problem}",
+                    region.id, function.name
+                )))
+            };
+            if region.blocks.first() != Some(&region.entry) {
+                return fail("does not start at its entry block");
+            }
+            if !region.blocks.iter().all(|block| block.0 < blocks)
+                || !region.blocks.windows(2).all(|pair| pair[0].0 < pair[1].0)
+            {
+                return fail("has blocks out of range or out of order");
+            }
+            if region.continuation.0 >= blocks || region.contains(region.continuation) {
+                return fail("continues inside itself or past the function");
+            }
+            let entered_elsewhere = function.blocks.iter().any(|block| {
+                !region.contains(block.id)
+                    && block
+                        .terminator
+                        .targets()
+                        .into_iter()
+                        .any(|target| target != region.entry && region.contains(target))
+            });
+            if entered_elsewhere || region.contains(function.entry_block) {
+                return fail("is entered other than at its entry block");
+            }
+            for exit in &region.exits {
+                if !region.contains(exit.source)
+                    || exit
+                        .target
+                        .is_some_and(|target| target.0 >= blocks || region.contains(target))
+                {
+                    return fail("has an exit that does not leave it");
+                }
+            }
+            let values = region.inputs.iter().chain(&region.outputs);
+            if values.clone().any(|value| value.local.0 >= locals)
+                || region.result.is_some_and(|local| local.0 >= locals)
+            {
+                return fail("names a local the function does not have");
+            }
+            if !region
+                .outputs
+                .iter()
+                .all(|output| region.inputs.contains(output))
+            {
+                return fail("has an output that is not one of its inputs");
+            }
+        }
+    }
+    let derived = mir::companion::plan(program).map_err(|error| malformed_mir(error.details))?;
+    if derived != program.companion {
+        return Err(malformed_mir(
+            "the companion plan differs from the one its unsafe regions give",
+        ));
+    }
+    if program.companion.regions.is_empty() {
+        return Ok(());
+    }
+    // Each entry is validated as the companion library compiles it, beside
+    // the program's functions, which its foreign calls reach.
+    let library = mir::companion::library(program).program;
+    for (index, region) in program.companion.regions.iter().enumerate() {
+        let entry = &region.entry;
+        let pointer = |local: &mir::LocalId| {
+            entry.locals.get(local.0).map(|local| local.ty) == Some(COMPANION_POINTER)
+        };
+        if entry.id != mir::FunctionId(program.functions.len() + index)
+            || entry.params.len() != 4
+            || !entry.params.iter().all(pointer)
+            || entry.return_type
+                != mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int32,
+                )))
+            || !entry.unsafe_regions.is_empty()
+        {
+            return Err(malformed_mir(format!(
+                "the companion entry of region {} does not have the version-1 signature",
+                region.id
+            )));
+        }
+        validate_function(&library, entry)?;
+    }
+    for callback in &program.companion.callbacks {
+        validate_function(&library, &callback.forwarder)?;
+    }
+    let first = program.functions.len()
+        + program.companion.regions.len()
+        + program.companion.callbacks.len();
+    for (index, binding) in program.companion.bindings.iter().enumerate() {
+        if binding.index != index || binding.entry.id != mir::FunctionId(first + index) {
+            return Err(malformed_mir(format!(
+                "the binding entry of `{}` is out of order",
+                binding.entry.name
+            )));
+        }
+        validate_function(&library, &binding.entry)?;
+    }
+    Ok(())
+}
+
+const COMPANION_POINTER: mir::Type = mir::Type::Scalar(mir::ScalarType::Inline(
+    crate::inline_value::InlineValueType::Pointer,
+));
+
+/// Companion statements belong to companion entries alone: the functions
+/// of the companion library that follow every function of the program.
+fn require_companion_entry(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<(), BackendError> {
+    let companion = &program.companion;
+    if companion
+        .regions
+        .iter()
+        .map(|region| region.entry.id)
+        .chain(
+            companion
+                .callbacks
+                .iter()
+                .map(|callback| callback.forwarder.id),
+        )
+        .chain(companion.bindings.iter().map(|binding| binding.entry.id))
+        .any(|id| id == function.id)
+    {
+        return Ok(());
+    }
+    Err(malformed_mir(format!(
+        "`{}` contains a companion statement outside a companion entry",
+        function.name
+    )))
+}
+
+fn require_companion_pointer(
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Result<(), BackendError> {
+    if local_in(function, local)?.ty == COMPANION_POINTER {
+        return Ok(());
+    }
+    Err(malformed_mir(format!(
+        "companion statement local{} is not a pointer",
+        local.0
+    )))
+}
+
+fn validate_c_entries(program: &mir::Program) -> Result<(), BackendError> {
+    let mut seen = std::collections::HashSet::new();
+    for id in &program.c_entries {
+        let function = function_in(program, *id)?;
+        if !seen.insert(*id) {
+            return Err(malformed_mir("a C entry names its function once"));
+        }
+        if !function.owns_diagnostic_frame()
+            || function.method.is_some()
+            || function.closure.is_some()
+        {
+            return Err(malformed_mir(format!(
+                "the C entry of function{} calls a free Doria function with its own frame",
+                id.0
+            )));
+        }
+        if function.has_checked_transport() {
+            return Err(malformed_mir(format!(
+                "the C entry of function{} calls a function without checked effects",
+                id.0
+            )));
+        }
+        let target = crate::c_layout::CTarget::host();
+        let c_form = |ty| mir::foreign_c_type(ty, &program.foreign_aggregates, target).is_some();
+        let parameters = function
+            .params
+            .iter()
+            .map(|local| local_in(function, *local).map(|local| local.ty))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = match function.return_type {
+            mir::ReturnType::Value(ty) => c_form(ty),
+            mir::ReturnType::Void => true,
+        };
+        if !result
+            || !parameters.into_iter().all(c_form)
+            || function
+                .parameter_modes
+                .iter()
+                .any(|mode| *mode != mir::FunctionParameterMode::Readonly)
+        {
+            return Err(malformed_mir(
+                "a C entry passes only readonly values with a C form",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A pointer operation reads a pointer local and assigns a result of its
+/// own type (Decision 0148 section 4).
+fn validate_pointer_operation(
+    program: &mir::Program,
+    function: &mir::Function,
+    target: Option<mir::LocalId>,
+    operation: &mir::PointerOperation,
+) -> Result<(), BackendError> {
+    use crate::inline_value::InlineValueType;
+    let pointer = mir::Type::Scalar(mir::ScalarType::Inline(InlineValueType::Pointer));
+    if let Some(local) = operation.pointer() {
+        if local_in(function, local)?.ty != pointer {
+            return Err(malformed_mir("a pointer operation reads a pointer local"));
+        }
+    }
+    let accessed = |ty: mir::Type| {
+        if let mir::Type::ForeignAggregate(aggregate) = ty {
+            foreign_aggregates::definition_in(program, aggregate)?;
+        }
+        Ok::<_, BackendError>(crate::native_abi::pointee_layout(ty).is_some())
+    };
+    let result = match operation {
+        mir::PointerOperation::Read { ty, .. } => {
+            if !accessed(*ty)? {
+                return Err(malformed_mir("a pointer reads a value with a C layout"));
+            }
+            Some(*ty)
+        }
+        mir::PointerOperation::Write { value, .. } => {
+            if !accessed(value.ty())? {
+                return Err(malformed_mir("a pointer writes a value with a C layout"));
+            }
+            validate_rvalue(program, function, value)?;
+            None
+        }
+        mir::PointerOperation::Offset { count, scale, .. } => {
+            if count.ty() != IntegerType::Int64 || *scale == 0 || *scale > i64::MAX as u64 {
+                return Err(malformed_mir(
+                    "a pointer offset scales an int64 count by a nonzero size",
+                ));
+            }
+            validate_integer_expression(program, function, count)?;
+            Some(pointer)
+        }
+        mir::PointerOperation::Address { .. } => Some(mir::Type::Scalar(mir::ScalarType::Integer(
+            IntegerType::UInt64,
+        ))),
+        mir::PointerOperation::AddressOf { place, offset } => {
+            let (ty, _) = foreign_aggregates::place_value(program, function, *place)?;
+            if !accessed(ty)? {
+                return Err(malformed_mir(
+                    "a pointer addresses a place of a value with a C layout",
+                ));
+            }
+            let inside = match ty {
+                mir::Type::ForeignAggregate(aggregate) => *offset < u64::from(aggregate.size),
+                _ => *offset == 0,
+            };
+            if !inside {
+                return Err(malformed_mir(
+                    "a pointer to a place addresses a byte of that place",
+                ));
+            }
+            Some(pointer)
+        }
+        mir::PointerOperation::RegionData { region, align } => {
+            if !matches!(local_in(function, *region)?.ty, mir::Type::Region(_)) {
+                return Err(malformed_mir(
+                    "a region pointer reads a present region local",
+                ));
+            }
+            if !align.is_power_of_two() {
+                return Err(malformed_mir(
+                    "an empty region's pointer is aligned for its element",
+                ));
+            }
+            Some(pointer)
+        }
+        mir::PointerOperation::ForeignStringData { string } => {
+            let foreign_string = match local_in(function, *string)?.ty {
+                mir::Type::Collection(collection) => matches!(
+                    collection_in(program, collection)?.kind,
+                    mir::CollectionKind::ForeignString(_)
+                ),
+                _ => false,
+            };
+            if !foreign_string {
+                return Err(malformed_mir(
+                    "a foreign string pointer reads a present CString or Utf16String local",
+                ));
+            }
+            Some(pointer)
+        }
+        mir::PointerOperation::ReadForeignString { .. } => Some(mir::Type::NullableString),
+        mir::PointerOperation::CreateHandle { value } => {
+            if program.handle_carrier(value.ty()).is_none() {
+                return Err(malformed_mir(
+                    "a handle holds a class value or a shared reference",
+                ));
+            }
+            if value.borrows_move_value() {
+                return Err(malformed_mir("a handle takes the ownership of its value"));
+            }
+            validate_rvalue(program, function, value)?;
+            Some(pointer)
+        }
+        mir::PointerOperation::FromHandle { ty, .. } => {
+            if program.handle_carrier(*ty).is_none() {
+                return Err(malformed_mir(
+                    "a handle gives back a class value or a shared reference",
+                ));
+            }
+            Some(*ty)
+        }
+        mir::PointerOperation::ForeignRange {
+            length,
+            stride,
+            align,
+            ..
+        } => {
+            if length.ty() != IntegerType::Int64
+                || *stride == 0
+                || *stride > i64::MAX as u64
+                || !align.is_power_of_two()
+            {
+                return Err(malformed_mir(
+                    "a foreign range has an int64 length, a nonzero stride and a power-of-two alignment",
+                ));
+            }
+            validate_integer_expression(program, function, length)?;
+            Some(pointer)
+        }
+        mir::PointerOperation::CEntryAddress { function } => {
+            if !program.c_entries.contains(function) {
+                return Err(malformed_mir(
+                    "a C entry address names a C-callable function of the program",
+                ));
+            }
+            Some(pointer)
+        }
+        mir::PointerOperation::FromAddress { address } => {
+            if address.ty() != IntegerType::UInt64 {
+                return Err(malformed_mir("a pointer is formed from a uint64 address"));
+            }
+            validate_integer_expression(program, function, address)?;
+            Some(mir::Type::NullableScalar(mir::ScalarType::Inline(
+                InlineValueType::Pointer,
+            )))
+        }
+    };
+    match (target, result) {
+        (Some(target), Some(result)) if local_in(function, target)?.ty == result => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(malformed_mir(
+            "a pointer operation assigns its result to a local of its type",
+        )),
+    }
+}
+
+/// A foreign call passes one local of each parameter's type, every one with
+/// a C form, and assigns its result to a local of the return type
+/// (Decision 0148 sections 14 and 15). A variadic binding's fixed count is
+/// at most its parameter count.
+fn validate_foreign_call(
+    program: &mir::Program,
+    function: &mir::Function,
+    foreign: &mir::ForeignFunction,
+    args: &[mir::LocalId],
+    target: Option<mir::LocalId>,
+) -> Result<(), BackendError> {
+    match &foreign.callee {
+        mir::ForeignCallee::Symbol { symbol, .. } => {
+            if function.owns_diagnostic_frame() {
+                return Err(malformed_mir(
+                    "a foreign call of a symbol is the body of an extern declaration, which runs in its caller's frame",
+                ));
+            }
+            if symbol.is_empty() {
+                return Err(malformed_mir("a foreign call names a symbol"));
+            }
+        }
+        // A C function pointer value is one pointer word, and a call of
+        // one is never variadic (section 12).
+        mir::ForeignCallee::Pointer(pointer) => {
+            if local_in(function, *pointer)?.ty
+                != mir::Type::Scalar(mir::ScalarType::Inline(
+                    crate::inline_value::InlineValueType::Pointer,
+                ))
+                || foreign.fixed_parameters.is_some()
+            {
+                return Err(malformed_mir(
+                    "a C function pointer call reads a pointer local and is not variadic",
+                ));
+            }
+        }
+    }
+    let target_platform = crate::c_layout::CTarget::host();
+    if foreign
+        .c_signature(&program.foreign_aggregates, target_platform)
+        .is_none()
+    {
+        return Err(malformed_mir(
+            "a foreign call passes only values with a C form",
+        ));
+    }
+    if foreign
+        .fixed_parameters
+        .is_some_and(|fixed| fixed > foreign.parameters.len())
+    {
+        return Err(malformed_mir(
+            "a variadic foreign call has no more fixed parameters than parameters",
+        ));
+    }
+    if args.len() != foreign.parameters.len() {
+        return Err(malformed_mir(
+            "a foreign call passes one argument per parameter",
+        ));
+    }
+    for (local, ty) in args.iter().zip(&foreign.parameters) {
+        if local_in(function, *local)?.ty != *ty {
+            return Err(malformed_mir(
+                "a foreign call passes a local of each parameter's type",
+            ));
+        }
+    }
+    match (target, foreign.return_type) {
+        (Some(target), Some(ty)) if local_in(function, target)?.ty == ty => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(malformed_mir(
+            "a foreign call assigns its result to a local of its return type",
         )),
     }
 }
@@ -6403,10 +7034,8 @@ fn validate_rvalue(
     expression: &mir::Rvalue,
 ) -> Result<(), BackendError> {
     match expression {
-        mir::Rvalue::ByteRegion(value) => {
-            byte_regions::validate_expression(program, function, value)
-        }
-        mir::Rvalue::NullableByteRegion(value) => {
+        mir::Rvalue::Region(value) => byte_regions::validate_expression(program, function, value),
+        mir::Rvalue::NullableRegion(value) => {
             byte_regions::validate_nullable_expression(program, function, value)
         }
         mir::Rvalue::Value(value) => validate_value_expression(program, function, value),
@@ -6474,6 +7103,12 @@ fn validate_rvalue(
         mir::Rvalue::Function(value) => validate_function_expression(program, function, value),
         mir::Rvalue::NullableFunction(value) => {
             validate_nullable_function_expression(program, function, value)
+        }
+        mir::Rvalue::ForeignAggregate(value) => {
+            foreign_aggregates::validate_expression(program, function, value)
+        }
+        mir::Rvalue::NullableForeignAggregate(value) => {
+            foreign_aggregates::validate_nullable_expression(program, function, value)
         }
     }?;
     let mut accesses = ClassLocalAccesses::default();
@@ -8777,8 +9412,18 @@ fn validate_mixed_expression(
             }
             validate_call_args(program, function, callee, args)
         }
-        mir::MixedExpression::BoxValue(value) => {
+        mir::MixedExpression::BoxValue { value, tag } => {
+            validate_mixed_tag(program, *tag)?;
+            if tag.ty() != mir::Type::Scalar(value.ty()) {
+                return Err(malformed_mir(format!(
+                    "a {} value is boxed with the mixed tag {tag}",
+                    value.ty()
+                )));
+            }
             validate_value_expression(program, function, value)
+        }
+        mir::MixedExpression::BoxForeignAggregate(value) => {
+            foreign_aggregates::validate_expression(program, function, value)
         }
         mir::MixedExpression::BoxString {
             value,
@@ -9293,6 +9938,9 @@ fn validate_collection_expression(
             }
             Ok(())
         }
+        mir::CollectionExpression::ForeignString { text, .. } => {
+            validate_foreign_string_construction(program, function, definition, text)
+        }
         mir::CollectionExpression::StringIntrinsic(call) => validate_string_intrinsic(
             program,
             function,
@@ -9322,6 +9970,33 @@ fn validate_collection_expression(
     }
 }
 
+/// `CString::from`, `Utf16String::from` and their `tryFrom` forms build an
+/// owned foreign string from a string (Decision 0148 section 9).
+fn validate_foreign_string_construction(
+    program: &mir::Program,
+    function: &mir::Function,
+    definition: &mir::CollectionType,
+    text: &mir::StringExpression,
+) -> Result<(), BackendError> {
+    let mir::CollectionKind::ForeignString(encoding) = definition.kind else {
+        return Err(malformed_mir(
+            "a foreign string construction builds a CString or Utf16String",
+        ));
+    };
+    let unit = match encoding {
+        crate::foreign::ForeignStringEncoding::Utf8 => IntegerType::UInt8,
+        crate::foreign::ForeignStringEncoding::Utf16 => IntegerType::UInt16,
+    };
+    if definition.key.is_some()
+        || definition.value != mir::Type::Scalar(mir::ScalarType::Integer(unit))
+    {
+        return Err(malformed_mir(
+            "a foreign string's collection type holds its code units",
+        ));
+    }
+    validate_string_expression(program, function, text)
+}
+
 fn validate_nullable_collection_expression(
     program: &mir::Program,
     function: &mir::Function,
@@ -9344,6 +10019,10 @@ fn validate_nullable_collection_expression(
             *access,
         ),
         mir::NullableCollectionExpression::Null(_) => Ok(()),
+        mir::NullableCollectionExpression::TryForeignString { text, .. } => {
+            let definition = collection_in(program, collection)?;
+            validate_foreign_string_construction(program, function, definition, text)
+        }
         mir::NullableCollectionExpression::Collection(value) => {
             if value.collection() != collection {
                 return Err(malformed_mir(
@@ -9506,7 +10185,7 @@ fn validate_string_intrinsic(
                 mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)),
             )
         }
-        Kind::GraphemeLength | Kind::ByteLength => {
+        Kind::GraphemeLength | Kind::DisplayWidth | Kind::ByteLength => {
             exact(&[string])?;
             require_string_intrinsic_result(call, int)
         }
@@ -9559,6 +10238,11 @@ fn validate_string_intrinsic(
                 ));
             };
             let definition = collection_in(program, collection)?;
+            if matches!(definition.kind, mir::CollectionKind::ForeignString(_)) {
+                return Err(malformed_mir(
+                    "an owned foreign string has no assertion presentation",
+                ));
+            }
             let expected = [string, int, int, string, string, int, string, string];
             for (index, (argument, expected)) in call.args[1..].iter().zip(expected).enumerate() {
                 if argument.ty() != expected {
@@ -9678,6 +10362,14 @@ fn validate_string_intrinsic(
         }
         Kind::Repeat => {
             exact(&[string, int])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::GraphemeBoundaryAfter => {
+            exact(&[string, int])?;
+            require_string_intrinsic_result(call, int)
+        }
+        Kind::TextBetween => {
+            exact(&[string, int, int])?;
             require_string_intrinsic_result(call, string)
         }
         Kind::PadStart | Kind::PadEnd => {
@@ -9832,7 +10524,7 @@ fn require_writable_nullable_collection(
     use mir::NullableCollectionExpression as E;
     let writable = match value {
         E::CollectionGet { .. } => false,
-        E::Null(_) => true,
+        E::Null(_) | E::TryForeignString { .. } => true,
         E::Collection(value) => {
             return validate_collection_borrow_writability(program, function, value, true);
         }
@@ -10805,7 +11497,7 @@ fn infer_rvalue_return_borrow(
         };
     }
     match source {
-        mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_) => {
+        mir::Rvalue::Region(_) | mir::Rvalue::NullableRegion(_) => {
             byte_regions::inferred_borrow(program, function, source)
         }
         mir::Rvalue::Interface(source) => {
@@ -11208,6 +11900,7 @@ fn infer_collection_expression_return_borrow(
         | mir::CollectionExpression::BytesAllocate { .. }
         | mir::CollectionExpression::ReadFileBytes { .. }
         | mir::CollectionExpression::ReadStdinBytes { .. }
+        | mir::CollectionExpression::ForeignString { .. }
         | mir::CollectionExpression::StringIntrinsic(_)
         | mir::CollectionExpression::Call {
             return_borrow: None,
@@ -11224,6 +11917,7 @@ fn infer_nullable_collection_return_borrow(
     use mir::NullableCollectionExpression as E;
     match expression {
         E::CollectionGet { access, .. } if access.removes_element() => Ok(None),
+        E::TryForeignString { .. } => Ok(None),
         E::CollectionGet { source, .. } => Ok(infer_local_return_borrow(
             program, function, *source,
         )?
@@ -11326,7 +12020,8 @@ fn infer_mixed_expression_return_borrow(
             return_borrow: None,
             ..
         }
-        | mir::MixedExpression::BoxValue(_)
+        | mir::MixedExpression::BoxValue { .. }
+        | mir::MixedExpression::BoxForeignAggregate(_)
         | mir::MixedExpression::BoxString { .. }
         | mir::MixedExpression::BoxClass { .. }
         | mir::MixedExpression::BoxInterface { .. }
@@ -12482,8 +13177,8 @@ fn collect_rvalue_class_local_accesses<'a>(
         accesses.independent_value(value);
     }
     match value {
-        mir::Rvalue::ByteRegion(value) => byte_regions::collect_expression(value, accesses),
-        mir::Rvalue::NullableByteRegion(value) => {
+        mir::Rvalue::Region(value) => byte_regions::collect_expression(value, accesses),
+        mir::Rvalue::NullableRegion(value) => {
             byte_regions::collect_nullable_expression(value, accesses)
         }
         mir::Rvalue::Value(value) => collect_value_class_local_accesses(value, accesses),
@@ -12549,6 +13244,117 @@ fn collect_rvalue_class_local_accesses<'a>(
         mir::Rvalue::Function(value) => collect_function_class_local_accesses(value, accesses),
         mir::Rvalue::NullableFunction(value) => {
             collect_nullable_function_class_local_accesses(value, accesses)
+        }
+        mir::Rvalue::ForeignAggregate(value) => {
+            collect_foreign_aggregate_class_local_accesses(value, accesses)
+        }
+        mir::Rvalue::NullableForeignAggregate(value) => {
+            collect_rvalue_class_local_accesses_of_nullable_aggregate(value, accesses)
+        }
+    }
+}
+
+fn collect_rvalue_class_local_accesses_of_nullable_aggregate<'a>(
+    value: &'a mir::NullableForeignAggregateExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::NullableForeignAggregateExpression::Present(value) => {
+            collect_foreign_aggregate_class_local_accesses(value, accesses)
+        }
+        mir::NullableForeignAggregateExpression::Local { local, .. } => {
+            accesses.resource_read(*local)
+        }
+        mir::NullableForeignAggregateExpression::Property {
+            object, property, ..
+        } => accesses.borrow_property(*object, *property),
+        mir::NullableForeignAggregateExpression::Null(_)
+        | mir::NullableForeignAggregateExpression::Static { .. } => {}
+        mir::NullableForeignAggregateExpression::Call { args, .. } => {
+            for arg in args {
+                collect_rvalue_class_local_accesses(arg, accesses);
+            }
+        }
+        mir::NullableForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            remove,
+            ..
+        } => {
+            collect_rvalue_class_local_accesses(index, accesses);
+            accesses.collection_access(*collection, *remove);
+        }
+        mir::NullableForeignAggregateExpression::CollectionGet {
+            collection,
+            key,
+            access,
+            ..
+        } => {
+            collect_rvalue_class_local_accesses(key, accesses);
+            accesses.collection_access(*collection, access.removes_element());
+        }
+    }
+}
+
+/// Whether the `?Name` value is present on every path: a present value, or
+/// a copy of a local proved present.
+fn nullable_foreign_aggregate_is_present(
+    value: &mir::NullableForeignAggregateExpression,
+    present: &HashSet<mir::LocalId>,
+) -> bool {
+    match value {
+        mir::NullableForeignAggregateExpression::Present(_) => true,
+        mir::NullableForeignAggregateExpression::Local { local, .. } => present.contains(local),
+        mir::NullableForeignAggregateExpression::Null(_)
+        | mir::NullableForeignAggregateExpression::Property { .. }
+        | mir::NullableForeignAggregateExpression::Static { .. }
+        | mir::NullableForeignAggregateExpression::Call { .. }
+        | mir::NullableForeignAggregateExpression::CollectionIndex { .. }
+        | mir::NullableForeignAggregateExpression::CollectionGet { .. } => false,
+    }
+}
+
+fn collect_foreign_aggregate_class_local_accesses<'a>(
+    value: &'a mir::ForeignAggregateExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::ForeignAggregateExpression::Construct { fields, .. } => {
+            for field in fields {
+                collect_rvalue_class_local_accesses(&field.value, accesses);
+            }
+        }
+        mir::ForeignAggregateExpression::Local { local, .. } => accesses.resource_read(*local),
+        mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { local, .. } => {
+            accesses.resource_read(*local);
+            accesses.assume_nullable_present(*local)
+        }
+        mir::ForeignAggregateExpression::Property {
+            object, property, ..
+        } => accesses.borrow_property(*object, *property),
+        // A static is no local's storage.
+        mir::ForeignAggregateExpression::Static { .. } => {}
+        mir::ForeignAggregateExpression::Call { args, .. } => {
+            for arg in args {
+                collect_rvalue_class_local_accesses(arg, accesses);
+            }
+        }
+        mir::ForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            remove,
+            ..
+        } => {
+            collect_rvalue_class_local_accesses(index, accesses);
+            accesses.collection_access(*collection, *remove);
+        }
+        mir::ForeignAggregateExpression::RegionIndex { region, index, .. } => {
+            accesses.resource_read(*region);
+            collect_rvalue_class_local_accesses(index, accesses);
+            accesses.contents_access(*region, false);
+        }
+        mir::ForeignAggregateExpression::MixedPayload { ty, mixed } => {
+            accesses.assume_mixed_tag(*mixed, mir::MixedTag::ForeignAggregate(*ty))
         }
     }
 }
@@ -13006,7 +13812,8 @@ fn collect_collection_class_local_accesses<'a>(
         mir::CollectionExpression::Property {
             object, property, ..
         } => accesses.borrow_property(*object, *property),
-        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+        mir::CollectionExpression::ReadFileBytes { path, .. }
+        | mir::CollectionExpression::ForeignString { text: path, .. } => {
             collect_string_class_local_accesses(path, accesses)
         }
         mir::CollectionExpression::Call {
@@ -13115,6 +13922,9 @@ fn collect_nullable_collection_class_local_accesses<'a>(
                 accesses.resource_transfer(*local);
             }
         }
+        mir::NullableCollectionExpression::TryForeignString { text, .. } => {
+            collect_string_class_local_accesses(text, accesses)
+        }
         mir::NullableCollectionExpression::Null(_) => {}
     }
 }
@@ -13124,8 +13934,11 @@ fn collect_mixed_class_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
-        mir::MixedExpression::BoxValue(value) => {
+        mir::MixedExpression::BoxValue { value, .. } => {
             collect_value_class_local_accesses(value, accesses)
+        }
+        mir::MixedExpression::BoxForeignAggregate(value) => {
+            collect_foreign_aggregate_class_local_accesses(value, accesses)
         }
         mir::MixedExpression::BoxString { value, .. } => {
             collect_string_class_local_accesses(value, accesses)
@@ -13456,8 +14269,8 @@ fn collect_operand_class_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match operand {
-        mir::Operand::ByteRegionLength(local) => accesses.resource_read(*local),
-        mir::Operand::ByteRegionIndex { region, index, .. } => {
+        mir::Operand::RegionLength(local) => accesses.resource_read(*local),
+        mir::Operand::RegionIndex { region, index, .. } => {
             accesses.resource_read(*region);
             collect_rvalue_class_local_accesses(index, accesses);
             accesses.contents_access(*region, false);
@@ -13506,6 +14319,7 @@ fn collect_integer_class_local_accesses<'a>(
         mir::IntegerExpression::InlineWord(value) => {
             collect_inline_class_local_accesses(value, accesses);
         }
+        mir::IntegerExpression::LastSystemCode => {}
         mir::IntegerExpression::Use { operand, .. } => {
             collect_operand_class_local_accesses(operand, accesses);
         }
@@ -13542,7 +14356,7 @@ fn collect_integer_class_local_accesses<'a>(
         mir::IntegerExpression::EnumBacking { value, .. } => {
             collect_enum_class_local_accesses(value, accesses)
         }
-        mir::IntegerExpression::CopyByteRegion {
+        mir::IntegerExpression::CopyRegion {
             destination,
             source,
             ..
@@ -13982,6 +14796,9 @@ fn collect_bool_class_local_accesses<'a>(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             collect_nullable_payload_enum_class_local_accesses(value, accesses);
         }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            collect_rvalue_class_local_accesses_of_nullable_aggregate(value, accesses);
+        }
         mir::BoolExpression::NullableFunctionIsPresent(value) => {
             collect_nullable_function_class_local_accesses(value, accesses);
         }
@@ -14136,10 +14953,18 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
             collect_rvalue_class_local_accesses(value, accesses);
             accesses.contents_access(*collection, false);
         }
+        mir::NullableScalarExpression::RegionIndex { region, index, .. } => {
+            accesses.resource_read(*region);
+            collect_rvalue_class_local_accesses(index, accesses);
+            accesses.contents_access(*region, false);
+        }
         mir::NullableScalarExpression::StringIntrinsic(call) => {
             collect_rvalue_args_class_local_accesses(&call.args, accesses)
         }
         mir::NullableScalarExpression::Local { local, .. } => accesses.resource_read(*local),
+        mir::NullableScalarExpression::TryConvert { value, .. } => {
+            collect_integer_class_local_accesses(value, accesses)
+        }
         mir::NullableScalarExpression::Parse { .. }
         | mir::NullableScalarExpression::Null(_)
         | mir::NullableScalarExpression::Static { .. } => {}
@@ -14246,10 +15071,107 @@ fn collect_format_class_local_accesses<'a>(
     }
 }
 
+/// The accesses a statement makes to reach the storage `place` names: a
+/// field read or write, or a pointer formed to it.
+fn collect_inline_place_accesses(
+    place: mir::InlinePlace,
+    write: bool,
+    accesses: &mut ClassLocalAccesses,
+) {
+    match place {
+        mir::InlinePlace::Local(local) => accesses.resource_read(local),
+        mir::InlinePlace::NullableLocalAssumeNonNull(local) => {
+            accesses.resource_read(local);
+            accesses.assume_nullable_present(local)
+        }
+        // A field access uses one stored path, not the receiver as a
+        // whole (Decision 0136), as a property store does.
+        mir::InlinePlace::Property { object, property }
+        | mir::InlinePlace::NullablePropertyAssumeNonNull { object, property } => {
+            accesses.borrow_property(object, property)
+        }
+        mir::InlinePlace::Static(_) | mir::InlinePlace::NullableStaticAssumeNonNull(_) => {}
+        mir::InlinePlace::CollectionElement {
+            collection, index, ..
+        }
+        | mir::InlinePlace::NullableCollectionElementAssumeNonNull {
+            collection, index, ..
+        } => {
+            accesses.resource_read(index);
+            accesses.collection_access(collection, false);
+        }
+        mir::InlinePlace::RegionElement { region, index, .. } => {
+            accesses.resource_read(region);
+            accesses.resource_read(index);
+            accesses.contents_access(region, write);
+        }
+    }
+}
+
 fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses<'_> {
     let mut accesses = ClassLocalAccesses::default();
     match statement {
         mir::Statement::SetDiagnosticSite { .. } => {}
+        mir::Statement::HostRecord { .. } => {}
+        mir::Statement::RegionSlot { record, .. } => accesses.resource_read(*record),
+        mir::Statement::CallHost {
+            host,
+            arguments,
+            results,
+            ..
+        } => {
+            for local in host.iter().chain(arguments).chain(results) {
+                accesses.resource_read(*local);
+            }
+        }
+        mir::Statement::ForeignCall { function, args, .. } => {
+            if let mir::ForeignCallee::Pointer(pointer) = function.callee {
+                accesses.resource_read(pointer);
+            }
+            for local in args {
+                accesses.resource_read(*local);
+            }
+        }
+        mir::Statement::ForeignField {
+            aggregate, access, ..
+        } => {
+            collect_inline_place_accesses(
+                *aggregate,
+                matches!(access, mir::ForeignFieldAccess::Write { .. }),
+                &mut accesses,
+            );
+            if let mir::ForeignFieldAccess::Write { value, .. } = access {
+                collect_rvalue_class_local_accesses(value, &mut accesses);
+            }
+        }
+        mir::Statement::Pointer { operation, .. } => {
+            if let Some(pointer) = operation.pointer() {
+                accesses.resource_read(pointer);
+            }
+            match operation {
+                mir::PointerOperation::AddressOf { place, .. } => {
+                    collect_inline_place_accesses(*place, false, &mut accesses)
+                }
+                mir::PointerOperation::Write { value, .. }
+                | mir::PointerOperation::CreateHandle { value } => {
+                    collect_rvalue_class_local_accesses(value, &mut accesses)
+                }
+                mir::PointerOperation::Offset { count: value, .. }
+                | mir::PointerOperation::FromAddress { address: value }
+                | mir::PointerOperation::ForeignRange { length: value, .. } => {
+                    collect_integer_class_local_accesses(value, &mut accesses)
+                }
+                mir::PointerOperation::RegionData { region: local, .. }
+                | mir::PointerOperation::ForeignStringData { string: local } => {
+                    accesses.resource_read(*local)
+                }
+                mir::PointerOperation::Read { .. }
+                | mir::PointerOperation::Address { .. }
+                | mir::PointerOperation::ReadForeignString { .. }
+                | mir::PointerOperation::CEntryAddress { .. }
+                | mir::PointerOperation::FromHandle { .. } => {}
+            }
+        }
         mir::Statement::CompletePendingRequest {
             request, outcome, ..
         } => {
@@ -14257,7 +15179,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             accesses.resource_read(*outcome);
         }
         mir::Statement::EndBorrow { .. } => {}
-        mir::Statement::AssignByteRegionIndex {
+        mir::Statement::AssignRegionIndex {
             region,
             index,
             value,
@@ -15702,7 +16624,14 @@ fn validate_control_flow_plans(
                 }
                 mir::ControlFlowPlan::When(plan) => {
                     validate_conditional_error_exit(function, plan.merge, plan.error_exit)?;
+                    // A branch the program never enters, such as one whose
+                    // condition is constant false for the target (Decision
+                    // 0148 section 17), has no result path to check.
+                    let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
                     for branch in &plan.branches {
+                        if !reachable[branch.0] {
+                            continue;
+                        }
                         validate_result_path(
                             function,
                             plan.result,
@@ -16255,14 +17184,14 @@ fn rvalue_reads_collection_value_at(
                 ..
             },
         )
-        | mir::Rvalue::ByteRegion(mir::ByteRegionExpression::CollectionIndex {
+        | mir::Rvalue::Region(mir::RegionExpression::CollectionIndex {
             collection,
             index,
             positional,
             remove,
             ..
         })
-        | mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::CollectionIndex {
+        | mir::Rvalue::NullableRegion(mir::NullableRegionExpression::CollectionIndex {
             collection,
             index,
             positional,
@@ -16343,7 +17272,23 @@ fn rvalue_reads_collection_value_at(
                 },
             mode: mir::PayloadEnumUseMode::Borrow,
             ..
-        }) => matches_index(*collection, index, *positional, *remove),
+        })
+        | mir::Rvalue::ForeignAggregate(mir::ForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        })
+        | mir::Rvalue::NullableForeignAggregate(
+            mir::NullableForeignAggregateExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            },
+        ) => matches_index(*collection, index, *positional, *remove),
         mir::Rvalue::NullableScalar(mir::NullableScalarExpression::DictionaryGet {
             collection,
             key,
@@ -16371,7 +17316,15 @@ fn rvalue_reads_collection_value_at(
             key,
             access,
             ..
-        }) => matches_nullable(*collection, key, *access),
+        })
+        | mir::Rvalue::NullableForeignAggregate(
+            mir::NullableForeignAggregateExpression::CollectionGet {
+                collection,
+                key,
+                access,
+                ..
+            },
+        ) => matches_nullable(*collection, key, *access),
         _ => false,
     }
 }
@@ -17049,7 +18002,7 @@ fn validate_finalizer_plan(
     let entry_predecessors = function
         .blocks
         .iter()
-        .filter(|block| terminator_targets(&block.terminator).contains(&plan.entry))
+        .filter(|block| block.terminator.targets().contains(&plan.entry))
         .map(|block| block.id)
         .collect::<HashSet<_>>();
     if entry_predecessors != planned_sources {
@@ -17426,7 +18379,7 @@ fn cfg_reaches(
             return Ok(true);
         }
         if visited.insert(block) {
-            pending.extend(terminator_targets(&block_in(function, block)?.terminator));
+            pending.extend(block_in(function, block)?.terminator.targets());
         }
     }
     Ok(false)
@@ -17657,9 +18610,7 @@ fn validate_result_path(
         if block_id == activation || !outside.insert(block_id) {
             continue;
         }
-        search.extend(terminator_targets(
-            &block_in(function, block_id)?.terminator,
-        ));
+        search.extend(block_in(function, block_id)?.terminator.targets());
     }
     let mut pending = VecDeque::from([(arm, 0_u8, false, FinalizerSelections::new())]);
     let mut visited = HashSet::new();
@@ -18039,7 +18990,7 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullableCollection(_), mir::Rvalue::NullableCollection(value)) => {
                     nullable_collection_expression_is_present(value, present)
                 }
-                (mir::Type::NullableByteRegion(_), mir::Rvalue::NullableByteRegion(value)) => {
+                (mir::Type::NullableRegion(_), mir::Rvalue::NullableRegion(value)) => {
                     byte_regions::nullable_present(value, present)
                 }
                 (mir::Type::NullableInterface(_), mir::Rvalue::NullableInterface(value)) => {
@@ -18048,6 +18999,10 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullablePayloadEnum(_), mir::Rvalue::NullablePayloadEnum(value)) => {
                     nullable_payload_enum_expression_is_present(value, present)
                 }
+                (
+                    mir::Type::NullableForeignAggregate(_),
+                    mir::Rvalue::NullableForeignAggregate(value),
+                ) => nullable_foreign_aggregate_is_present(value, present),
                 _ => return Ok(()),
             };
             if value_is_present {
@@ -18071,7 +19026,7 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullableCollection(_), mir::Rvalue::NullableCollection(value)) => {
                     nullable_collection_expression_is_present(value, present)
                 }
-                (mir::Type::NullableByteRegion(_), mir::Rvalue::NullableByteRegion(value)) => {
+                (mir::Type::NullableRegion(_), mir::Rvalue::NullableRegion(value)) => {
                     byte_regions::nullable_present(value, present)
                 }
                 (mir::Type::NullableInterface(_), mir::Rvalue::NullableInterface(value)) => {
@@ -18080,6 +19035,10 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullablePayloadEnum(_), mir::Rvalue::NullablePayloadEnum(value)) => {
                     nullable_payload_enum_expression_is_present(value, present)
                 }
+                (
+                    mir::Type::NullableForeignAggregate(_),
+                    mir::Rvalue::NullableForeignAggregate(value),
+                ) => nullable_foreign_aggregate_is_present(value, present),
                 _ => return Ok(()),
             };
             for target in targets {
@@ -18488,6 +19447,7 @@ fn nullable_collection_expression_presence(
         mir::NullableCollectionExpression::Property { .. }
         | mir::NullableCollectionExpression::Index { .. }
         | mir::NullableCollectionExpression::CollectionGet { .. }
+        | mir::NullableCollectionExpression::TryForeignString { .. }
         | mir::NullableCollectionExpression::Call { .. } => None,
         mir::NullableCollectionExpression::Coalesce { left, right, .. } => coalesced_presence(
             nullable_collection_expression_presence(left, present),
@@ -18566,8 +19526,10 @@ fn nullable_scalar_expression_presence(
         | mir::NullableScalarExpression::NullSafeProperty { .. }
         | mir::NullableScalarExpression::NullSafeCall { .. }
         | mir::NullableScalarExpression::DictionaryGet { .. }
+        | mir::NullableScalarExpression::RegionIndex { .. }
         | mir::NullableScalarExpression::CollectionIndexOf { .. }
         | mir::NullableScalarExpression::Parse { .. }
+        | mir::NullableScalarExpression::TryConvert { .. }
         | mir::NullableScalarExpression::StringIntrinsic(_) => None,
     }
 }
@@ -18739,7 +19701,7 @@ fn apply_nullable_presence_condition(
             }
         }
         mir::BoolExpression::NullableByteRegionIsPresent(value) => {
-            if let mir::NullableByteRegionExpression::Local { local, .. } = value.as_ref() {
+            if let mir::NullableRegionExpression::Local { local, .. } = value.as_ref() {
                 set_nullable_presence(*local, when_true, present);
             }
         }
@@ -18761,6 +19723,11 @@ fn apply_nullable_presence_condition(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             if let Some(local) = nullable_payload_enum_presence_local(value) {
                 set_nullable_presence(local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            if let mir::NullableForeignAggregateExpression::Local { local, .. } = value.as_ref() {
+                set_nullable_presence(*local, when_true, present);
             }
         }
         mir::BoolExpression::PayloadEnumIsCase {
@@ -20092,58 +21059,12 @@ fn constructor_property_assignment_count(
         .count())
 }
 
-fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
-    match terminator {
-        mir::Terminator::Jump(target) => vec![*target],
-        mir::Terminator::Branch {
-            then_block,
-            else_block,
-            ..
-        } => vec![*then_block, *else_block],
-        mir::Terminator::CheckedCall {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedIndirectCall {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedConstruct {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedIo {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedDeadlineFromNow {
-            success, failure, ..
-        }
-        | mir::Terminator::CheckedCancellationRequest {
-            success, failure, ..
-        } => vec![*success, *failure],
-        mir::Terminator::IndirectCall { continuation, .. } => vec![*continuation],
-        mir::Terminator::ErrorSwitch {
-            cases,
-            catch_all,
-            fallback,
-            ..
-        } => cases
-            .iter()
-            .map(|(_, target)| *target)
-            .chain(catch_all.iter().copied())
-            .chain(std::iter::once(*fallback))
-            .collect(),
-        mir::Terminator::Return(_)
-        | mir::Terminator::ReturnVoid
-        | mir::Terminator::Panic { .. }
-        | mir::Terminator::Unreachable
-        | mir::Terminator::PropagateError { .. } => Vec::new(),
-    }
-}
-
 fn analysis_terminator_targets(
     terminator: &mir::Terminator,
     fold_constant_branches: bool,
 ) -> Vec<mir::BlockId> {
     if !fold_constant_branches {
-        return terminator_targets(terminator);
+        return terminator.targets();
     }
     match terminator {
         mir::Terminator::Branch {
@@ -20155,7 +21076,7 @@ fn analysis_terminator_targets(
             Some(false) => vec![*else_block],
             None => vec![*then_block, *else_block],
         },
-        _ => terminator_targets(terminator),
+        _ => terminator.targets(),
     }
 }
 
@@ -20192,10 +21113,49 @@ fn statement_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match statement {
-        mir::Statement::SetDiagnosticSite { .. } => false,
+        mir::Statement::SetDiagnosticSite { .. }
+        | mir::Statement::ForeignCall { .. }
+        | mir::Statement::HostRecord { .. }
+        | mir::Statement::RegionSlot { .. }
+        | mir::Statement::CallHost { .. } => false,
+        mir::Statement::ForeignField {
+            aggregate, access, ..
+        } => {
+            aggregate.stored_property() == Some((receiver, property))
+                || match access {
+                    mir::ForeignFieldAccess::Read { .. }
+                    | mir::ForeignFieldAccess::Region { .. } => false,
+                    mir::ForeignFieldAccess::Write { value, .. } => {
+                        rvalue_observes_property(value, receiver, property)
+                    }
+                }
+        }
+        mir::Statement::Pointer { operation, .. } => match operation {
+            mir::PointerOperation::Write { value, .. }
+            | mir::PointerOperation::CreateHandle { value } => {
+                rvalue_observes_property(value, receiver, property)
+            }
+            mir::PointerOperation::Offset { count: value, .. }
+            | mir::PointerOperation::FromAddress { address: value }
+            | mir::PointerOperation::ForeignRange { length: value, .. } => {
+                integer_observes_property(value, receiver, property)
+            }
+            // A pointer to the property exposes its storage, which a
+            // foreign call may then read.
+            mir::PointerOperation::AddressOf { place, .. } => {
+                place.stored_property() == Some((receiver, property))
+            }
+            mir::PointerOperation::Read { .. }
+            | mir::PointerOperation::Address { .. }
+            | mir::PointerOperation::RegionData { .. }
+            | mir::PointerOperation::ForeignStringData { .. }
+            | mir::PointerOperation::ReadForeignString { .. }
+            | mir::PointerOperation::CEntryAddress { .. }
+            | mir::PointerOperation::FromHandle { .. } => false,
+        },
         mir::Statement::CompletePendingRequest { .. } => false,
         mir::Statement::EndBorrow { .. } => false,
-        mir::Statement::AssignByteRegionIndex { index, value, .. } => {
+        mir::Statement::AssignRegionIndex { index, value, .. } => {
             rvalue_observes_property(index, receiver, property)
                 || rvalue_observes_property(value, receiver, property)
         }
@@ -20407,7 +21367,7 @@ fn rvalue_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
-        mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_) => {
+        mir::Rvalue::Region(_) | mir::Rvalue::NullableRegion(_) => {
             let mut accesses = ClassLocalAccesses::default();
             collect_rvalue_class_local_accesses(value, &mut accesses);
             let observed = accesses
@@ -20481,6 +21441,57 @@ fn rvalue_observes_property(
         mir::Rvalue::NullablePayloadEnum(value) => {
             nullable_payload_enum_observes_property(value, receiver, property)
         }
+        mir::Rvalue::ForeignAggregate(value) => {
+            foreign_aggregate_observes_property(value, receiver, property)
+        }
+        mir::Rvalue::NullableForeignAggregate(value) => match value {
+            mir::NullableForeignAggregateExpression::Present(value) => {
+                foreign_aggregate_observes_property(value, receiver, property)
+            }
+            mir::NullableForeignAggregateExpression::Call { args, .. } => args
+                .iter()
+                .any(|arg| rvalue_observes_property(arg, receiver, property)),
+            mir::NullableForeignAggregateExpression::Property {
+                object,
+                property: observed,
+                ..
+            } => *object == receiver && *observed == property,
+            mir::NullableForeignAggregateExpression::CollectionIndex { index: key, .. }
+            | mir::NullableForeignAggregateExpression::CollectionGet { key, .. } => {
+                rvalue_observes_property(key, receiver, property)
+            }
+            mir::NullableForeignAggregateExpression::Null(_)
+            | mir::NullableForeignAggregateExpression::Local { .. }
+            | mir::NullableForeignAggregateExpression::Static { .. } => false,
+        },
+    }
+}
+
+fn foreign_aggregate_observes_property(
+    value: &mir::ForeignAggregateExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::ForeignAggregateExpression::Construct { fields, .. } => fields
+            .iter()
+            .any(|field| rvalue_observes_property(&field.value, receiver, property)),
+        mir::ForeignAggregateExpression::Call { args, .. } => args
+            .iter()
+            .any(|arg| rvalue_observes_property(arg, receiver, property)),
+        mir::ForeignAggregateExpression::Property {
+            object,
+            property: observed,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::ForeignAggregateExpression::CollectionIndex { index, .. }
+        | mir::ForeignAggregateExpression::RegionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
+        mir::ForeignAggregateExpression::Local { .. }
+        | mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { .. }
+        | mir::ForeignAggregateExpression::Static { .. }
+        | mir::ForeignAggregateExpression::MixedPayload { .. } => false,
     }
 }
 
@@ -21029,7 +22040,8 @@ fn collection_observes_property(
             property: observed,
             ..
         } => *object == receiver && *observed == property,
-        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+        mir::CollectionExpression::ReadFileBytes { path, .. }
+        | mir::CollectionExpression::ForeignString { text: path, .. } => {
             string_observes_property(path, receiver, property)
         }
         mir::CollectionExpression::Call { args, .. } => args
@@ -21074,6 +22086,9 @@ fn nullable_collection_observes_property(
             nullable_collection_observes_property(left, receiver, property)
                 || nullable_collection_observes_property(right, receiver, property)
         }
+        mir::NullableCollectionExpression::TryForeignString { text, .. } => {
+            string_observes_property(text, receiver, property)
+        }
         mir::NullableCollectionExpression::Null(_)
         | mir::NullableCollectionExpression::Local { .. } => false,
     }
@@ -21085,7 +22100,12 @@ fn mixed_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
-        mir::MixedExpression::BoxValue(value) => value_observes_property(value, receiver, property),
+        mir::MixedExpression::BoxValue { value, .. } => {
+            value_observes_property(value, receiver, property)
+        }
+        mir::MixedExpression::BoxForeignAggregate(value) => {
+            foreign_aggregate_observes_property(value, receiver, property)
+        }
         mir::MixedExpression::BoxString { value, .. } => {
             string_observes_property(value, receiver, property)
         }
@@ -21231,6 +22251,7 @@ fn integer_observes_property(
         mir::IntegerExpression::InlineWord(value) => {
             inline_value_observes_property(value, receiver, property)
         }
+        mir::IntegerExpression::LastSystemCode => false,
         mir::IntegerExpression::Use { operand, .. } => {
             operand_observes_property(operand, receiver, property)
         }
@@ -21255,7 +22276,7 @@ fn integer_observes_property(
         mir::IntegerExpression::EnumBacking { value, .. } => {
             enum_observes_property(value, receiver, property)
         }
-        mir::IntegerExpression::CopyByteRegion {
+        mir::IntegerExpression::CopyRegion {
             destination,
             source,
             ..
@@ -21519,6 +22540,11 @@ fn bool_observes_property(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             nullable_payload_enum_observes_property(value, receiver, property)
         }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => rvalue_observes_property(
+            &mir::Rvalue::NullableForeignAggregate(value.as_ref().clone()),
+            receiver,
+            property,
+        ),
         mir::BoolExpression::PayloadEnumCompare { left, right, .. } => {
             payload_enum_observes_property(left, receiver, property)
                 || payload_enum_observes_property(right, receiver, property)
@@ -21593,8 +22619,14 @@ fn nullable_scalar_observes_property(
         mir::NullableScalarExpression::CollectionIndexOf { value, .. } => {
             rvalue_observes_property(value, receiver, property)
         }
+        mir::NullableScalarExpression::RegionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
         mir::NullableScalarExpression::Parse { value, .. } => {
             string_observes_property(value, receiver, property)
+        }
+        mir::NullableScalarExpression::TryConvert { value, .. } => {
+            integer_observes_property(value, receiver, property)
         }
         mir::NullableScalarExpression::StringIntrinsic(call) => call
             .args
@@ -21955,7 +22987,7 @@ fn validate_call_args_for_params(
                 ));
             }
             if parameter_definition.writable
-                && byte_regions::kind(parameter_type).is_some_and(mir::ByteRegionKind::is_writable)
+                && byte_regions::kind(parameter_type).is_some_and(mir::RegionType::is_writable)
             {
                 byte_regions::require_writable(program, caller, argument)?;
             }
@@ -22298,7 +23330,7 @@ fn escaping_class_local_borrows(
     argument: &mir::Rvalue,
 ) -> Result<Vec<mir::LocalId>, BackendError> {
     match argument {
-        mir::Rvalue::ByteRegion(_) | mir::Rvalue::NullableByteRegion(_) => {
+        mir::Rvalue::Region(_) | mir::Rvalue::NullableRegion(_) => {
             byte_regions::escaping(program, argument)
         }
         mir::Rvalue::Mixed(expression) => escaping_mixed_local_borrows(program, expression),
@@ -23133,6 +24165,9 @@ fn validate_condition(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             validate_nullable_payload_enum_expression(program, function, value)
         }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            foreign_aggregates::validate_nullable_expression(program, function, value)
+        }
         mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
             validate_payload_enum_comparison(program, function, *op, left, right)
         }
@@ -23182,20 +24217,7 @@ fn validate_condition(
         }
         mir::BoolExpression::MixedIs { mixed, tag } => {
             validate_mixed_expression(program, function, mixed)?;
-            validate_type(program, tag.ty())?;
-            if let mir::MixedTag::Class(class) = tag {
-                class_in(program, *class)?;
-            }
-            if let mir::MixedTag::Enum(enum_id) = tag {
-                enum_in(program, *enum_id)?;
-            }
-            if let mir::MixedTag::PayloadEnum(payload) = tag {
-                validate_payload_enum_type(program, *payload)?;
-            }
-            if let mir::MixedTag::Function(function_type) = tag {
-                function_type_in(program, *function_type)?;
-            }
-            Ok(())
+            validate_mixed_tag(program, *tag)
         }
         mir::BoolExpression::Not(condition) => validate_condition(program, function, condition),
         mir::BoolExpression::Binary { left, right, .. } => {
@@ -23342,9 +24364,9 @@ fn validate_integer_operand(
     operand: &mir::Operand,
 ) -> Result<(), BackendError> {
     match operand {
-        mir::Operand::ByteRegionLength(local) => {
+        mir::Operand::RegionLength(local) => {
             if ty != IntegerType::Int64
-                || !matches!(local_in(function, *local)?.ty, mir::Type::ByteRegion(_))
+                || !matches!(local_in(function, *local)?.ty, mir::Type::Region(_))
             {
                 return Err(malformed_mir(
                     "byte region length requires a non-null region and int result",
@@ -23352,12 +24374,13 @@ fn validate_integer_operand(
             }
             Ok(())
         }
-        mir::Operand::ByteRegionIndex { region, index, .. } => {
-            if ty != IntegerType::UInt8 {
-                return Err(malformed_mir("byte region index result must be uint8"));
-            }
-            byte_regions::validate_index(program, function, *region, index, false)
-        }
+        mir::Operand::RegionIndex { region, index, .. } => byte_regions::validate_element_read(
+            program,
+            function,
+            *region,
+            index,
+            mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+        ),
         mir::Operand::CollectionIteratorPosition { receiver, vtable } => {
             iteration::builtin_receiver(program, function, *receiver, *vtable, true)?;
             if ty != IntegerType::Int64 {
@@ -23474,8 +24497,9 @@ fn validate_bool_operand(
 ) -> Result<(), BackendError> {
     let expected = mir::Type::Scalar(mir::ScalarType::Bool);
     match operand {
-        mir::Operand::ByteRegionLength(_) | mir::Operand::ByteRegionIndex { .. } => {
-            Err(malformed_mir("byte region measurement is not bool"))
+        mir::Operand::RegionLength(_) => Err(malformed_mir("byte region measurement is not bool")),
+        mir::Operand::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(program, function, *region, index, expected)
         }
         mir::Operand::CollectionIteratorPosition { .. } => {
             Err(malformed_mir("iterator position is int, not bool"))
@@ -23564,8 +24588,9 @@ fn validate_float_operand(
 ) -> Result<(), BackendError> {
     let expected = mir::Type::Scalar(mir::ScalarType::Float(ty));
     match operand {
-        mir::Operand::ByteRegionLength(_) | mir::Operand::ByteRegionIndex { .. } => {
-            Err(malformed_mir("byte region measurement is not float"))
+        mir::Operand::RegionLength(_) => Err(malformed_mir("byte region measurement is not float")),
+        mir::Operand::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(program, function, *region, index, expected)
         }
         mir::Operand::CollectionIteratorPosition { .. } => {
             Err(malformed_mir("iterator position is int, not float"))
@@ -23998,6 +25023,15 @@ fn validate_nullable_scalar_expression(
             mir::Type::Scalar(ty),
             *access,
         ),
+        mir::NullableScalarExpression::RegionIndex { region, index, .. } => {
+            byte_regions::validate_element_read(
+                program,
+                function,
+                *region,
+                index,
+                mir::Type::NullableScalar(ty),
+            )
+        }
         mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
             let local = local_in(function, *collection)?;
             let mir::Type::Collection(collection_type) = local.ty else {
@@ -24025,6 +25059,20 @@ fn validate_nullable_scalar_expression(
                 return Err(malformed_mir("parse produces only `?int` or `?float`"));
             }
             validate_string_expression(program, function, value)
+        }
+        mir::NullableScalarExpression::TryConvert {
+            ty: converted,
+            boundary,
+            value,
+        } => {
+            if ty != mir::ScalarType::Integer(*converted)
+                || crate::c_layout::CTarget::host().boundary_integer(*boundary) != *converted
+            {
+                return Err(malformed_mir(
+                    "a boundary conversion produces the integer of its C type on this target",
+                ));
+            }
+            validate_integer_expression(program, function, value)
         }
         mir::NullableScalarExpression::StringIntrinsic(call) => {
             validate_string_intrinsic(program, function, call, mir::Type::NullableScalar(ty))
@@ -24234,16 +25282,17 @@ fn validate_null_safe_call(
             ));
         }
         mir::Type::Collection(collection) => mir::Type::NullableCollection(collection),
-        mir::Type::ByteRegion(kind) => mir::Type::NullableByteRegion(kind),
+        mir::Type::Region(kind) => mir::Type::NullableRegion(kind),
         mir::Type::PayloadEnum(payload) => mir::Type::NullablePayloadEnum(payload),
         mir::Type::Function(function_type) => mir::Type::NullableFunction(function_type),
+        mir::Type::ForeignAggregate(ty) => mir::Type::NullableForeignAggregate(ty),
         mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "null-safe calls cannot expose closure environments",
             ));
         }
         mir::Type::NullableScalar(_)
-        | mir::Type::NullableByteRegion(_)
+        | mir::Type::NullableRegion(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableInterface(_)
@@ -24251,6 +25300,7 @@ fn validate_null_safe_call(
         | mir::Type::NullableCollection(_)
         | mir::Type::NullableFunction(_)
         | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
         | mir::Type::NullableWritableSharedReference(_)
@@ -24583,6 +25633,48 @@ fn function_in(
         .get(id.0)
         .filter(|function| function.id == id)
         .ok_or_else(|| malformed_mir(format!("FunctionId function{} does not exist", id.0)))
+}
+
+/// A `mixed` tag names a type of the program exactly. A pointer's tag
+/// names its checked pointer type; the bare inline pointer tag would make
+/// every pointer type test match every other.
+fn validate_mixed_tag(program: &mir::Program, tag: mir::MixedTag) -> Result<(), BackendError> {
+    validate_type(program, tag.ty())?;
+    match tag {
+        mir::MixedTag::Class(class) => {
+            class_in(program, class)?;
+        }
+        mir::MixedTag::Enum(enum_id) => {
+            enum_in(program, enum_id)?;
+        }
+        mir::MixedTag::PayloadEnum(payload) => {
+            validate_payload_enum_type(program, payload)?;
+        }
+        mir::MixedTag::Function(function_type) => {
+            function_type_in(program, function_type)?;
+        }
+        mir::MixedTag::Pointer(id) => {
+            program
+                .pointer_types
+                .get(id.0)
+                .filter(|pointer| pointer.id == id)
+                .ok_or_else(|| malformed_mir(format!("pointer type#{} does not exist", id.0)))?;
+        }
+        mir::MixedTag::Inline(crate::inline_value::InlineValueType::Pointer) => {
+            return Err(malformed_mir(
+                "a pointer `mixed` tag must name its checked pointer type",
+            ));
+        }
+        mir::MixedTag::Bool
+        | mir::MixedTag::Integer(_)
+        | mir::MixedTag::Float(_)
+        | mir::MixedTag::String
+        | mir::MixedTag::Interface(_)
+        | mir::MixedTag::Inline(_)
+        | mir::MixedTag::ForeignAggregate(_)
+        | mir::MixedTag::Boundary(_) => {}
+    }
+    Ok(())
 }
 
 fn function_type_in(

@@ -3,6 +3,13 @@ function main(): void
     let $family = "👨‍👩‍👧‍👦";
     echo "length: {$family->length}\n";
     echo "bytes: {$family->byteLength}\n";
+    echo "cells: {$family->displayWidth}\n";
+    let $mixed = "日本 ±é	";
+    echo "cells: {$mixed->displayWidth}\n";
+    foreach ($mixed->graphemes as string $grapheme) {
+        echo "<{$grapheme}:{$grapheme->displayWidth}>";
+    }
+    echo "\n";
 
     let $text = "  Dória 👍🏾  ";
     echo String::trim($text) . "\n";

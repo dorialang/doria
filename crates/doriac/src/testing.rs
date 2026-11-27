@@ -504,6 +504,9 @@ impl Elaborator<'_> {
             consuming_span: None,
             is_static: false,
             static_span: None,
+            unsafe_span: None,
+            linkage: crate::ast::FunctionLinkage::Doria,
+            documentation: None,
             name: generated_name,
             name_span: call_name_span,
             type_params: Vec::new(),
@@ -759,6 +762,7 @@ fn closure_body_span(body: &ClosureBody) -> Span {
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
         Stmt::Block(block) => block.span,
+        Stmt::Unsafe(statement) => statement.span,
         Stmt::VarDecl(value) => value.span,
         Stmt::Assignment(value) => value.span,
         Stmt::Echo { span, .. }

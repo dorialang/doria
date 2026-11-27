@@ -38,6 +38,8 @@ fn package(identity: &str, files: &[&str], dependencies: &[&str]) -> Package {
                 kind: DependencyKind::Normal,
             })
             .collect(),
+        native_libraries: Vec::new(),
+        unsafe_policy: None,
     }
 }
 
@@ -56,6 +58,7 @@ fn plan(packages: Vec<Package>) -> BuildPlanDocument {
                 kind: TargetKind::Binary,
                 entry_source: Some("acme/app:main.doria".into()),
                 active_scopes: vec![SourceScope::Main],
+                windows_subsystem: None,
             },
             packages,
             compiler: CompilerOptions {

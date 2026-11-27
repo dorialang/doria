@@ -19,6 +19,7 @@ pub mod backend;
 pub mod build_plan;
 pub mod builtins;
 pub mod byte_intrinsics;
+pub mod c_layout;
 mod checked_effects;
 mod generic_inference;
 pub use checked_effects::{CheckedEffectClass, CheckedEffectProfile};
@@ -32,17 +33,23 @@ pub mod collection_diagnostics;
 pub mod compilation_graph;
 pub mod compiler_known_concurrency;
 pub mod compiler_known_contracts;
+pub mod compiler_known_ffi;
 pub mod compiler_known_io;
 pub mod compiler_known_stream;
 pub mod compiler_known_term;
 pub mod compiler_known_test;
+pub mod compiler_known_text;
 pub mod compiler_known_time;
 pub mod const_eval;
 mod constructor_init;
 pub mod control_flow;
 pub mod dataflow;
+pub mod diagnostic_entries;
 pub mod diagnostics;
 pub mod enums;
+pub mod foreign;
+pub mod foreign_handles;
+pub mod foreign_strings;
 pub mod format_string;
 pub mod hir;
 pub mod incremental;
@@ -58,6 +65,9 @@ pub mod names;
 mod narrowing;
 pub mod native_abi;
 pub mod native_closure_abi;
+pub mod native_companion;
+pub mod native_link;
+pub mod native_loader;
 pub mod native_process;
 mod native_shared;
 pub mod numeric;
@@ -65,6 +75,7 @@ pub mod ownership;
 pub mod parser;
 pub mod performance;
 mod php_closure;
+pub mod pointer_intrinsics;
 pub mod property_hooks;
 pub mod return_analysis;
 pub mod runtime_artifact;
@@ -75,10 +86,14 @@ pub mod source;
 pub mod source_map;
 pub mod source_provider;
 pub mod string_literal;
+pub mod string_surface;
 pub mod symbols;
+pub mod syntax;
 pub mod testing;
 pub mod trait_composition;
 pub mod types;
+pub mod unsafe_code;
+pub mod unsafe_policy;
 
 pub const TOOLCHAIN_VERSION: &str = env!("DORIA_TOOLCHAIN_VERSION");
 pub const BUILD_COMMIT: &str = env!("DORIA_BUILD_COMMIT");
@@ -98,6 +113,9 @@ struct PreparedSource {
     source_semantic_contexts:
         std::collections::HashMap<source::SourceId, testing::SourceSemanticContext>,
     test_semantics: testing::TestSemanticFacts,
+    /// Warnings from name resolution and test elaboration, reported beside
+    /// the program's checking warnings.
+    warnings: Vec<Diagnostic>,
 }
 
 pub fn lex_source(
@@ -114,6 +132,15 @@ pub fn parse_source(path: impl Into<String>, text: impl Into<String>) -> Diagnos
 }
 
 pub fn check_source(path: impl Into<String>, text: impl Into<String>) -> DiagnosticResult<Program> {
+    check_source_with_warnings(path, text).map(|(program, _)| program)
+}
+
+/// Checks one source. A program with warnings and no errors checks; its
+/// warnings come back beside the program for the caller to report.
+pub fn check_source_with_warnings(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<(Program, Vec<Diagnostic>)> {
     let source = SourceFile::new(path, text);
     let context = CompilationContext::standalone(source.path.clone());
     check_source_file_with_context(&source, context)
@@ -125,7 +152,7 @@ pub fn check_source_with_context(
     context: CompilationContext,
 ) -> DiagnosticResult<Program> {
     let source = SourceFile::new(path, text);
-    check_source_file_with_context(&source, context)
+    check_source_file_with_context(&source, context).map(|(program, _)| program)
 }
 
 /// Parses and semantically analyzes one source file for editor tooling.
@@ -159,40 +186,17 @@ pub fn analyze_source_for_ide_with_source_context(
     let source = SourceFile::new(path, text);
     let context = source_context.compilation.clone();
     let authored = parse_source_file(&source)?;
+    // Tooling reads the authored tree as name resolution reads it.
+    let authored = read_call_candidates(&source, authored, &context, None)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolution = names::resolve_program_for_ide(&authored, &context);
-    let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(&source)?
-        || compiler_known_io::resolved_program_uses_canonical_io(
-            &resolution.resolved.facts,
-            &resolution.resolved.program,
-        );
-    if uses_compiler_known_io {
-        resolution.resolved.program =
-            compiler_known_io::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_stream::resolved_facts_use_streams(&resolution.resolved.facts) {
-        resolution.resolved.program = compiler_known_stream::augment_program_for(
-            &resolution.resolved.program,
-            &resolution.resolved.facts,
-        );
-    }
-    if compiler_known_time::resolved_facts_use_time(&resolution.resolved.facts) {
-        resolution.resolved.program =
-            compiler_known_time::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_concurrency::resolved_facts_use_concurrency(&resolution.resolved.facts) {
-        resolution.resolved.program =
-            compiler_known_concurrency::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_term::resolved_facts_use_term(&resolution.resolved.facts) {
-        resolution.resolved.program =
-            compiler_known_term::augment_program(&resolution.resolved.program);
-    }
-    if compiler_known_test::resolved_facts_use_assertion_surface(&resolution.resolved.facts) {
-        resolution.resolved.program =
-            compiler_known_test::augment_program(&resolution.resolved.program);
-    }
+    resolution.resolved.program = augment_compiler_known(
+        &resolution.resolved.program,
+        &resolution.resolved.facts,
+        compiler_known_io::source_uses_io_intrinsics(&source)?,
+        compiler_known_text::source_uses_graphemes(&source),
+    );
     let (evaluation, _) =
         const_eval::evaluate_program_with_diagnostics(&resolution.resolved.program);
     let elaboration = testing::elaborate_source(
@@ -203,7 +207,9 @@ pub fn analyze_source_for_ide_with_source_context(
     );
     resolution.resolved.program = elaboration.program;
     resolution.diagnostics.extend(elaboration.diagnostics);
-    let resolution_succeeded = resolution.diagnostics.is_empty();
+    // Only an error stops a file's analysis; warnings from resolution and
+    // elaboration are reported with the semantic findings.
+    let resolution_succeeded = !diagnostics::has_errors(&resolution.diagnostics);
     let mut analysis = if resolution_succeeded {
         let mut source_texts = std::collections::HashMap::from([(source.id, source.text.as_str())]);
         let mut contexts = std::collections::HashMap::from([(source.id, context.clone())]);
@@ -222,6 +228,7 @@ pub fn analyze_source_for_ide_with_source_context(
             resolution.resolved.facts.clone(),
             elaboration.facts,
         )
+        .with_leading_diagnostics(std::mem::take(&mut resolution.diagnostics))
     } else {
         semantics::SemanticAnalysis {
             info: semantics::SemanticInfo::default(),
@@ -247,7 +254,8 @@ pub fn compile_source_to_php(
 ) -> DiagnosticResult<String> {
     match compile_source(path, text, BackendTarget::Php)? {
         backend::BackendOutput::Text { contents, .. }
-        | backend::BackendOutput::TextWithRuntime { contents, .. } => Ok(contents),
+        | backend::BackendOutput::TextWithRuntime { contents, .. }
+        | backend::BackendOutput::TextWithCompanion { contents, .. } => Ok(contents),
         _ => Err(vec![Diagnostic::new(
             "B0002",
             "PHP backend did not return text output",
@@ -279,14 +287,89 @@ pub fn lower_source(
     lower_source_file_with_context(source, context)
 }
 
+/// The fingerprint a metadata document records for one source.
+pub fn source_fingerprint(path: &str, text: &str) -> String {
+    runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes())
+}
+
+/// An attribute metadata schema version a consumer asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataSchema {
+    V1,
+    V2,
+    V3,
+}
+
+/// An attribute metadata document in the schema a consumer asked for.
+#[derive(Debug, Clone)]
+pub enum MetadataDocument {
+    V1(attributes::AttributeMetadataDocumentV1),
+    V2(attributes::AttributeMetadataDocumentV2),
+    V3(attributes::AttributeMetadataDocumentV3),
+}
+
+impl serde::Serialize for MetadataDocument {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::V1(document) => document.serialize(serializer),
+            Self::V2(document) => document.serialize(serializer),
+            Self::V3(document) => document.serialize(serializer),
+        }
+    }
+}
+
+fn metadata_document_for(
+    hir: &hir::Program,
+    fingerprint: String,
+    schema: MetadataSchema,
+) -> MetadataDocument {
+    match schema {
+        MetadataSchema::V1 => MetadataDocument::V1(attributes::metadata_document(hir, fingerprint)),
+        MetadataSchema::V2 => {
+            MetadataDocument::V2(attributes::metadata_document_v2(hir, fingerprint))
+        }
+        MetadataSchema::V3 => {
+            MetadataDocument::V3(attributes::metadata_document_v3(hir, fingerprint))
+        }
+    }
+}
+
+/// The metadata document of one source file in `schema`, with the warnings
+/// checking reported. Warnings never fail it; only errors do.
+pub fn metadata_source_with_warnings(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    schema: MetadataSchema,
+) -> DiagnosticResult<(MetadataDocument, Vec<Diagnostic>)> {
+    let path = path.into();
+    let text = text.into();
+    let fingerprint = source_fingerprint(&path, &text);
+    let hir = lower_source(path, text)?;
+    let warnings = hir.semantic_info.warnings.clone();
+    Ok((metadata_document_for(&hir, fingerprint, schema), warnings))
+}
+
+/// The metadata document of a compilation graph in `schema`, with the
+/// warnings checking reported. Warnings never fail it; only errors do.
+pub fn metadata_compilation_graph_with_warnings(
+    graph: &compilation_graph::CompilationGraph,
+    schema: MetadataSchema,
+) -> DiagnosticResult<(MetadataDocument, Vec<Diagnostic>)> {
+    let hir = lower_compilation_graph(graph)?;
+    let warnings = hir.semantic_info.warnings.clone();
+    Ok((
+        metadata_document_for(&hir, graph.fingerprint.clone(), schema),
+        warnings,
+    ))
+}
+
 pub fn metadata_source(
     path: impl Into<String>,
     text: impl Into<String>,
 ) -> DiagnosticResult<attributes::AttributeMetadataDocumentV1> {
     let path = path.into();
     let text = text.into();
-    let fingerprint =
-        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let fingerprint = source_fingerprint(&path, &text);
     let hir = lower_source(path, text)?;
     Ok(attributes::metadata_document(&hir, fingerprint))
 }
@@ -297,8 +380,7 @@ pub fn metadata_source_v2(
 ) -> DiagnosticResult<attributes::AttributeMetadataDocumentV2> {
     let path = path.into();
     let text = text.into();
-    let fingerprint =
-        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let fingerprint = source_fingerprint(&path, &text);
     let hir = lower_source(path, text)?;
     Ok(attributes::metadata_document_v2(&hir, fingerprint))
 }
@@ -309,8 +391,7 @@ pub fn metadata_source_v3(
 ) -> DiagnosticResult<attributes::AttributeMetadataDocumentV3> {
     let path = path.into();
     let text = text.into();
-    let fingerprint =
-        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let fingerprint = source_fingerprint(&path, &text);
     let hir = lower_source(path, text)?;
     Ok(attributes::metadata_document_v3(&hir, fingerprint))
 }
@@ -359,6 +440,8 @@ pub(crate) fn complete_standalone_hir(
     compiler_known_time::append_hir_source(&mut hir);
     compiler_known_concurrency::append_hir_source(&mut hir);
     compiler_known_term::append_hir_source(&mut hir);
+    compiler_known_text::append_hir_source(&mut hir);
+    compiler_known_ffi::append_hir_source(&mut hir);
     hir.source_path = source.path;
     hir.source_text = source.text;
     hir
@@ -368,8 +451,33 @@ pub fn lower_source_to_mir(
     path: impl Into<String>,
     text: impl Into<String>,
 ) -> DiagnosticResult<mir::Program> {
-    let hir = lower_source(path, text)?;
-    let mir = mir_lowering::lower_program(&hir)?;
+    lower_hir_to_mir(&lower_source(path, text)?)
+}
+
+/// Lowers one source without an entry point to validated MIR as a library
+/// (Decision 0148 section 17): each declaration with a body is a root and is
+/// emitted, and the program has no process entry. A source that declares
+/// `main` is a program; `lower_source_to_mir` lowers it.
+pub fn lower_library_source_to_mir(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<mir::Program> {
+    let mut hir = lower_source(path, text)?;
+    if !hir.semantic_info.reachable.is_library() {
+        return Err(vec![Diagnostic::new(
+            "I2401",
+            "a library source declares no `main` entry point",
+            Span::default(),
+        )]);
+    }
+    hir.selected_target.kind = build_plan::TargetKind::Library;
+    hir.selected_target.entry_source = None;
+    lower_hir_to_mir(&hir)
+}
+
+/// Lowers checked HIR to validated MIR.
+pub fn lower_hir_to_mir(hir: &hir::Program) -> DiagnosticResult<mir::Program> {
+    let mir = mir_lowering::lower_program(hir)?;
     mir_validation::validate_program(&mir).map_err(|error| {
         error.diagnostics.unwrap_or_else(|| {
             vec![Diagnostic::new("B0001", error.message, Span::default())
@@ -408,8 +516,19 @@ pub fn compile_source_with_options(
     text: impl Into<String>,
     options: CompileOptions,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
+    compile_source_with_warnings(path, text, options).map(|(output, _)| output)
+}
+
+/// Compiles one source. A program with warnings and no errors compiles; its
+/// warnings come back beside the output for the caller to report.
+pub fn compile_source_with_warnings(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    options: CompileOptions,
+) -> Result<(backend::BackendOutput, Vec<Diagnostic>), Vec<Diagnostic>> {
     let hir = lower_source(path, text)?;
-    backend::emit_with_options(&hir, options).map_err(|error| {
+    let warnings = hir.semantic_info.warnings.clone();
+    let output = backend::emit_with_options(&hir, options).map_err(|error| {
         error.diagnostics.unwrap_or_else(|| {
             let summary = error
                 .message
@@ -425,7 +544,8 @@ pub fn compile_source_with_options(
                     ),
             ]
         })
-    })
+    })?;
+    Ok((output, warnings))
 }
 
 pub fn compile_source_with_context(
@@ -482,11 +602,10 @@ pub fn lower_compilation_graph(
     graph: &compilation_graph::CompilationGraph,
 ) -> DiagnosticResult<hir::Program> {
     let analysis = compilation_graph::analyze_compilation_graph_for_ide(graph);
-    if !analysis.diagnostics.is_empty() {
-        return Err(analysis.diagnostics);
-    }
+    let mut semantic_info = analysis.semantic_info;
+    semantic_info.warnings = diagnostics::separate_errors(analysis.diagnostics)?;
     let mut hir =
-        lowering::lower_program_with_semantics(&analysis.resolved_program, analysis.semantic_info)?;
+        lowering::lower_program_with_semantics(&analysis.resolved_program, semantic_info)?;
     hir.sources = graph
         .sources
         .values()
@@ -547,6 +666,8 @@ pub fn lower_compilation_graph(
     compiler_known_time::append_hir_source(&mut hir);
     compiler_known_concurrency::append_hir_source(&mut hir);
     compiler_known_term::append_hir_source(&mut hir);
+    compiler_known_text::append_hir_source(&mut hir);
+    compiler_known_ffi::append_hir_source(&mut hir);
     Ok(hir)
 }
 
@@ -595,15 +716,7 @@ pub fn lower_build_plan_file(path: impl AsRef<Path>) -> DiagnosticResult<hir::Pr
 pub fn lower_compilation_graph_to_mir(
     graph: &compilation_graph::CompilationGraph,
 ) -> DiagnosticResult<mir::Program> {
-    let hir = lower_compilation_graph(graph)?;
-    let mir = mir_lowering::lower_program(&hir)?;
-    mir_validation::validate_program(&mir).map_err(|error| {
-        error.diagnostics.unwrap_or_else(|| {
-            vec![Diagnostic::new("B0001", error.message, Span::default())
-                .with_title("Malformed MIR")]
-        })
-    })?;
-    Ok(mir)
+    lower_hir_to_mir(&lower_compilation_graph(graph)?)
 }
 
 pub fn lower_build_plan_file_to_mir(path: impl AsRef<Path>) -> DiagnosticResult<mir::Program> {
@@ -614,13 +727,23 @@ pub fn lower_build_plan_file_to_mir(path: impl AsRef<Path>) -> DiagnosticResult<
 pub fn compile_compilation_graph(
     graph: &compilation_graph::CompilationGraph,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
+    compile_compilation_graph_with_warnings(graph).map(|(output, _)| output)
+}
+
+/// Compiles a graph. A graph with warnings and no errors compiles; its
+/// warnings come back beside the output for the caller to report.
+pub fn compile_compilation_graph_with_warnings(
+    graph: &compilation_graph::CompilationGraph,
+) -> Result<(backend::BackendOutput, Vec<Diagnostic>), Vec<Diagnostic>> {
     let options = compilation_graph_options(graph)?;
     let hir = lower_compilation_graph(graph)?;
-    backend::emit_with_options(&hir, options).map_err(|error| {
+    let warnings = hir.semantic_info.warnings.clone();
+    let output = backend::emit_with_options(&hir, options).map_err(|error| {
         error
             .diagnostics
             .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
-    })
+    })?;
+    Ok((output, warnings))
 }
 
 pub(crate) fn compilation_graph_options(
@@ -647,7 +770,10 @@ pub(crate) fn compilation_graph_options(
             unreachable!("validated native plan has a profile")
         }
     };
-    Ok(options)
+    Ok(CompileOptions {
+        linking: compilation_graph::native_linking(graph),
+        ..options
+    })
 }
 
 pub fn compile_build_plan_file(
@@ -660,10 +786,10 @@ pub fn compile_build_plan_file(
 fn check_source_file_with_context(
     source: &SourceFile,
     context: CompilationContext,
-) -> DiagnosticResult<Program> {
+) -> DiagnosticResult<(Program, Vec<Diagnostic>)> {
     let prepared = prepare_source(source, context)?;
-    analyze_prepared_source(&prepared, source)?;
-    Ok(prepared.authored)
+    let info = analyze_prepared_source(&prepared, source)?;
+    Ok((prepared.authored, info.warnings))
 }
 
 pub(crate) fn analyze_prepared_source(
@@ -687,11 +813,11 @@ pub(crate) fn analyze_prepared_source(
         prepared.global_symbols.clone(),
         prepared.test_semantics.clone(),
     );
-    if analysis.diagnostics.is_empty() {
-        Ok(analysis.info)
-    } else {
-        Err(analysis.diagnostics)
-    }
+    let mut findings = prepared.warnings.clone();
+    findings.extend(analysis.diagnostics);
+    let mut info = analysis.info;
+    info.warnings = diagnostics::separate_errors(findings)?;
+    Ok(info)
 }
 
 fn append_compiler_known_semantic_context(
@@ -710,6 +836,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_concurrency::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -722,6 +849,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_term::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -734,6 +862,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_time::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -746,6 +875,33 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_stream::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
+        },
+    );
+    source_texts.insert(
+        compiler_known_text::SOURCE_ID,
+        compiler_known_text::SOURCE_TEXT,
+    );
+    source_texts.insert(
+        compiler_known_ffi::SOURCE_ID,
+        compiler_known_ffi::source_text(),
+    );
+    contexts.insert(
+        compiler_known_ffi::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_ffi::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
+        },
+    );
+    contexts.insert(
+        compiler_known_text::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_text::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     source_texts.insert(
@@ -758,6 +914,7 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_contracts::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     if !ast_uses_compiler_known_source(program) {
@@ -770,8 +927,57 @@ fn append_compiler_known_semantic_context(
             edition: context.edition,
             package: names::PackageIdentity::CompilerKnown,
             source: names::SourceIdentity(compiler_known_io::SYNTHETIC_SOURCE_IDENTITY.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
+}
+
+/// Adds the compiler-known declarations a resolved program needs, in one
+/// order, for every compilation path. `authored_uses_io` reports I/O
+/// intrinsics and structural callables in the authored text;
+/// `reads_graphemes` reports `->graphemes` in it.
+///
+/// The I/O identities are decided once more after the other modules are
+/// added, over the program as the compiler will check it: a compiler-known
+/// module can bring interface slots that no authored name shows, such as the
+/// `Iterable<string>` behind `$text->graphemes`.
+pub(crate) fn augment_compiler_known(
+    program: &Program,
+    facts: &GlobalSymbolFacts,
+    authored_uses_io: bool,
+    reads_graphemes: bool,
+) -> Program {
+    let mut program = program.clone();
+    let has_io =
+        authored_uses_io || compiler_known_io::resolved_program_uses_canonical_io(facts, &program);
+    if has_io {
+        program = compiler_known_io::augment_program(&program);
+    }
+    if compiler_known_stream::resolved_facts_use_streams(facts) {
+        program = compiler_known_stream::augment_program_for(&program, facts);
+    }
+    if compiler_known_time::resolved_facts_use_time(facts) {
+        program = compiler_known_time::augment_program(&program);
+    }
+    if compiler_known_concurrency::resolved_facts_use_concurrency(facts) {
+        program = compiler_known_concurrency::augment_program(&program);
+    }
+    if compiler_known_term::resolved_facts_use_term(facts) {
+        program = compiler_known_term::augment_program(&program);
+    }
+    if compiler_known_ffi::resolved_facts_use_ffi(facts) {
+        program = compiler_known_ffi::augment_program(&program);
+    }
+    if reads_graphemes {
+        program = compiler_known_text::augment_program(&program);
+    }
+    if compiler_known_test::resolved_facts_use_assertion_surface(facts) {
+        program = compiler_known_test::augment_program(&program);
+    }
+    if !has_io && compiler_known_io::program_uses_interface_slots(&program) {
+        program = compiler_known_io::augment_program(&program);
+    }
+    program
 }
 
 fn ast_uses_compiler_known_source(program: &ast::Program) -> bool {
@@ -783,6 +989,8 @@ fn ast_uses_compiler_known_source(program: &ast::Program) -> bool {
         ast::Item::Trait(value) => value.span.source == synthetic,
         ast::Item::Function(value) => value.span.source == synthetic,
         ast::Item::Constant(value) => value.span.source == synthetic,
+        ast::Item::ExternBlock(value) => value.span.source == synthetic,
+        ast::Item::ForeignAggregate(value) => value.span.source == synthetic,
         ast::Item::Statement(_) => false,
     })
 }
@@ -800,33 +1008,18 @@ pub(crate) fn prepare_parsed_source(
     context: CompilationContext,
     authored: Program,
 ) -> DiagnosticResult<PreparedSource> {
+    let authored = read_call_candidates(source, authored, &context, None)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
-    let mut resolved = names::resolve_program(&authored, &context)?;
-    let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(source)?
-        || compiler_known_io::resolved_program_uses_canonical_io(
-            &resolved.facts,
-            &resolved.program,
-        );
-    if uses_compiler_known_io {
-        resolved.program = compiler_known_io::augment_program(&resolved.program);
-    }
-    if compiler_known_stream::resolved_facts_use_streams(&resolved.facts) {
-        resolved.program =
-            compiler_known_stream::augment_program_for(&resolved.program, &resolved.facts);
-    }
-    if compiler_known_time::resolved_facts_use_time(&resolved.facts) {
-        resolved.program = compiler_known_time::augment_program(&resolved.program);
-    }
-    if compiler_known_concurrency::resolved_facts_use_concurrency(&resolved.facts) {
-        resolved.program = compiler_known_concurrency::augment_program(&resolved.program);
-    }
-    if compiler_known_term::resolved_facts_use_term(&resolved.facts) {
-        resolved.program = compiler_known_term::augment_program(&resolved.program);
-    }
-    if compiler_known_test::resolved_facts_use_assertion_surface(&resolved.facts) {
-        resolved.program = compiler_known_test::augment_program(&resolved.program);
-    }
+    let resolution = names::resolve_program_for_ide(&authored, &context);
+    let mut warnings = diagnostics::separate_errors(resolution.diagnostics)?;
+    let mut resolved = resolution.resolved;
+    resolved.program = augment_compiler_known(
+        &resolved.program,
+        &resolved.facts,
+        compiler_known_io::source_uses_io_intrinsics(source)?,
+        compiler_known_text::source_uses_graphemes(source),
+    );
     let source_context = testing::SourceSemanticContext::standalone(context.clone());
     let (evaluation, _) = const_eval::evaluate_program_with_diagnostics(&resolved.program);
     let elaboration = testing::elaborate_source(
@@ -835,9 +1028,9 @@ pub(crate) fn prepare_parsed_source(
         &source_context,
         &evaluation,
     );
-    if !elaboration.diagnostics.is_empty() {
-        return Err(elaboration.diagnostics);
-    }
+    let mut findings = std::mem::take(&mut warnings);
+    findings.extend(elaboration.diagnostics);
+    let warnings = diagnostics::separate_errors(findings)?;
     Ok(PreparedSource {
         authored,
         resolved: elaboration.program,
@@ -845,12 +1038,64 @@ pub(crate) fn prepare_parsed_source(
         global_symbols: resolved.facts,
         source_semantic_contexts: std::collections::HashMap::from([(source.id, source_context)]),
         test_semantics: elaboration.facts,
+        warnings,
     })
 }
 
+/// Parses `source`, reading each `callee<A, B>(...)` whose type arguments
+/// are all plain names as type arguments. When that leaves the source
+/// unparsed, it is read again with those calls as comparisons, the meaning
+/// they had before type arguments at a call existed (Decision 0105,
+/// Amendment: Type Arguments At The Call); [`read_call_candidates`] then
+/// applies name resolution's choice.
 pub fn parse_source_file(source: &SourceFile) -> DiagnosticResult<Program> {
-    let tokens = lexer::Lexer::new(source).lex()?;
-    parser::Parser::new(tokens).parse_program()
+    let (parsed, candidates) =
+        parse_source_file_with_call_readings(source, std::collections::HashMap::new())?;
+    match parsed {
+        Ok(program) => Ok(program),
+        Err(diagnostics) if candidates.is_empty() => Err(diagnostics),
+        Err(diagnostics) => {
+            let comparisons = candidates
+                .iter()
+                .map(|candidate| (candidate.open_span, ast::CallReading::Comparison))
+                .collect();
+            parse_source_file_with_call_readings(source, comparisons)?
+                .0
+                .map_err(|_| diagnostics)
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_source_file_with_call_readings(
+    source: &SourceFile,
+    readings: std::collections::HashMap<source::Span, ast::CallReading>,
+) -> DiagnosticResult<(DiagnosticResult<Program>, Vec<ast::CallCandidate>)> {
+    let (tokens, comments) = lexer::Lexer::new(source).lex_with_comments();
+    Ok(parser::Parser::new(tokens?)
+        .with_documentation(parser::documentation_comments(source, &comments))
+        .with_call_readings(readings)
+        .parse_program_with_candidates())
+}
+
+/// `program` with each call candidate read as name resolution reads it: the
+/// same tree when it already does, and otherwise `source` parsed again with
+/// those readings. Two parses at most, whatever the candidates' nesting.
+pub(crate) fn read_call_candidates(
+    source: &SourceFile,
+    program: Program,
+    context: &CompilationContext,
+    environment: Option<&names::NameResolutionEnvironment>,
+) -> DiagnosticResult<Program> {
+    let readings = names::call_readings(&program, context, environment);
+    if program
+        .call_candidates
+        .iter()
+        .all(|candidate| readings.get(&candidate.open_span) == Some(&candidate.read_as))
+    {
+        return Ok(program);
+    }
+    parse_source_file_with_call_readings(source, readings)?.0
 }
 
 pub fn render_diagnostics(
@@ -882,4 +1127,76 @@ pub fn render_diagnostics_with_options(
 ) -> String {
     let source = SourceFile::new(path, text);
     diagnostics::render_diagnostics(&source, diagnostics, options)
+}
+
+#[cfg(test)]
+mod warning_flow_tests {
+    use super::*;
+
+    const WARNING_ONLY: &str = r#"function main(): void
+{
+    let $value = 1;
+    let $unused = fn() with ($value) => 1;
+}
+"#;
+
+    /// Warnings from resolution and elaboration travel in `PreparedSource`
+    /// to the checked result; they never fail it.
+    #[test]
+    fn preparation_warnings_reach_the_checked_result() {
+        let source = SourceFile::new("main.doria", "function main(): void {}");
+        let context = CompilationContext::standalone(source.path.clone());
+        let mut prepared = prepare_source(&source, context).expect("the program prepares");
+        assert!(prepared.warnings.is_empty());
+        prepared.warnings.push(
+            Diagnostic::new("E0646", "an earlier phase warned", Span::default())
+                .with_severity(diagnostics::DiagnosticSeverity::Warning),
+        );
+        let info = analyze_prepared_source(&prepared, &source)
+            .expect("a warning from preparation does not fail checking");
+        assert_eq!(
+            info.warnings
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>(),
+            ["an earlier phase warned"]
+        );
+    }
+
+    /// Editor analysis keeps semantic facts for a file whose findings are
+    /// only warnings, and reports the warnings.
+    #[test]
+    fn editor_analysis_keeps_semantic_facts_beside_warnings() {
+        let (_, analysis) =
+            analyze_source_for_ide("main.doria", WARNING_ONLY).expect("the file parses");
+        assert_eq!(
+            analysis
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["E0646"]
+        );
+        assert!(!analysis.info.global_symbols.declarations.is_empty());
+        assert!(!analysis.info.expression_types.is_empty());
+    }
+
+    #[test]
+    fn earlier_findings_lead_an_analysis() {
+        let later = Diagnostic::new("E0646", "later", Span::default());
+        let earlier = Diagnostic::new("E0646", "earlier", Span::default());
+        let analysis = semantics::SemanticAnalysis {
+            info: semantics::SemanticInfo::default(),
+            diagnostics: vec![later],
+        }
+        .with_leading_diagnostics(vec![earlier]);
+        assert_eq!(
+            analysis
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["earlier", "later"]
+        );
+    }
 }

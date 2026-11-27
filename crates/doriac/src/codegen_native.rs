@@ -13,6 +13,7 @@ use std::os::windows::process::CommandExt;
 use std::process::Output;
 
 use crate::backend::{BackendError, NativeProfile};
+use crate::native_link::{LinkPlan, NativeLinking, WindowsSubsystem};
 use crate::{codegen_cranelift, mir, runtime_artifact};
 
 #[derive(Debug, Clone)]
@@ -30,26 +31,62 @@ pub struct NativePerformance {
     pub optimization: crate::mir_validation::OptimizationMetrics,
 }
 
+/// A linked executable and the runtime files its foreign libraries load,
+/// which are placed beside it (Decision 0148 section 19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedExecutable {
+    pub bytes: Vec<u8>,
+    pub runtime_files: Vec<PathBuf>,
+}
+
+/// The executable of a program that links no native library.
 pub fn generate_executable(
     program: &mir::Program,
     profile: NativeProfile,
 ) -> Result<Vec<u8>, BackendError> {
+    generate_linked_executable(program, profile, &NativeLinking::default())
+        .map(|executable| executable.bytes)
+}
+
+/// The executable of `program`, linking the native libraries its foreign
+/// calls name from `linking` (Decision 0148 section 18).
+pub fn generate_linked_executable(
+    program: &mir::Program,
+    profile: NativeProfile,
+    linking: &NativeLinking,
+) -> Result<LinkedExecutable, BackendError> {
+    let plan = link_plan(program, linking)?;
     let object_bytes = match profile {
         NativeProfile::Fast => codegen_cranelift::lower_mir_to_object(program)?,
         NativeProfile::Release => lower_release_object(program)?,
     };
-    let runtime = runtime_artifact::locate(profile)?;
+    let hosting = runtime_artifact::RuntimeHosting::for_program(program);
+    let runtime = runtime_artifact::locate(profile, hosting)?;
     let runtime_path = runtime.path;
-    link_object(&object_bytes, &runtime_path)
+    let (bytes, _, _) = link_object_with_metadata(&object_bytes, &runtime_path, hosting, &plan)?;
+    Ok(LinkedExecutable {
+        bytes,
+        runtime_files: plan.runtime_files,
+    })
+}
+
+/// The link plan of `program` for the host target, which native code
+/// generation targets.
+fn link_plan(program: &mir::Program, linking: &NativeLinking) -> Result<LinkPlan, BackendError> {
+    linking
+        .resolve(program, crate::c_layout::CTarget::host())
+        .map_err(BackendError::from_diagnostics)
 }
 
 pub(crate) fn generate_executable_with_performance(
     program: &mir::Program,
     profile: NativeProfile,
-) -> Result<(Vec<u8>, NativePerformance), BackendError> {
+    linking: &NativeLinking,
+) -> Result<(LinkedExecutable, NativePerformance), BackendError> {
     let started = Instant::now();
     crate::mir_validation::validate_program(program)?;
     let mir_validation = started.elapsed();
+    let plan = link_plan(program, linking)?;
 
     let started = Instant::now();
     let mut optimization = crate::mir_validation::OptimizationMetrics::default();
@@ -73,16 +110,20 @@ pub(crate) fn generate_executable_with_performance(
         .sum();
 
     let started = Instant::now();
-    let runtime = runtime_artifact::locate(profile)?;
+    let hosting = runtime_artifact::RuntimeHosting::for_program(program);
+    let runtime = runtime_artifact::locate(profile, hosting)?;
     let runtime_path = runtime.path.clone();
     let runtime_selection = started.elapsed();
 
     let started = Instant::now();
-    let (executable, linker, link_command) =
-        link_object_with_metadata(&object_bytes, &runtime_path)?;
+    let (bytes, linker, link_command) =
+        link_object_with_metadata(&object_bytes, &runtime_path, hosting, &plan)?;
     let linking = started.elapsed();
     Ok((
-        executable,
+        LinkedExecutable {
+            bytes,
+            runtime_files: plan.runtime_files,
+        },
         NativePerformance {
             mir_validation,
             code_generation,
@@ -129,13 +170,11 @@ fn lower_release_object(_program: &mir::Program) -> Result<Vec<u8>, BackendError
     ))
 }
 
-fn link_object(object_bytes: &[u8], runtime_path: &Path) -> Result<Vec<u8>, BackendError> {
-    link_object_with_metadata(object_bytes, runtime_path).map(|(bytes, _, _)| bytes)
-}
-
 fn link_object_with_metadata(
     object_bytes: &[u8],
     runtime_path: &Path,
+    hosting: runtime_artifact::RuntimeHosting,
+    plan: &LinkPlan,
 ) -> Result<(Vec<u8>, String, Vec<String>), BackendError> {
     let temp_stem = unique_temp_stem();
     let object_path = temp_stem.with_extension(object_extension());
@@ -144,13 +183,14 @@ fn link_object_with_metadata(
     fs::write(&object_path, object_bytes)
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
 
-    let (linker, arguments) = match invoke_linker(&object_path, runtime_path, &executable_path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            cleanup_temp_artifacts(&object_path, &executable_path);
-            return Err(error);
-        }
-    };
+    let (linker, arguments) =
+        match invoke_linker(&object_path, runtime_path, &executable_path, hosting, plan) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                cleanup_temp_artifacts(&object_path, &executable_path);
+                return Err(error);
+            }
+        };
     let executable_bytes = match fs::read(&executable_path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -172,6 +212,8 @@ fn invoke_linker(
     object_path: &Path,
     runtime_path: &Path,
     executable_path: &Path,
+    hosting: runtime_artifact::RuntimeHosting,
+    plan: &LinkPlan,
 ) -> Result<(String, Vec<String>), BackendError> {
     // Cranelift emits a host object from MIR, then the host toolchain links it.
     // Doria does not generate C source or use C semantics as an oracle.
@@ -183,10 +225,26 @@ fn invoke_linker(
         cc_is_set,
         cfg!(windows),
         msvc_host,
-        object_path,
-        runtime_path,
-        executable_path,
+        LinkInputs {
+            object: object_path,
+            runtime: runtime_path,
+            executable: executable_path,
+            hosting,
+            foreign: plan,
+        },
     );
+    run_linker(linker, arguments, cc_is_set, msvc_host)
+}
+
+/// Runs `linker` with `arguments`, finding the Visual Studio environment
+/// when the MSVC driver is not on the path.
+#[cfg_attr(not(windows), allow(unused_variables))]
+fn run_linker(
+    linker: String,
+    arguments: Vec<OsString>,
+    cc_is_set: bool,
+    msvc_host: bool,
+) -> Result<(String, Vec<String>), BackendError> {
     let mut command = Command::new(&linker);
     command.args(&arguments);
 
@@ -469,16 +527,75 @@ fn default_linker(msvc_host: bool) -> &'static str {
     }
 }
 
+/// What one executable link combines: the generated object, the selected
+/// runtime archive and the C runtime it is hosted by, the foreign link
+/// inputs, and the output.
+#[derive(Debug, Clone, Copy)]
+struct LinkInputs<'a> {
+    object: &'a Path,
+    runtime: &'a Path,
+    executable: &'a Path,
+    hosting: runtime_artifact::RuntimeHosting,
+    foreign: &'a LinkPlan,
+}
+
 fn linker_arguments(
     linker: &str,
     cc_is_set: bool,
     windows: bool,
     msvc_host: bool,
-    object_path: &Path,
-    runtime_path: &Path,
-    executable_path: &Path,
+    inputs: LinkInputs<'_>,
 ) -> Vec<OsString> {
-    if windows && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(linker)) {
+    let LinkInputs {
+        object: object_path,
+        runtime: runtime_path,
+        executable: executable_path,
+        hosting,
+        foreign,
+    } = inputs;
+    let subsystem = match foreign.windows_subsystem {
+        WindowsSubsystem::Console => "/SUBSYSTEM:CONSOLE",
+        WindowsSubsystem::Gui => "/SUBSYSTEM:WINDOWS",
+    };
+    let msvc_driver =
+        windows && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(linker));
+    if msvc_driver && hosting == runtime_artifact::RuntimeHosting::CrtHosted {
+        // A program with foreign code links the C runtime and enters
+        // through its startup, which calls `main` and leaves through the
+        // CRT's exit (Decision 0148 section 20): the Universal CRT
+        // dynamically (`ucrt.lib` in place of the static `libucrt.lib` that
+        // `libcmt.lib` names), so clean machines need no redistributable,
+        // and the startup code and vcruntime statically. The runtime archive
+        // is the CRT-hosted one, which defines none of the CRT's symbols.
+        let mut arguments = vec![
+            OsString::from("/nologo"),
+            object_path.as_os_str().to_os_string(),
+            runtime_path.as_os_str().to_os_string(),
+            OsString::from(format!("/Fe:{}", executable_path.display())),
+            OsString::from("/link"),
+            OsString::from(subsystem),
+        ];
+        // The GUI subsystem's default entry is `WinMainCRTStartup`, which
+        // calls `WinMain`; Doria's entry is `main` on either subsystem.
+        if foreign.windows_subsystem == WindowsSubsystem::Gui {
+            arguments.push(OsString::from("/ENTRY:mainCRTStartup"));
+        }
+        arguments.extend(
+            [
+                "libcmt.lib",
+                "libvcruntime.lib",
+                "ucrt.lib",
+                "/NODEFAULTLIB:libucrt.lib",
+                "kernel32.lib",
+                "shell32.lib",
+                "bcrypt.lib",
+            ]
+            .map(OsString::from),
+        );
+        arguments.extend(foreign.msvc_arguments());
+        return arguments;
+    }
+    if msvc_driver {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
         // Make Doria's process wrapper the executable entrypoint instead of
         // relying on CRT startup. On normal completion the wrapper calls
@@ -493,7 +610,7 @@ fn linker_arguments(
             OsString::from(format!("/Fe:{}", executable_path.display())),
             OsString::from("/link"),
             OsString::from("/ENTRY:main"),
-            OsString::from("/SUBSYSTEM:CONSOLE"),
+            OsString::from(subsystem),
             OsString::from("kernel32.lib"),
             // `doria_rt.lib` is a staticlib, so it carries archived objects
             // without the crate metadata that records a `#[link]` dependency.
@@ -510,11 +627,184 @@ fn linker_arguments(
         OsString::from("-o"),
         executable_path.as_os_str().to_os_string(),
     ];
+    arguments.extend(foreign.driver_arguments(crate::c_layout::CTarget::host()));
     if windows {
         arguments.push(OsString::from("-lshell32"));
         arguments.push(OsString::from("-lbcrypt"));
     }
     arguments
+}
+
+/// The file extension of a platform shared library.
+pub(crate) fn shared_library_extension() -> &'static str {
+    if cfg!(windows) {
+        "dll"
+    } else if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    }
+}
+
+/// Links `object_bytes` into a platform shared library (Decision 0148
+/// section 23's native shared-library artifact): its exported entries, the
+/// foreign link inputs of `plan`, and a dynamic dependency on the hosted
+/// shared runtime `runtime`, which the library finds at `runtime_directory`
+/// relative to itself. The library names itself `file_name`, the name it is
+/// published under, never the temporary path it links at. Returns the
+/// library's bytes.
+pub(crate) fn link_shared_library(
+    object_bytes: &[u8],
+    runtime: &Path,
+    runtime_directory: &Path,
+    file_name: &str,
+    plan: &LinkPlan,
+) -> Result<Vec<u8>, BackendError> {
+    let temp_stem = unique_temp_stem();
+    let object_path = temp_stem.with_extension(object_extension());
+    let library_path = temp_stem.with_extension(shared_library_extension());
+    let import_path = temp_stem.with_extension("runtime.lib");
+    let definition_path = temp_stem.with_extension("def");
+    let cleanup = || {
+        for path in [&object_path, &library_path, &import_path, &definition_path] {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_file(library_path.with_extension("lib"));
+        let _ = fs::remove_file(library_path.with_extension("exp"));
+    };
+    fs::write(&object_path, object_bytes)
+        .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
+    let result = (|| {
+        let cc_is_set = env::var_os("CC").is_some();
+        let msvc_host = cfg!(all(windows, target_env = "msvc"));
+        let linker = env::var("CC").unwrap_or_else(|_| default_linker(msvc_host).to_string());
+        let msvc_driver =
+            cfg!(windows) && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(&linker));
+        let runtime_folder = runtime.parent().unwrap_or(Path::new("."));
+        let mut arguments = Vec::new();
+        if msvc_driver {
+            // MSVC links a DLL against an import library; the runtime ships
+            // only its DLL, so one is made from the symbols the object
+            // imports from it.
+            write_runtime_import_library(object_bytes, runtime, &definition_path, &import_path)?;
+            arguments.extend([
+                OsString::from("/nologo"),
+                OsString::from("/LD"),
+                object_path.as_os_str().to_os_string(),
+                OsString::from(format!("/Fe:{}", library_path.display())),
+                OsString::from("/link"),
+                import_path.as_os_str().to_os_string(),
+            ]);
+            arguments.extend(
+                [
+                    "libcmt.lib",
+                    "libvcruntime.lib",
+                    "ucrt.lib",
+                    "/NODEFAULTLIB:libucrt.lib",
+                    "kernel32.lib",
+                ]
+                .map(OsString::from),
+            );
+            arguments.extend(plan.msvc_arguments());
+        } else {
+            let target = crate::c_layout::CTarget::host();
+            arguments.push(object_path.as_os_str().to_os_string());
+            arguments.push(OsString::from(if cfg!(target_os = "macos") {
+                "-dynamiclib"
+            } else {
+                "-shared"
+            }));
+            arguments.push(OsString::from("-o"));
+            arguments.push(library_path.as_os_str().to_os_string());
+            let mut search = OsString::from("-L");
+            search.push(runtime_folder);
+            arguments.push(search);
+            arguments.push(OsString::from("-ldoria_rt"));
+            let origin = if cfg!(target_os = "macos") {
+                "@loader_path"
+            } else {
+                "$ORIGIN"
+            };
+            if !cfg!(windows) {
+                arguments.push(OsString::from(format!(
+                    "-Wl,-rpath,{origin}/{}",
+                    runtime_directory.display()
+                )));
+                arguments.push(OsString::from(if cfg!(target_os = "macos") {
+                    format!("-Wl,-install_name,@rpath/{file_name}")
+                } else {
+                    format!("-Wl,-soname,{file_name}")
+                }));
+            }
+            arguments.extend(plan.driver_arguments(target));
+        }
+        run_linker(linker, arguments, cc_is_set, msvc_host)?;
+        fs::read(&library_path)
+            .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))
+    })();
+    cleanup();
+    result
+}
+
+/// Writes an import library for the shared runtime DLL `runtime` that
+/// names every runtime symbol `object_bytes` imports.
+fn write_runtime_import_library(
+    object_bytes: &[u8],
+    runtime: &Path,
+    definition: &Path,
+    import: &Path,
+) -> Result<(), BackendError> {
+    let name = runtime
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let text = runtime_import_definition(object_bytes, &name)?;
+    fs::write(definition, text)
+        .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
+    run_linker(
+        "lib.exe".to_string(),
+        vec![
+            OsString::from("/nologo"),
+            OsString::from(format!("/def:{}", definition.display())),
+            OsString::from(format!("/out:{}", import.display())),
+            OsString::from("/machine:x64"),
+        ],
+        false,
+        true,
+    )
+    .map(|_| ())
+}
+
+/// The module definition of the import library for the shared runtime DLL
+/// `name`: every runtime symbol the COFF object `object_bytes` imports.
+pub(crate) fn runtime_import_definition(
+    object_bytes: &[u8],
+    name: &str,
+) -> Result<String, BackendError> {
+    use cranelift_object::object::{Object, ObjectSymbol};
+    let object = cranelift_object::object::File::parse(object_bytes)
+        .map_err(|error| BackendError::new(format!("cannot read generated object: {error}")))?;
+    // A runtime function is named itself; runtime data is reached through
+    // its import slot (`native_abi::RuntimeDataAccess`), which the import
+    // library defines for an export marked DATA.
+    let slot = crate::native_abi::RuntimeDataAccess::ImportSlot.symbol("");
+    let mut symbols = object
+        .symbols()
+        .filter(|symbol| symbol.is_undefined())
+        .filter_map(|symbol| symbol.name().ok())
+        .filter_map(|name| match name.strip_prefix(slot.as_str()) {
+            Some(data) if data.starts_with("dr_") => Some(format!("{data} DATA")),
+            None if name.starts_with("dr_") => Some(name.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+    let mut text = format!("LIBRARY {name}\nEXPORTS\n");
+    for symbol in symbols {
+        text.push_str(&format!("    {symbol}\n"));
+    }
+    Ok(text)
 }
 
 fn is_msvc_style_compiler_driver(linker: &str) -> bool {
@@ -538,9 +828,13 @@ mod tests {
             false,
             true,
             true,
-            Path::new("main.obj"),
-            Path::new("doria_rt.lib"),
-            Path::new("main.exe"),
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::Freestanding,
+                foreign: &LinkPlan::default(),
+            },
         );
 
         assert_eq!(
@@ -561,15 +855,106 @@ mod tests {
     }
 
     #[test]
+    fn windows_programs_with_foreign_code_link_the_hybrid_c_runtime() {
+        let args = linker_arguments(
+            "cl.exe",
+            false,
+            true,
+            true,
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::CrtHosted,
+                foreign: &LinkPlan::default(),
+            },
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/nologo"),
+                OsString::from("main.obj"),
+                OsString::from("doria_rt.lib"),
+                OsString::from("/Fe:main.exe"),
+                OsString::from("/link"),
+                OsString::from("/SUBSYSTEM:CONSOLE"),
+                OsString::from("libcmt.lib"),
+                OsString::from("libvcruntime.lib"),
+                OsString::from("ucrt.lib"),
+                OsString::from("/NODEFAULTLIB:libucrt.lib"),
+                OsString::from("kernel32.lib"),
+                OsString::from("shell32.lib"),
+                OsString::from("bcrypt.lib"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_foreign_libraries_and_the_gui_subsystem_follow_the_c_runtime() {
+        let foreign = LinkPlan {
+            items: vec![
+                crate::native_link::LinkItem::SearchPath(PathBuf::from("native")),
+                crate::native_link::LinkItem::Library {
+                    name: "zlib".to_string(),
+                    mode: crate::native_link::LinkMode::Dynamic,
+                },
+            ],
+            runtime_files: Vec::new(),
+            windows_subsystem: WindowsSubsystem::Gui,
+        };
+        let args = linker_arguments(
+            "cl.exe",
+            false,
+            true,
+            true,
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::CrtHosted,
+                foreign: &foreign,
+            },
+        );
+
+        assert_eq!(
+            args,
+            [
+                "/nologo",
+                "main.obj",
+                "doria_rt.lib",
+                "/Fe:main.exe",
+                "/link",
+                "/SUBSYSTEM:WINDOWS",
+                "/ENTRY:mainCRTStartup",
+                "libcmt.lib",
+                "libvcruntime.lib",
+                "ucrt.lib",
+                "/NODEFAULTLIB:libucrt.lib",
+                "kernel32.lib",
+                "shell32.lib",
+                "bcrypt.lib",
+                "/LIBPATH:native",
+                "zlib.lib",
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
     fn windows_clang_cl_uses_msvc_compiler_driver_arguments() {
         let args = linker_arguments(
             "clang-cl.exe",
             true,
             true,
             true,
-            Path::new("main.obj"),
-            Path::new("doria_rt.lib"),
-            Path::new("main.exe"),
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::Freestanding,
+                foreign: &LinkPlan::default(),
+            },
         );
 
         assert_eq!(
@@ -596,9 +981,13 @@ mod tests {
             true,
             true,
             true,
-            Path::new("main.obj"),
-            Path::new("doria_rt.lib"),
-            Path::new("main.exe"),
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("doria_rt.lib"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::Freestanding,
+                foreign: &LinkPlan::default(),
+            },
         );
 
         assert_eq!(
@@ -621,9 +1010,13 @@ mod tests {
             false,
             true,
             false,
-            Path::new("main.obj"),
-            Path::new("libdoria_rt.a"),
-            Path::new("main.exe"),
+            LinkInputs {
+                object: Path::new("main.obj"),
+                runtime: Path::new("libdoria_rt.a"),
+                executable: Path::new("main.exe"),
+                hosting: runtime_artifact::RuntimeHosting::Freestanding,
+                foreign: &LinkPlan::default(),
+            },
         );
 
         assert_eq!(

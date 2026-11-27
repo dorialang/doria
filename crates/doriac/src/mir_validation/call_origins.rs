@@ -88,8 +88,8 @@ mod scheduling_tests {
             enum_id: definition.id,
             index: 0,
         };
-        let region = mir::Rvalue::ByteRegion(mir::ByteRegionExpression::Local {
-            kind: crate::types::ByteRegionKind::Readonly,
+        let region = mir::Rvalue::Region(mir::RegionExpression::Local {
+            kind: mir::RegionType::bytes(crate::types::ByteRegionKind::Readonly),
             local: mir::LocalId(0),
             transfer: false,
         });
@@ -1808,7 +1808,7 @@ fn preparation_entries(program: &mir::Program) -> Result<HashSet<mir::FunctionId
             } else {
                 mir::ByteRegionKind::Readonly
             };
-            if region.ty != mir::Type::ByteRegion(kind)
+            if region.ty != mir::Type::Region(mir::RegionType::bytes(kind))
                 || function.parameter_modes[0] != mir::FunctionParameterMode::Writable
                 || function.parameter_modes[1] != mir::FunctionParameterMode::Writable
                 || function.parameter_modes[2]
@@ -2367,9 +2367,7 @@ impl Proof<'_> {
             B::NullableCollectionIsPresent(value) => {
                 mir::Rvalue::NullableCollection((**value).clone())
             }
-            B::NullableByteRegionIsPresent(value) => {
-                mir::Rvalue::NullableByteRegion((**value).clone())
-            }
+            B::NullableByteRegionIsPresent(value) => mir::Rvalue::NullableRegion((**value).clone()),
             B::NullableSharedReferenceIsPresent(value) => {
                 mir::Rvalue::NullableSharedReference((**value).clone())
             }
@@ -2488,7 +2486,7 @@ impl Proof<'_> {
             )?
             .ty,
         )
-        .is_some_and(mir::ByteRegionKind::is_writable);
+        .is_some_and(mir::RegionType::is_writable);
         for request in requests {
             for storage in &storage {
                 let selection = Selection {
@@ -4173,20 +4171,18 @@ impl Proof<'_> {
             mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Mixed(value)) => {
                 self.value(context, site, flow, &mir::Rvalue::Mixed(value.clone()))
             }
-            mir::Rvalue::ByteRegion(mir::ByteRegionExpression::Region { source, .. }) => {
-                self.value(context, site, flow, source)
-            }
-            mir::Rvalue::ByteRegion(mir::ByteRegionExpression::AssumePresent { value, .. }) => self
-                .value(
-                    context,
-                    site,
-                    flow,
-                    &mir::Rvalue::NullableByteRegion((**value).clone()),
-                ),
-            mir::Rvalue::ByteRegion(mir::ByteRegionExpression::Coalesce {
-                left, right, ..
-            }) => {
-                let left = mir::Rvalue::NullableByteRegion((**left).clone());
+            mir::Rvalue::Region(
+                mir::RegionExpression::Region { source, .. }
+                | mir::RegionExpression::Foreign { owner: source, .. },
+            ) => self.value(context, site, flow, source),
+            mir::Rvalue::Region(mir::RegionExpression::AssumePresent { value, .. }) => self.value(
+                context,
+                site,
+                flow,
+                &mir::Rvalue::NullableRegion((**value).clone()),
+            ),
+            mir::Rvalue::Region(mir::RegionExpression::Coalesce { left, right, .. }) => {
+                let left = mir::Rvalue::NullableRegion((**left).clone());
                 let right_site = Site {
                     call: site.call + value_call_count(&left),
                     ..site
@@ -4196,12 +4192,12 @@ impl Proof<'_> {
                     context,
                     right_site,
                     flow,
-                    &mir::Rvalue::ByteRegion((**right).clone()),
+                    &mir::Rvalue::Region((**right).clone()),
                 )?);
                 Ok(result)
             }
-            mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Present(value)) => {
-                self.value(context, site, flow, &mir::Rvalue::ByteRegion(value.clone()))
+            mir::Rvalue::NullableRegion(mir::NullableRegionExpression::Present(value)) => {
+                self.value(context, site, flow, &mir::Rvalue::Region(value.clone()))
             }
             mir::Rvalue::Class(mir::ClassExpression::InterfaceReceiver { receiver, .. })
             | mir::Rvalue::Collection(mir::CollectionExpression::InterfaceReceiver {
@@ -4378,7 +4374,7 @@ impl Proof<'_> {
                     ..Value::default()
                 })
             }
-            mir::Rvalue::ByteRegion(mir::ByteRegionExpression::Call { function, args, .. })
+            mir::Rvalue::Region(mir::RegionExpression::Call { function, args, .. })
             | mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Call {
                 function, args, ..
             })
@@ -4416,7 +4412,7 @@ impl Proof<'_> {
                     ..
                 }),
             )
-            | mir::Rvalue::NullableByteRegion(mir::NullableByteRegionExpression::Call {
+            | mir::Rvalue::NullableRegion(mir::NullableRegionExpression::Call {
                 function,
                 args,
                 ..

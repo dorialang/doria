@@ -50,23 +50,25 @@ use crate::native_abi::{
     COLLECTION_VALUE_AT, ERROR_ASSERTION_PRESENTATION, FLOAT_PARSE, FORMAT_F32, FORMAT_F64,
     FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
     MIXED_NEW_AGGREGATE, MIXED_NEW_AGGREGATE_BORROWED, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
-    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM,
-    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_FUNCTION, MIXED_TAG_INLINE, MIXED_TAG_INT16,
-    MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_INTERFACE, MIXED_TAG_PAYLOAD_ENUM,
+    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_BOUNDARY, MIXED_TAG_CLASS,
+    MIXED_TAG_ENUM, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_FOREIGN_AGGREGATE,
+    MIXED_TAG_FUNCTION, MIXED_TAG_INLINE, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64,
+    MIXED_TAG_INT8, MIXED_TAG_INTERFACE, MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_POINTER,
     MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
     MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES,
     READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_PAYLOAD, SHARED_PAYLOAD_DESCRIPTOR,
     SHARED_RELEASE, SHARED_RELEASE_WEAK, STRING_ASSERTION_DIFFERENCE, STRING_ASSERTION_QUOTE,
     STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
-    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
-    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
-    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
-    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
-    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
-    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
-    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
-    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
-    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
+    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_DISPLAY_WIDTH,
+    STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL,
+    STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_GRAPHEME_BOUNDARY_AFTER, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF,
+    STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF,
+    STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END,
+    STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE,
+    STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE, STRING_TEXT_BETWEEN,
+    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
+    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
     WRITABLE_SHARED_PAYLOAD_DESCRIPTOR, WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
     WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE,
@@ -83,21 +85,26 @@ use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerVa
 
 const RUNTIME_RETURNED_TRAP: u8 = 1;
 
+mod c_entry;
+mod companion;
 mod process;
 mod readiness_set;
 #[cfg(test)]
 mod return_transport_tests;
+#[cfg(test)]
+pub(crate) mod runtime_data_tests;
 mod stream_callbacks;
 mod terminal;
 
 struct DeclaredNativeItems<'a> {
-    function_ids: &'a [FuncId],
+    function_ids: &'a [Option<FuncId>],
     class_drop_function_ids: &'a [FuncId],
     collection_drop_function_ids: &'a [FuncId],
     closure_drop_function_ids: &'a [FuncId],
     closure_descriptor_ids: &'a [DataId],
     class_descriptor_ids: &'a [DataId],
     static_ids: &'a [DataId],
+    runtime_data: crate::native_abi::RuntimeDataAccess,
 }
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
@@ -117,7 +124,18 @@ pub(crate) fn lower_validated_mir_to_object_with_metrics(
 ) -> Result<Vec<u8>, BackendError> {
     let isa_builder =
         cranelift_native::builder().map_err(|error| backend_failure(error.to_string()))?;
-    lower_validated_mir_to_object_for_isa(program, isa_builder, metrics)
+    lower_validated_mir_to_object_for_isa(program, isa_builder, metrics, None)
+}
+
+/// The object of the native companion library `library` (Decision 0148
+/// section 23): its emitted functions, each region entry exported as its
+/// versioned C entry, and no process entry.
+pub(crate) fn lower_companion_object(
+    library: &mir::companion::CompanionLibrary,
+) -> Result<Vec<u8>, BackendError> {
+    let isa_builder =
+        cranelift_native::builder().map_err(|error| backend_failure(error.to_string()))?;
+    lower_validated_mir_to_object_for_isa(&library.program, isa_builder, None, Some(library))
 }
 
 /// The shared Cranelift settings for every Doria object.
@@ -150,6 +168,7 @@ fn lower_validated_mir_to_object_for_isa(
     program: &mir::Program,
     isa_builder: cranelift_codegen::isa::Builder,
     metrics: Option<&mut mir_validation::OptimizationMetrics>,
+    companion: Option<&mir::companion::CompanionLibrary>,
 ) -> Result<Vec<u8>, BackendError> {
     let isa = isa_builder
         .finish(native_flags()?)
@@ -158,14 +177,55 @@ fn lower_validated_mir_to_object_for_isa(
         ObjectBuilder::new(isa, "doria_stage_13", default_libcall_names())
             .map_err(|error| backend_failure(error.to_string()))?,
     );
+    let runtime_data = crate::native_abi::RuntimeDataAccess::for_object(
+        &module.isa().triple().to_string(),
+        companion.is_some(),
+    );
 
+    // A companion emits only its own functions; every other function of
+    // the program stays on the host and is not declared.
+    let emits = |function: &mir::Function| {
+        companion.is_none_or(|library| library.emitted.contains(&function.id))
+    };
     let mut function_ids = Vec::with_capacity(program.functions.len());
     for function in &program.functions {
+        if !emits(function) {
+            function_ids.push(None);
+            continue;
+        }
         let signature = function_signature(&mut module, program, function)?;
         let function_id = module
             .declare_function(&function_symbol(function), Linkage::Local, &signature)
             .map_err(|error| backend_failure(error.to_string()))?;
-        function_ids.push(function_id);
+        function_ids.push(Some(function_id));
+    }
+    let c_entries = c_entry::declare(&mut module, program, companion)?;
+    if companion.is_some() {
+        let optimization = mir_validation::optimization_facts_with_metrics(program, metrics);
+        let declarations = DeclaredNativeItems {
+            function_ids: &function_ids,
+            class_drop_function_ids: &[],
+            collection_drop_function_ids: &[],
+            closure_drop_function_ids: &[],
+            closure_descriptor_ids: &[],
+            class_descriptor_ids: &[],
+            static_ids: &[],
+            runtime_data,
+        };
+        for function in program.functions.iter().filter(|function| emits(function)) {
+            define_function(
+                &mut module,
+                program,
+                function,
+                &declarations,
+                &optimization.functions[function.id.0],
+            )?;
+        }
+        c_entry::define(&mut module, program, &c_entries, &function_ids)?;
+        return module
+            .finish()
+            .emit()
+            .map_err(|error| backend_failure(error.to_string()));
     }
     let class_drop_function_ids = declare_class_drop_functions(&mut module, program)?;
     let collection_drop_function_ids = declare_collection_drop_functions(&mut module, program)?;
@@ -198,6 +258,7 @@ fn lower_validated_mir_to_object_for_isa(
         closure_descriptor_ids: &closure_descriptor_ids,
         class_descriptor_ids: &class_descriptor_ids,
         static_ids: &static_ids,
+        runtime_data,
     };
     let stream_callbacks = stream_callbacks::declare(&mut module, program)?;
 
@@ -225,6 +286,7 @@ fn lower_validated_mir_to_object_for_isa(
             &optimization.functions[function.id.0],
         )?;
     }
+    c_entry::define(&mut module, program, &c_entries, &function_ids)?;
     for class in &program.classes {
         define_class_drop_function(&mut module, program, class.id, &declarations)?;
     }
@@ -328,7 +390,7 @@ fn declare_closure_drop_functions(
 fn define_closure_descriptors(
     module: &mut ObjectModule,
     program: &mir::Program,
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
     closure_drop_function_ids: &[FuncId],
 ) -> Result<Vec<DataId>, BackendError> {
     let pointer_bytes = usize::from(module.target_config().pointer_bytes());
@@ -337,8 +399,9 @@ fn define_closure_descriptors(
         .closure_descriptors
         .iter()
         .map(|descriptor| {
-            let entry = *function_ids
+            let entry = function_ids
                 .get(descriptor.entry_function.0)
+                .and_then(|id| *id)
                 .ok_or_else(|| malformed_mir("closure descriptor entry was not declared"))?;
             let drop_environment = *closure_drop_function_ids
                 .get(descriptor.id.0)
@@ -385,7 +448,7 @@ fn declare_interface_vtable(
 fn define_class_descriptors(
     module: &mut ObjectModule,
     program: &mir::Program,
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
     class_drop_function_ids: &[FuncId],
 ) -> Result<Vec<DataId>, BackendError> {
     let pointer_bytes = usize::from(module.target_config().pointer_bytes());
@@ -442,9 +505,16 @@ fn define_class_descriptors(
                 let Some(function) = entry.implementation else {
                     continue;
                 };
-                let function = *function_ids.get(function.0).ok_or_else(|| {
-                    malformed_mir(format!("virtual function{} was not declared", function.0))
-                })?;
+                let function =
+                    function_ids
+                        .get(function.0)
+                        .and_then(|id| *id)
+                        .ok_or_else(|| {
+                            malformed_mir(format!(
+                                "virtual function{} was not declared",
+                                function.0
+                            ))
+                        })?;
                 let function = module.declare_func_in_data(function, &mut table);
                 table.write_function_addr((slot * pointer_bytes) as u32, function);
             }
@@ -767,10 +837,10 @@ fn append_type_abi_params(
     }
     match ty {
         mir::Type::Scalar(ty) => params.push(scalar_abi_param(ty)),
-        mir::Type::ByteRegion(_) => {
+        mir::Type::Region(_) => {
             params.extend([AbiParam::new(pointer_type), AbiParam::new(pointer_type)]);
         }
-        mir::Type::NullableByteRegion(_) => {
+        mir::Type::NullableRegion(_) => {
             params.extend([
                 AbiParam::new(pointer_type),
                 AbiParam::new(pointer_type),
@@ -795,7 +865,9 @@ fn append_type_abi_params(
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_)
         | mir::Type::PayloadEnum(_)
-        | mir::Type::NullablePayloadEnum(_) => {
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => {
             params.push(AbiParam::new(pointer_type));
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -857,6 +929,35 @@ impl LoweredValue {
             Self::OpenClass { object, .. } => object,
             Self::ByteRegion { data, .. } => data,
             Self::NullableByteRegion { present, .. } => present,
+        }
+    }
+
+    /// The two words of a two-word carrier: an open class value's object
+    /// and descriptor, or a shared interface reference's two words, in the
+    /// order they are stored.
+    fn two_words(self) -> Result<(Value, Value), BackendError> {
+        match self {
+            Self::OpenClass { object, descriptor } => Ok((object, descriptor)),
+            Self::Nullable { present, payload } => Ok((present, payload)),
+            Self::Single(_) | Self::ByteRegion { .. } | Self::NullableByteRegion { .. } => {
+                Err(malformed_mir("expected a two-word backend value"))
+            }
+        }
+    }
+
+    /// The value of type `ty` made of two stored words, the inverse of
+    /// [`Self::two_words`].
+    fn from_two_words(ty: mir::Type, first: Value, second: Value) -> Self {
+        if ty.shared_interface().is_some() {
+            Self::Nullable {
+                present: first,
+                payload: second,
+            }
+        } else {
+            Self::OpenClass {
+                object: first,
+                descriptor: second,
+            }
         }
     }
 
@@ -951,11 +1052,11 @@ fn byte_region_from_abi(ty: mir::Type, values: &[Value]) -> Result<LoweredValue,
             .ok_or_else(|| malformed_mir("byte region call is missing an ABI result word"))
     };
     match ty {
-        mir::Type::ByteRegion(_) => Ok(LoweredValue::ByteRegion {
+        mir::Type::Region(_) => Ok(LoweredValue::ByteRegion {
             data: word(0)?,
             length: word(1)?,
         }),
-        mir::Type::NullableByteRegion(_) => Ok(LoweredValue::NullableByteRegion {
+        mir::Type::NullableRegion(_) => Ok(LoweredValue::NullableByteRegion {
             present: word(0)?,
             data: word(1)?,
             length: word(2)?,
@@ -980,9 +1081,7 @@ fn lowered_from_direct_results(
             .ok_or_else(|| malformed_mir("call is missing a return register word"))
     };
     Ok(match ty {
-        mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
-            byte_region_from_abi(ty, results)?
-        }
+        mir::Type::Region(_) | mir::Type::NullableRegion(_) => byte_region_from_abi(ty, results)?,
         _ if ty.shared_interface().is_some() => LoweredValue::Nullable {
             present: word(0)?,
             payload: word(1)?,
@@ -1000,9 +1099,12 @@ fn lowered_from_direct_results(
                 payload: nullable_payload_from_doria_abi(builder, payload, ty),
             }
         }
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
+        mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => {
             return Err(malformed_mir(
-                "a payload enum returns through its result slot",
+                "a payload enum or foreign aggregate returns through its result slot",
             ))
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -1099,7 +1201,7 @@ fn define_nonclass_interface_vtable(
     module: &mut ObjectModule,
     program: &mir::Program,
     table: &mir::InterfaceVtable,
-    functions: &[FuncId],
+    functions: &[Option<FuncId>],
     collection_drops: &[FuncId],
 ) -> Result<DataId, BackendError> {
     let width = usize::from(module.target_config().pointer_bytes());
@@ -1198,7 +1300,11 @@ fn define_nonclass_interface_vtable(
     let reference = module.declare_func_in_data(drop, &mut data);
     data.write_function_addr((width * 3) as u32, reference);
     for (slot, function) in table.methods.iter().enumerate() {
-        let reference = module.declare_func_in_data(functions[function.0], &mut data);
+        let function = functions
+            .get(function.0)
+            .and_then(|id| *id)
+            .ok_or_else(|| malformed_mir("interface method entry was not declared"))?;
+        let reference = module.declare_func_in_data(function, &mut data);
         data.write_function_addr(
             (width * (crate::native_abi::INTERFACE_VTABLE_HEADER_WORDS + slot)) as u32,
             reference,
@@ -1213,7 +1319,7 @@ fn define_nonclass_interface_vtable(
 fn define_static_data(
     module: &mut ObjectModule,
     program: &mir::Program,
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
     class_drop_function_ids: &[FuncId],
     collection_drop_function_ids: &[FuncId],
     class_descriptor_ids: &[DataId],
@@ -1239,11 +1345,15 @@ fn define_static_data(
         description.set_align(u64::from(layout.align));
         match &property.initializer {
             mir::StaticValue::Scalar(value) => {
-                let scalar = scalar_data_bytes(*value);
-                if matches!(property.ty, mir::Type::NullableScalar(_)) {
+                let scalar = value.data_bytes();
+                if let mir::Type::NullableScalar(stored) = property.ty {
+                    let form =
+                        native_closure_abi::nullable_scalar_form(stored, pointer_bytes as u32);
                     let mut bytes = Vec::with_capacity(layout.size as usize);
-                    append_target_word(&mut bytes, 1, pointer_bytes);
-                    bytes.resize(layout.align as usize, 0);
+                    if form != native_closure_abi::NullableScalarForm::ZeroIsNull {
+                        append_target_word(&mut bytes, 1, pointer_bytes);
+                    }
+                    bytes.resize(form.payload_offset() as usize, 0);
                     bytes.extend_from_slice(&scalar);
                     bytes.resize(layout.size as usize, 0);
                     description.define(bytes.into_boxed_slice());
@@ -1289,6 +1399,17 @@ fn define_static_data(
                 let nullable = matches!(property.ty, mir::Type::NullablePayloadEnum(_));
                 description.set_align(value.ty.align.into());
                 description.define_zeroinit(value.ty.storage_size(nullable) as usize);
+            }
+            // A foreign struct or union is plain bytes: its static data is
+            // the constant's bytes (Decision 0148 section 6).
+            mir::StaticValue::ForeignAggregate(value) => {
+                description.set_align(value.ty.align.into());
+                let bytes = if matches!(property.ty, mir::Type::NullableForeignAggregate(_)) {
+                    value.nullable_bytes()
+                } else {
+                    value.bytes()
+                };
+                description.define(bytes.into_boxed_slice());
             }
         }
         module
@@ -1440,8 +1561,9 @@ fn define_static_data(
             module.declare_data_in_data(class_descriptor_id, &mut description);
         description.write_data_addr((pointer_bytes * 8) as u32, class_descriptor_reference, 0);
         for (slot, function) in table.methods.iter().enumerate() {
-            let function = *function_ids
+            let function = function_ids
                 .get(function.0)
+                .and_then(|id| *id)
                 .ok_or_else(|| malformed_mir("interface method entry was not declared"))?;
             let reference = module.declare_func_in_data(function, &mut description);
             description.write_function_addr(
@@ -1521,31 +1643,6 @@ fn append_target_word(bytes: &mut Vec<u8>, value: u64, width: usize) {
     }
 }
 
-fn scalar_data_bytes(value: mir::ScalarValue) -> Vec<u8> {
-    match value {
-        mir::ScalarValue::Integer(value) => match value.ty.bit_width() {
-            8 => vec![value.bits as u8],
-            16 => (value.bits as u16).to_ne_bytes().to_vec(),
-            32 => (value.bits as u32).to_ne_bytes().to_vec(),
-            64 => value.bits.to_ne_bytes().to_vec(),
-            width => unreachable!("canonical Doria integer has unsupported width {width}"),
-        },
-        mir::ScalarValue::Float(value) => match value.ty {
-            FloatType::Float32 => (value.bits as u32).to_ne_bytes().to_vec(),
-            FloatType::Float64 => value.bits.to_ne_bytes().to_vec(),
-        },
-        mir::ScalarValue::Bool(value) => vec![u8::from(value)],
-        mir::ScalarValue::Enum(value) => (value.case_id.index as u32).to_ne_bytes().to_vec(),
-        mir::ScalarValue::Inline(value) => {
-            if value.ty.storage_bytes() == 8 {
-                (value.bits as u64).to_ne_bytes().to_vec()
-            } else {
-                value.bits.to_ne_bytes().to_vec()
-            }
-        }
-    }
-}
-
 fn define_function(
     module: &mut ObjectModule,
     program: &mir::Program,
@@ -1560,10 +1657,12 @@ fn define_function(
         closure_descriptor_ids,
         class_descriptor_ids,
         static_ids,
+        runtime_data,
         ..
     } = declarations;
-    let function_id = *function_ids
+    let function_id = function_ids
         .get(function.id.0)
+        .and_then(|id| *id)
         .ok_or_else(|| malformed_mir(format!("function{} was not declared", function.id.0)))?;
     let signature = function_signature(module, program, function)?;
     let mut context = module.make_context();
@@ -1635,7 +1734,7 @@ fn define_function(
                         module.target_config().pointer_bytes().trailing_zeros() as u8,
                     )))
                 }
-                mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+                mir::Type::Region(_) | mir::Type::NullableRegion(_) => {
                     let layout = native_closure_abi::value_layout(
                         program,
                         local.ty,
@@ -1666,6 +1765,14 @@ fn define_function(
                 }
                 mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => {
                     let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
+                    Some(builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        ty.storage_size(nullable),
+                        ty.align.trailing_zeros() as u8,
+                    )))
+                }
+                mir::Type::ForeignAggregate(ty) | mir::Type::NullableForeignAggregate(ty) => {
+                    let nullable = matches!(local.ty, mir::Type::NullableForeignAggregate(_));
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         ty.storage_size(nullable),
@@ -1767,7 +1874,7 @@ fn define_function(
             let local = function.params[parameter + usize::from(function.closure.is_some())];
             let descriptor = builder.block_params(entry)[abi];
             borrow_home_addresses.insert(local, descriptor);
-            if function.promotes_writable_input(local) {
+            if function.writes_through_parameter_home(local) {
                 let home = load_borrow_home_descriptor(&mut builder, descriptor, pointer_type);
                 writable_parameter_addresses.insert(local, home.address);
             }
@@ -1799,12 +1906,13 @@ fn define_function(
                 pointer_bytes.trailing_zeros() as u8,
             ));
             let callable_name = program.diagnostic_callable_name(function);
+            let frame_data = frame_data_symbols(function.id);
             let function_name = define_named_data(
                 &mut builder,
                 callable_name.as_bytes(),
                 1,
                 module,
-                &format!("__doria_function_name_{}", function.id.0),
+                &frame_data.name,
             )?;
             builder
                 .ins()
@@ -1832,14 +1940,14 @@ fn define_function(
                 doria_source.path.as_bytes(),
                 1,
                 module,
-                &format!("__doria_source_path_{}", function.id.0),
+                &frame_data.path,
             )?;
             let source_text = define_named_data(
                 &mut builder,
                 doria_source.text.as_bytes(),
                 1,
                 module,
-                &format!("__doria_source_text_{}", function.id.0),
+                &frame_data.text,
             )?;
             for (word, value) in [
                 (3, source_path),
@@ -1923,6 +2031,7 @@ fn define_function(
             checked_error_address,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
+            runtime_data: *runtime_data,
         };
         retain_string_parameters(&mut builder, function, &mut resources)?;
         for local in &function.locals {
@@ -1971,6 +2080,22 @@ fn define_function(
     Ok(())
 }
 
+/// The data symbols of the function name, source path and source text that
+/// the diagnostic frame of `function` refers to.
+struct FrameDataSymbols {
+    name: String,
+    path: String,
+    text: String,
+}
+
+fn frame_data_symbols(function: mir::FunctionId) -> FrameDataSymbols {
+    FrameDataSymbols {
+        name: format!("__doria_function_name_{}", function.0),
+        path: format!("__doria_source_path_{}", function.0),
+        text: format!("__doria_source_text_{}", function.0),
+    }
+}
+
 fn define_class_drop_function(
     module: &mut ObjectModule,
     program: &mir::Program,
@@ -1984,6 +2109,7 @@ fn define_class_drop_function(
         closure_descriptor_ids,
         class_descriptor_ids,
         static_ids,
+        runtime_data,
         ..
     } = declarations;
     let function_id = *class_drop_function_ids
@@ -2033,6 +2159,7 @@ fn define_class_drop_function(
             checked_error_address: None,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
+            runtime_data: *runtime_data,
         };
         if let Some(ty) = class_definition(program, class)?.inline_copy_type() {
             if ty.requires_owned_cleanup() {
@@ -2070,6 +2197,7 @@ fn define_collection_drop_function(
         closure_descriptor_ids,
         class_descriptor_ids,
         static_ids,
+        runtime_data,
         ..
     } = declarations;
     let function_id = *collection_drop_function_ids
@@ -2119,6 +2247,7 @@ fn define_collection_drop_function(
             checked_error_address: None,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
+            runtime_data: *runtime_data,
         };
         lower_drop_collection_value(&mut builder, value, collection, &mut resources)?;
         builder.ins().return_(&[]);
@@ -2146,6 +2275,7 @@ fn define_closure_drop_function(
         closure_descriptor_ids,
         class_descriptor_ids,
         static_ids,
+        runtime_data,
         ..
     } = declarations;
     let function_id = *closure_drop_function_ids
@@ -2204,6 +2334,7 @@ fn define_closure_drop_function(
             checked_error_address: None,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
+            runtime_data: *runtime_data,
         };
         if let Some((logical, native)) = &environment_layout {
             for logical_index in &logical.logical_release_order {
@@ -2286,14 +2417,26 @@ fn initialize_locals(
             builder.call_memset(frontend_config, address, zero, size);
             continue;
         }
+        if let mir::Type::ForeignAggregate(ty) | mir::Type::NullableForeignAggregate(ty) = local.ty
+        {
+            let nullable = matches!(local.ty, mir::Type::NullableForeignAggregate(_));
+            let slot = local_slot(slots, local.id)?;
+            let address = builder.ins().stack_addr(pointer_type, slot, 0);
+            let zero = builder.ins().iconst(types::I8, 0);
+            let size = builder
+                .ins()
+                .iconst(pointer_type, i64::from(ty.storage_size(nullable)));
+            builder.call_memset(frontend_config, address, zero, size);
+            continue;
+        }
         let zero = match local.ty {
-            mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_) => {
+            mir::Type::Region(_) | mir::Type::NullableRegion(_) => {
                 let zero = builder.ins().iconst(pointer_type, 0);
                 let slot = local_slot(slots, local.id)?;
                 builder
                     .ins()
                     .stack_store(pointer_type, zero, slot, pointer_type.bytes() as i32);
-                if matches!(local.ty, mir::Type::NullableByteRegion(_)) {
+                if matches!(local.ty, mir::Type::NullableRegion(_)) {
                     builder.ins().stack_store(
                         pointer_type,
                         zero,
@@ -2369,7 +2512,10 @@ fn initialize_locals(
                 zero_inline_bytes(builder, address, layout.size, pointer_type);
                 zero
             }
-            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => unreachable!(),
+            mir::Type::PayloadEnum(_)
+            | mir::Type::NullablePayloadEnum(_)
+            | mir::Type::ForeignAggregate(_)
+            | mir::Type::NullableForeignAggregate(_) => unreachable!(),
         };
         builder
             .ins()
@@ -2421,12 +2567,20 @@ fn bind_parameters(
             continue;
         }
         let first = value_from_doria_abi(builder, first, ty);
-        if matches!(
-            ty,
-            mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
-        ) {
+        if let mir::Type::NullableScalar(_) = ty {
+            let payload = params.next().ok_or_else(|| {
+                malformed_mir("nullable function parameter is missing its ABI payload")
+            })?;
+            let value = LoweredValue::Nullable {
+                present: first,
+                payload: nullable_payload_from_doria_abi(builder, payload, ty),
+            };
+            store_lowered_to_stack(builder, program, ty, slot, value, pointer_type)?;
+            continue;
+        }
+        if matches!(ty, mir::Type::Region(_) | mir::Type::NullableRegion(_)) {
             let mut words = vec![first];
-            let count = if matches!(ty, mir::Type::NullableByteRegion(_)) {
+            let count = if matches!(ty, mir::Type::NullableRegion(_)) {
                 3
             } else {
                 2
@@ -2449,6 +2603,20 @@ fn bind_parameters(
                 payload.storage_size(matches!(ty, mir::Type::NullablePayloadEnum(_))),
                 pointer_type,
             );
+        } else if let mir::Type::ForeignAggregate(aggregate)
+        | mir::Type::NullableForeignAggregate(aggregate) = ty
+        {
+            // The caller passes the address of its value; the callee keeps
+            // its own copy, as every Copy argument is.
+            let destination = builder.ins().stack_addr(pointer_type, slot, 0);
+            copy_foreign_storage(
+                builder,
+                destination,
+                first,
+                aggregate,
+                matches!(ty, mir::Type::NullableForeignAggregate(_)),
+                pointer_type,
+            );
         } else if matches!(ty, mir::Type::Class(class) | mir::Type::NullableClass(class)
             if class_uses_open_carrier(program, class))
         {
@@ -2466,8 +2634,7 @@ fn bind_parameters(
         if ty.shared_interface().is_some()
             || matches!(
                 ty,
-                mir::Type::NullableScalar(_)
-                    | mir::Type::NullableString
+                mir::Type::NullableString
                     | mir::Type::Interface(_)
                     | mir::Type::NullableInterface(_)
                     | mir::Type::Function(_)
@@ -2799,15 +2966,16 @@ fn define_process_main(
     program: &mir::Program,
     process_main_id: FuncId,
     process_signature: &Signature,
-    function_ids: &[FuncId],
+    function_ids: &[Option<FuncId>],
     static_ids: &[DataId],
 ) -> Result<(), BackendError> {
     let entry = program
         .functions
         .get(program.entry.0)
         .ok_or_else(|| malformed_mir("entry function does not exist"))?;
-    let entry_id = *function_ids
+    let entry_id = function_ids
         .get(program.entry.0)
+        .and_then(|id| *id)
         .ok_or_else(|| malformed_mir("entry function was not declared"))?;
 
     let mut context = module.make_context();
@@ -2823,6 +2991,19 @@ fn define_process_main(
         let argv = builder.block_params(block)[1];
 
         let pointer_type = module.target_config().pointer_type();
+        // C may call back only on the thread running Doria code (Decision
+        // 0148 section 13).
+        if !program.c_entries.is_empty() {
+            let record = module
+                .declare_function(
+                    crate::native_abi::RECORD_DORIA_THREAD,
+                    Linkage::Import,
+                    &module.make_signature(),
+                )
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let record = module.declare_func_in_func(record, builder.func);
+            builder.ins().call(record, &[]);
+        }
         initialize_payload_statics(&mut builder, module, program, static_ids)?;
         let entry_ref = module.declare_func_in_func(entry_id, builder.func);
         let entry_pointer = builder.ins().func_addr(pointer_type, entry_ref);
@@ -2955,7 +3136,11 @@ fn define_process_main(
         }
         let call = builder.ins().call(runtime, &runtime_args);
         let status = builder.inst_results(call)[0];
-        if cfg!(windows) {
+        // A Windows program without foreign code enters at `main` without a
+        // C runtime and leaves through ExitProcess. One with foreign code
+        // enters through the C runtime's startup, which `main`'s return
+        // leaves through, as on Unix (Decision 0148 section 20).
+        if cfg!(windows) && !program.links_foreign_code() {
             let mut exit_signature = module.make_signature();
             exit_signature.params.push(AbiParam::new(types::I32));
             let exit_id = module
@@ -3036,15 +3221,11 @@ fn initialize_payload_static_value(
         (mir::StaticValue::Scalar(value), mir::Type::NullableScalar(expected))
             if value.ty() == expected =>
         {
-            let present = builder.ins().iconst(pointer, 1);
-            builder.ins().store(flags, present, address, 0);
-            let value = cranelift_scalar_constant(builder, *value);
-            builder.ins().store(
-                flags,
-                value,
-                address,
-                native_closure_abi::type_layout(ty, pointer.bytes()).align as i32,
-            );
+            let value = LoweredValue::Nullable {
+                present: builder.ins().iconst(pointer, 1),
+                payload: cranelift_scalar_constant(builder, *value),
+            };
+            store_nullable_scalar(builder, expected, address, value, flags, pointer)?;
         }
         (mir::StaticValue::String(value), mir::Type::String | mir::Type::NullableString) => {
             let mut bytes = Vec::with_capacity(pointer.bytes() as usize * 2 + value.len());
@@ -3119,6 +3300,25 @@ fn initialize_payload_static_value(
                 )?;
             }
         }
+        // The storage starts zero, so each scalar field is stored over it.
+        (
+            mir::StaticValue::ForeignAggregate(value),
+            mir::Type::ForeignAggregate(expected) | mir::Type::NullableForeignAggregate(expected),
+        ) if value.ty == expected => {
+            let payload = if matches!(ty, mir::Type::NullableForeignAggregate(_)) {
+                let present = builder.ins().iconst(types::I8, 1);
+                builder.ins().store(flags, present, address, 0);
+                expected.nullable_payload_offset as i32
+            } else {
+                0
+            };
+            for (offset, scalar) in value.scalar_fields() {
+                let scalar = cranelift_scalar_constant(builder, scalar);
+                builder
+                    .ins()
+                    .store(flags, scalar, address, payload + offset as i32);
+            }
+        }
         _ => {
             return Err(malformed_mir(
                 "payload enum static initializer type mismatch",
@@ -3163,7 +3363,7 @@ fn clif_tag_type(width: u32) -> Result<ClifType, BackendError> {
 struct LoweringResources<'module, 'program> {
     module: &'module mut ObjectModule,
     program: &'program mir::Program,
-    function_ids: &'program [FuncId],
+    function_ids: &'program [Option<FuncId>],
     class_drop_function_ids: &'program [FuncId],
     collection_drop_function_ids: &'program [FuncId],
     closure_descriptor_ids: &'program [DataId],
@@ -3192,6 +3392,8 @@ struct LoweringResources<'module, 'program> {
     checked_error_address: Option<Value>,
     defer_class_temporary_drops: bool,
     deferred_class_temporary_drops: Vec<(StackSlot, DeferredOwnedTemporary)>,
+    /// How this object reaches the runtime's data symbols.
+    runtime_data: crate::native_abi::RuntimeDataAccess,
 }
 
 #[derive(Clone, Copy)]
@@ -3445,9 +3647,7 @@ fn project_stored_value(
                 payload: value.single()?,
             });
         }
-        (mir::Type::ByteRegion(source), mir::Type::NullableByteRegion(target))
-            if source == target =>
-        {
+        (mir::Type::Region(source), mir::Type::NullableRegion(target)) if source == target => {
             let (data, length) = value.byte_region()?;
             return Ok(LoweredValue::NullableByteRegion {
                 present: builder.ins().iconst(pointer, 1),
@@ -3455,9 +3655,7 @@ fn project_stored_value(
                 length,
             });
         }
-        (mir::Type::NullableByteRegion(source), mir::Type::ByteRegion(target))
-            if source == target =>
-        {
+        (mir::Type::NullableRegion(source), mir::Type::Region(target)) if source == target => {
             let (present, data, length) = value.nullable_byte_region()?;
             builder
                 .ins()
@@ -3985,6 +4183,39 @@ fn lower_statement(
             environment,
             bindings,
         } => lower_bind_closure_environment(builder, *environment, bindings, resources)?,
+        mir::Statement::Pointer {
+            target,
+            operation,
+            span,
+        } => lower_pointer_operation(builder, *target, operation, *span, resources)?,
+        mir::Statement::ForeignCall {
+            function,
+            args,
+            target,
+            ..
+        } => lower_foreign_call(builder, function, args, *target, resources)?,
+        mir::Statement::HostRecord {
+            target,
+            size,
+            align,
+        } => companion::host_record(builder, *target, *size, *align, resources)?,
+        mir::Statement::RegionSlot {
+            record,
+            slot,
+            access,
+        } => companion::region_slot(builder, *record, *slot, *access, resources)?,
+        mir::Statement::CallHost {
+            host,
+            operation,
+            arguments,
+            results,
+        } => companion::call_host(builder, *host, *operation, *arguments, *results, resources)?,
+        mir::Statement::ForeignField {
+            aggregate,
+            offset,
+            access,
+            span,
+        } => lower_foreign_field(builder, *aggregate, *offset, access, *span, resources)?,
         mir::Statement::DropFunction { local, .. } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
@@ -4218,26 +4449,41 @@ fn lower_statement(
             )?;
         }
         mir::Statement::EndBorrow { .. } => {}
-        mir::Statement::AssignByteRegionIndex {
+        mir::Statement::AssignRegionIndex {
             region,
             index,
             value,
             index_span,
         } => {
-            let (data, length) =
-                lower_byte_region_local(builder, *region, false, resources)?.byte_region()?;
             let index = lower_rvalue(builder, index, resources)?.single()?;
-            let value = lower_rvalue(builder, value, resources)?.single()?;
-            set_active_panic_site(builder, *index_span, resources);
-            let pointer = resources.module.target_config().pointer_type();
-            runtime_call(
-                builder,
-                BYTE_REGION_SET,
-                &[pointer, pointer, pointer, types::I64, types::I8],
-                None,
-                &[resources.current_frame, data, length, index, value],
-                resources,
-            )?;
+            let value = lower_rvalue(builder, value, resources)?;
+            if let Some((element, address)) =
+                typed_region_element(builder, *region, index, *index_span, resources)?
+            {
+                let pointer = resources.module.target_config().pointer_type();
+                store_lowered_to_address(
+                    builder,
+                    resources.program,
+                    element,
+                    address,
+                    value,
+                    pointer,
+                )?;
+            } else {
+                let value = value.single()?;
+                let (data, length) =
+                    lower_byte_region_local(builder, *region, false, resources)?.byte_region()?;
+                set_active_panic_site(builder, *index_span, resources);
+                let pointer = resources.module.target_config().pointer_type();
+                runtime_call(
+                    builder,
+                    BYTE_REGION_SET,
+                    &[pointer, pointer, pointer, types::I64, types::I8],
+                    None,
+                    &[resources.current_frame, data, length, index, value],
+                    resources,
+                )?;
+            }
         }
         mir::Statement::CopyWithinByteRegion {
             region,
@@ -4531,16 +4777,7 @@ fn lower_statement(
                 new_value,
                 pointer,
             )?;
-            let writable_home = resources.program.functions[resources.function_id.0]
-                .is_writable_borrowed_place(*target)
-                || resources.writable_parameter_addresses.contains_key(target)
-                || resources
-                    .closure_bound_fields
-                    .get(target)
-                    .is_some_and(|field| {
-                        field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
-                    });
-            if writable_home {
+            if is_writable_home(resources, *target) {
                 let home = closure_source_home(builder, *target, resources)?;
                 let current = load_lowered_from_stack(
                     builder,
@@ -4871,13 +5108,18 @@ fn lower_statement(
                     }
                     mir::Type::Scalar(_)
                     | mir::Type::NullableScalar(_)
-                    | mir::Type::ByteRegion(_)
-                    | mir::Type::NullableByteRegion(_)
+                    | mir::Type::Region(_)
+                    | mir::Type::NullableRegion(_)
                     | mir::Type::Class(_)
                     | mir::Type::NullableClass(_)
                     | mir::Type::Interface(_)
                     | mir::Type::NullableInterface(_) => None,
-                    mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
+                    // A foreign struct or union is plain bytes with nothing
+                    // to release (Decision 0148 section 6).
+                    mir::Type::Function(_)
+                    | mir::Type::NullableFunction(_)
+                    | mir::Type::ForeignAggregate(_)
+                    | mir::Type::NullableForeignAggregate(_) => None,
                     mir::Type::ClosureEnvironment(_) => {
                         return Err(malformed_mir(
                             "closure environment pointer reached a Doria property",
@@ -5532,13 +5774,13 @@ fn load_lowered_from_stack(
         };
     }
     match ty {
-        mir::Type::ByteRegion(_) => LoweredValue::ByteRegion {
+        mir::Type::Region(_) => LoweredValue::ByteRegion {
             data: builder.ins().stack_load(pointer, pointer, slot, 0),
             length: builder
                 .ins()
                 .stack_load(pointer, pointer, slot, pointer.bytes() as i32),
         },
-        mir::Type::NullableByteRegion(_) => LoweredValue::NullableByteRegion {
+        mir::Type::NullableRegion(_) => LoweredValue::NullableByteRegion {
             present: builder.ins().stack_load(pointer, pointer, slot, 0),
             data: builder
                 .ins()
@@ -5547,15 +5789,16 @@ fn load_lowered_from_stack(
                 .ins()
                 .stack_load(pointer, pointer, slot, (pointer.bytes() * 2) as i32),
         },
-        mir::Type::NullableScalar(scalar) => LoweredValue::Nullable {
-            present: builder.ins().stack_load(pointer, pointer, slot, 0),
-            payload: builder.ins().stack_load(
+        mir::Type::NullableScalar(scalar) => {
+            let address = builder.ins().stack_addr(pointer, slot, 0);
+            load_nullable_scalar(
+                builder,
+                scalar,
+                address,
+                cranelift_codegen::ir::MachMemFlags::trusted().into(),
                 pointer,
-                clif_scalar_type(scalar),
-                slot,
-                native_closure_abi::type_layout(ty, pointer.bytes()).align as i32,
-            ),
-        },
+            )
+        }
         mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
@@ -5572,7 +5815,10 @@ fn load_lowered_from_stack(
             slot,
             0,
         )),
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
+        mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => {
             LoweredValue::Single(builder.ins().stack_addr(pointer, slot, 0))
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
@@ -5630,14 +5876,14 @@ fn store_lowered_to_stack(
         return Ok(());
     }
     match ty {
-        mir::Type::ByteRegion(_) => {
+        mir::Type::Region(_) => {
             let (data, length) = value.byte_region()?;
             builder.ins().stack_store(pointer, data, slot, 0);
             builder
                 .ins()
                 .stack_store(pointer, length, slot, pointer.bytes() as i32);
         }
-        mir::Type::NullableByteRegion(_) => {
+        mir::Type::NullableRegion(_) => {
             let (present, data, length) = value.nullable_byte_region()?;
             builder.ins().stack_store(pointer, present, slot, 0);
             builder
@@ -5658,8 +5904,29 @@ fn store_lowered_to_stack(
                 pointer,
             );
         }
-        mir::Type::NullableScalar(_)
-        | mir::Type::NullableString
+        mir::Type::ForeignAggregate(aggregate) | mir::Type::NullableForeignAggregate(aggregate) => {
+            let destination = builder.ins().stack_addr(pointer, slot, 0);
+            copy_foreign_storage(
+                builder,
+                destination,
+                value.single()?,
+                aggregate,
+                matches!(ty, mir::Type::NullableForeignAggregate(_)),
+                pointer,
+            );
+        }
+        mir::Type::NullableScalar(scalar) => {
+            let address = builder.ins().stack_addr(pointer, slot, 0);
+            store_nullable_scalar(
+                builder,
+                scalar,
+                address,
+                value,
+                cranelift_codegen::ir::MachMemFlags::trusted().into(),
+                pointer,
+            )?;
+        }
+        mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
         | mir::Type::Function(_)
@@ -5708,13 +5975,13 @@ fn load_lowered_from_address(
         };
     }
     match ty {
-        mir::Type::ByteRegion(_) => LoweredValue::ByteRegion {
+        mir::Type::Region(_) => LoweredValue::ByteRegion {
             data: builder.ins().load(pointer, flags, address, 0),
             length: builder
                 .ins()
                 .load(pointer, flags, address, pointer.bytes() as i32),
         },
-        mir::Type::NullableByteRegion(_) => LoweredValue::NullableByteRegion {
+        mir::Type::NullableRegion(_) => LoweredValue::NullableByteRegion {
             present: builder.ins().load(pointer, flags, address, 0),
             data: builder
                 .ins()
@@ -5723,15 +5990,9 @@ fn load_lowered_from_address(
                 .ins()
                 .load(pointer, flags, address, (pointer.bytes() * 2) as i32),
         },
-        mir::Type::NullableScalar(scalar) => LoweredValue::Nullable {
-            present: builder.ins().load(pointer, flags, address, 0),
-            payload: builder.ins().load(
-                clif_scalar_type(scalar),
-                flags,
-                address,
-                native_closure_abi::type_layout(ty, pointer.bytes()).align as i32,
-            ),
-        },
+        mir::Type::NullableScalar(scalar) => {
+            load_nullable_scalar(builder, scalar, address, flags.into(), pointer)
+        }
         mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
@@ -5748,9 +6009,10 @@ fn load_lowered_from_address(
             address,
             0,
         )),
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
-            LoweredValue::Single(address)
-        }
+        mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => LoweredValue::Single(address),
         mir::Type::Class(class) | mir::Type::NullableClass(class)
             if class_uses_open_carrier(program, class) =>
         {
@@ -5804,14 +6066,14 @@ fn store_lowered_to_address(
         return Ok(());
     }
     match ty {
-        mir::Type::ByteRegion(_) => {
+        mir::Type::Region(_) => {
             let (data, length) = value.byte_region()?;
             builder.ins().store(flags, data, address, 0);
             builder
                 .ins()
                 .store(flags, length, address, pointer.bytes() as i32);
         }
-        mir::Type::NullableByteRegion(_) => {
+        mir::Type::NullableRegion(_) => {
             let (present, data, length) = value.nullable_byte_region()?;
             builder.ins().store(flags, present, address, 0);
             builder
@@ -5831,8 +6093,20 @@ fn store_lowered_to_address(
                 pointer,
             );
         }
-        mir::Type::NullableScalar(_)
-        | mir::Type::NullableString
+        mir::Type::ForeignAggregate(aggregate) | mir::Type::NullableForeignAggregate(aggregate) => {
+            copy_foreign_storage(
+                builder,
+                address,
+                value.single()?,
+                aggregate,
+                matches!(ty, mir::Type::NullableForeignAggregate(_)),
+                pointer,
+            )
+        }
+        mir::Type::NullableScalar(scalar) => {
+            store_nullable_scalar(builder, scalar, address, value, flags.into(), pointer)?;
+        }
+        mir::Type::NullableString
         | mir::Type::Interface(_)
         | mir::Type::NullableInterface(_)
         | mir::Type::Function(_)
@@ -5859,6 +6133,66 @@ fn store_lowered_to_address(
         }
         _ => {
             builder.ins().store(flags, value.single()?, address, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Reads a stored `?T` in its `NullableScalarForm` into the presence and
+/// payload pair a `?T` is while code works with it.
+fn load_nullable_scalar(
+    builder: &mut FunctionBuilder,
+    scalar: mir::ScalarType,
+    address: Value,
+    flags: MemFlagsData,
+    pointer: ClifType,
+) -> LoweredValue {
+    match native_closure_abi::nullable_scalar_form(scalar, pointer.bytes()) {
+        native_closure_abi::NullableScalarForm::ZeroIsNull => {
+            let payload = builder
+                .ins()
+                .load(clif_scalar_type(scalar), flags, address, 0);
+            LoweredValue::Nullable {
+                present: presence_word(builder, payload, pointer),
+                payload,
+            }
+        }
+        native_closure_abi::NullableScalarForm::Tagged { payload_offset } => {
+            LoweredValue::Nullable {
+                present: builder.ins().load(pointer, flags, address, 0),
+                payload: builder.ins().load(
+                    clif_scalar_type(scalar),
+                    flags,
+                    address,
+                    payload_offset as i32,
+                ),
+            }
+        }
+    }
+}
+
+/// Stores the presence and payload pair of a `?T` in its
+/// `NullableScalarForm`; an absent nullable pointer stores address zero.
+fn store_nullable_scalar(
+    builder: &mut FunctionBuilder,
+    scalar: mir::ScalarType,
+    address: Value,
+    value: LoweredValue,
+    flags: MemFlagsData,
+    pointer: ClifType,
+) -> Result<(), BackendError> {
+    let (present, payload) = value.nullable()?;
+    match native_closure_abi::nullable_scalar_form(scalar, pointer.bytes()) {
+        native_closure_abi::NullableScalarForm::ZeroIsNull => {
+            let null = builder.ins().iconst(clif_scalar_type(scalar), 0);
+            let word = builder.ins().select(present, payload, null);
+            builder.ins().store(flags, word, address, 0);
+        }
+        native_closure_abi::NullableScalarForm::Tagged { payload_offset } => {
+            builder.ins().store(flags, present, address, 0);
+            builder
+                .ins()
+                .store(flags, payload, address, payload_offset as i32);
         }
     }
     Ok(())
@@ -7657,7 +7991,10 @@ fn finish_checked_resource(
             store_lowered_to_stack(
                 builder,
                 resources.program,
-                mir::Type::NullableByteRegion(mir::ByteRegionKind::Readonly),
+                mir::Type::NullableRegion(mir::RegionType {
+                    access: mir::ByteRegionKind::Readonly,
+                    array: None,
+                }),
                 slot,
                 LoweredValue::NullableByteRegion {
                     present,
@@ -8728,8 +9065,8 @@ fn lower_rvalue(
         refresh_borrowed_local(builder, local, resources)?;
     }
     let value = match expression {
-        mir::Rvalue::ByteRegion(value) => lower_byte_region_expression(builder, value, resources),
-        mir::Rvalue::NullableByteRegion(value) => {
+        mir::Rvalue::Region(value) => lower_byte_region_expression(builder, value, resources),
+        mir::Rvalue::NullableRegion(value) => {
             lower_nullable_byte_region_expression(builder, value, resources)
         }
         mir::Rvalue::Function(value) => lower_function_expression(builder, value, resources),
@@ -8808,6 +9145,13 @@ fn lower_rvalue(
             lower_nullable_payload_enum_expression(builder, value, resources)
                 .map(LoweredValue::Single)
         }
+        mir::Rvalue::ForeignAggregate(value) => {
+            lower_foreign_aggregate_expression(builder, value, resources).map(LoweredValue::Single)
+        }
+        mir::Rvalue::NullableForeignAggregate(value) => {
+            lower_nullable_foreign_aggregate_expression(builder, value, resources)
+                .map(LoweredValue::Single)
+        }
     }?;
     let function = &resources.program.functions[resources.function_id.0];
     if expression.is_null_value() && expression.ty().has_move_ownership() {
@@ -8857,14 +9201,101 @@ fn lower_byte_region_local(
     Ok(value)
 }
 
+/// The element type of a typed array region local and the bounds-checked
+/// address of its element `index` (Decision 0148 section 8); `None` for a
+/// byte region, whose elements the byte runtime entries read and write.
+fn typed_region_element(
+    builder: &mut FunctionBuilder,
+    region: mir::LocalId,
+    index: Value,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Option<(mir::Type, Value)>, BackendError> {
+    let mir::Type::Region(region_type) =
+        local_definition(resources.program, resources.function_id, region)?.ty
+    else {
+        return Err(malformed_mir(
+            "a region element access names a present region",
+        ));
+    };
+    if region_type.array.is_none() {
+        return Ok(None);
+    }
+    let (element, stride) = crate::native_abi::array_region_element(resources.program, region_type)
+        .ok_or_else(|| malformed_mir("a typed array region views elements the targets build"))?;
+    let (data, length) =
+        lower_byte_region_local(builder, region, false, resources)?.byte_region()?;
+    set_active_panic_site(builder, span, resources);
+    let pointer = resources.module.target_config().pointer_type();
+    let stride = builder.ins().iconst(pointer, stride as i64);
+    let address = runtime_call(
+        builder,
+        crate::native_abi::ARRAY_REGION_ELEMENT,
+        &[pointer, pointer, pointer, types::I64, pointer],
+        Some(pointer),
+        &[resources.current_frame, data, length, index, stride],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("an array region element produced no address"))?;
+    Ok(Some((element, address)))
+}
+
+/// Element `index` of the typed array region `region`, read as `scalar`
+/// (Decision 0148 section 8). Every scalar family's operand reads region
+/// elements here. A `bool` element is true for any nonzero byte, as a
+/// `_Bool` read from C memory is, because a region may view a foreign
+/// aggregate's field.
+fn lower_typed_region_read(
+    builder: &mut FunctionBuilder,
+    region: mir::LocalId,
+    index: &mir::Rvalue,
+    index_span: crate::source::Span,
+    scalar: mir::ScalarType,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    lower_typed_region_element_value(
+        builder,
+        region,
+        index,
+        index_span,
+        mir::Type::Scalar(scalar),
+        resources,
+    )?
+    .single()
+}
+
+/// Element `index` of the typed array region `region`, read as
+/// `expected`: a scalar, or a nullable pointer, which loads from its word
+/// as absent at address zero.
+fn lower_typed_region_element_value(
+    builder: &mut FunctionBuilder,
+    region: mir::LocalId,
+    index: &mir::Rvalue,
+    index_span: crate::source::Span,
+    expected: mir::Type,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
+    let index = lower_rvalue(builder, index, resources)?.single()?;
+    let (element, address) = typed_region_element(builder, region, index, index_span, resources)?
+        .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
+    if element != expected {
+        return Err(malformed_mir(
+            "a region element read has the element's type",
+        ));
+    }
+    let pointer = resources.module.target_config().pointer_type();
+    let value = load_lowered_from_address(builder, resources.program, element, address, pointer);
+    normalize_foreign_bool(builder, element, value)
+}
+
 fn lower_byte_region_expression(
     builder: &mut FunctionBuilder,
-    expression: &mir::ByteRegionExpression,
+    expression: &mir::RegionExpression,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
-        mir::ByteRegionExpression::CollectionIndex {
+        mir::RegionExpression::CollectionIndex {
             collection,
             index,
             index_span,
@@ -8880,7 +9311,7 @@ fn lower_byte_region_expression(
             *remove,
             resources,
         ),
-        mir::ByteRegionExpression::Region {
+        mir::RegionExpression::Region {
             source,
             offset,
             length,
@@ -8892,7 +9323,45 @@ fn lower_byte_region_expression(
             let offset = lower_rvalue(builder, offset, resources)?.single()?;
             let length = lower_rvalue(builder, length, resources)?.single()?;
             set_active_panic_site(builder, *span, resources);
-            let data = if matches!(source_ty, mir::Type::ByteRegion(_)) {
+            let typed_stride = match expression.kind() {
+                region if region.array.is_some() => Some(
+                    crate::native_abi::array_region_element(resources.program, region)
+                        .ok_or_else(|| {
+                            malformed_mir("a typed array region views elements the targets build")
+                        })?
+                        .1,
+                ),
+                _ => None,
+            };
+            let data = if let (Some(stride), mir::Type::Region(_)) = (typed_stride, source_ty) {
+                let (data, source_length) = source.byte_region()?;
+                let stride = builder.ins().iconst(pointer, stride as i64);
+                runtime_call(
+                    builder,
+                    crate::native_abi::ARRAY_REGION_SUBREGION,
+                    &[pointer, pointer, pointer, types::I64, types::I64, pointer],
+                    Some(pointer),
+                    &[
+                        resources.current_frame,
+                        data,
+                        source_length,
+                        offset,
+                        length,
+                        stride,
+                    ],
+                    resources,
+                )?
+            } else if typed_stride.is_some() {
+                // A `T[]`: the runtime knows its element storage.
+                runtime_call(
+                    builder,
+                    crate::native_abi::ARRAY_REGION,
+                    &[pointer, pointer, types::I64, types::I64],
+                    Some(pointer),
+                    &[resources.current_frame, source.single()?, offset, length],
+                    resources,
+                )?
+            } else if matches!(source_ty, mir::Type::Region(_)) {
                 let (data, source_length) = source.byte_region()?;
                 runtime_call(
                     builder,
@@ -8950,17 +9419,34 @@ fn lower_byte_region_expression(
             };
             Ok(LoweredValue::ByteRegion { data, length })
         }
-        mir::ByteRegionExpression::Local {
+        mir::RegionExpression::Local {
             local, transfer, ..
         } => lower_byte_region_local(builder, *local, *transfer, resources),
-        mir::ByteRegionExpression::Call {
+        // A region over foreign memory is the range its pointer operation
+        // checked; the owner is a loan only checking and validation read.
+        mir::RegionExpression::Foreign { data, length, .. } => {
+            let mut word = |local: mir::LocalId| {
+                load_lowered_from_stack(
+                    builder,
+                    resources.program,
+                    local_definition(resources.program, resources.function_id, local)?.ty,
+                    local_slot(resources.local_slots, local)?,
+                    pointer,
+                )
+                .single()
+            };
+            let data = word(*data)?;
+            let length = word(*length)?;
+            Ok(LoweredValue::ByteRegion { data, length })
+        }
+        mir::RegionExpression::Call {
             function,
             args,
             span,
             ..
         } => lower_function_call_at(builder, *function, args, *span, resources)?
             .ok_or_else(|| malformed_mir("byte region call produced no result")),
-        mir::ByteRegionExpression::AssumePresent { value, .. } => {
+        mir::RegionExpression::AssumePresent { value, .. } => {
             let source = lower_nullable_byte_region_expression(builder, value, resources)?;
             let (_, data, length) = source.nullable_byte_region()?;
             let value = LoweredValue::ByteRegion { data, length };
@@ -8975,7 +9461,7 @@ fn lower_byte_region_expression(
             }
             Ok(value)
         }
-        mir::ByteRegionExpression::Coalesce { left, right, .. } => {
+        mir::RegionExpression::Coalesce { left, right, .. } => {
             let (present, data, length) =
                 lower_nullable_byte_region_expression(builder, left, resources)?
                     .nullable_byte_region()?;
@@ -9002,12 +9488,12 @@ fn lower_byte_region_expression(
 
 fn lower_nullable_byte_region_expression(
     builder: &mut FunctionBuilder,
-    expression: &mir::NullableByteRegionExpression,
+    expression: &mir::NullableRegionExpression,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
-        mir::NullableByteRegionExpression::CollectionIndex {
+        mir::NullableRegionExpression::CollectionIndex {
             collection,
             index,
             index_span,
@@ -9023,7 +9509,7 @@ fn lower_nullable_byte_region_expression(
             *remove,
             resources,
         ),
-        mir::NullableByteRegionExpression::CollectionGet {
+        mir::NullableRegionExpression::CollectionGet {
             collection,
             key,
             index_span,
@@ -9037,7 +9523,7 @@ fn lower_nullable_byte_region_expression(
             *access,
             resources,
         ),
-        mir::NullableByteRegionExpression::Null { .. } => {
+        mir::NullableRegionExpression::Null { .. } => {
             let zero = builder.ins().iconst(pointer, 0);
             Ok(LoweredValue::NullableByteRegion {
                 present: zero,
@@ -9045,7 +9531,7 @@ fn lower_nullable_byte_region_expression(
                 length: zero,
             })
         }
-        mir::NullableByteRegionExpression::Present(value) => {
+        mir::NullableRegionExpression::Present(value) => {
             let source = lower_byte_region_expression(builder, value, resources)?;
             let (data, length) = source.byte_region()?;
             let present = builder.ins().iconst(pointer, 1);
@@ -9065,10 +9551,10 @@ fn lower_nullable_byte_region_expression(
             }
             Ok(value)
         }
-        mir::NullableByteRegionExpression::Local {
+        mir::NullableRegionExpression::Local {
             local, transfer, ..
         } => lower_byte_region_local(builder, *local, *transfer, resources),
-        mir::NullableByteRegionExpression::Call {
+        mir::NullableRegionExpression::Call {
             function,
             args,
             span,
@@ -9314,6 +9800,34 @@ fn closure_source_address(
     Ok(builder.ins().stack_addr(pointer, slot, 0))
 }
 
+/// A writable home is storage the local names but does not own: a writable
+/// parameter, a writable borrowed place or a writable closure capture. Its
+/// stack slot holds a working copy that whole-value assignment writes back.
+fn is_writable_home(resources: &LoweringResources<'_, '_>, local: mir::LocalId) -> bool {
+    resources.program.functions[resources.function_id.0].is_writable_borrowed_place(local)
+        || resources.writable_parameter_addresses.contains_key(&local)
+        || resources
+            .closure_bound_fields
+            .get(&local)
+            .is_some_and(|field| field.storage == mir::ClosureEnvironmentStorage::WritableBorrow)
+}
+
+/// The storage of an inline local that is read or changed in place: the home
+/// of a writable home, so field writes, region writes and pointers reach the
+/// caller's value, and the local's own slot otherwise.
+fn inline_local_address(
+    builder: &mut FunctionBuilder,
+    local: mir::LocalId,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    if is_writable_home(resources, local) {
+        return Ok(closure_source_home(builder, local, resources)?.address);
+    }
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, local)?;
+    Ok(builder.ins().stack_addr(pointer, slot, 0))
+}
+
 fn closure_source_home(
     builder: &mut FunctionBuilder,
     local: mir::LocalId,
@@ -9486,10 +10000,7 @@ fn materialize_owned_borrow_home(
     resources: &LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
-    let address = if matches!(
-        ty,
-        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-    ) {
+    let address = if native_closure_abi::memory_value_layout(ty).is_some() {
         // Inline aggregate results already have stable native storage.
         value.single()?
     } else {
@@ -10035,9 +10546,15 @@ fn operand_borrow_home(
         mir::Operand::Local(local) | mir::Operand::NullablePayload(local) => {
             let mut home = closure_source_home(builder, *local, resources)?;
             if matches!(operand, mir::Operand::NullablePayload(_)) {
-                home.address = builder
-                    .ins()
-                    .iadd_imm_u(home.address, i64::from(pointer.bytes()));
+                let offset =
+                    match local_definition(resources.program, resources.function_id, *local)?.ty {
+                        mir::Type::NullableScalar(scalar) => {
+                            native_closure_abi::nullable_scalar_form(scalar, pointer.bytes())
+                                .payload_offset()
+                        }
+                        _ => pointer.bytes(),
+                    };
+                home.address = builder.ins().iadd_imm_u(home.address, i64::from(offset));
             }
             Ok(borrow_home_descriptor(builder, home, pointer))
         }
@@ -10181,6 +10698,687 @@ fn create_payload_storage(
     builder
         .ins()
         .stack_addr(resources.module.target_config().pointer_type(), slot, 0)
+}
+
+/// What a foreign aggregate copy may assume of the memory it reads and
+/// writes: compiler storage is aligned and never faults; memory a pointer
+/// addresses may fault, and is aligned only for an aligned access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateAccess {
+    Storage,
+    Pointer { aligned: bool },
+}
+
+/// Copies at most this many units in straight-line code; a larger
+/// aggregate copies in a loop, so code size stays independent of the
+/// aggregate's size.
+const FOREIGN_AGGREGATE_UNROLLED_UNITS: u32 = 16;
+
+/// The memory unit a foreign aggregate copy or fill moves: its alignment up
+/// to 8 bytes. A C layout's size is a multiple of its alignment, so the
+/// units cover it exactly.
+fn foreign_aggregate_unit(align: u32, access: AggregateAccess) -> (ClifType, u32, MemFlagsData) {
+    let unit = align.min(8);
+    let clif = match unit {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        _ => types::I64,
+    };
+    let flags = match access {
+        AggregateAccess::Storage => MemFlagsData::trusted(),
+        AggregateAccess::Pointer { aligned: true } => MemFlagsData::new().with_aligned(),
+        AggregateAccess::Pointer { aligned: false } => MemFlagsData::new(),
+    };
+    (clif, unit, flags)
+}
+
+/// Applies `step` to every unit of a foreign aggregate, at each unit's byte
+/// offset as a value of `pointer` type.
+fn for_each_foreign_aggregate_unit(
+    builder: &mut FunctionBuilder,
+    size: u32,
+    unit: u32,
+    pointer: ClifType,
+    mut step: impl FnMut(&mut FunctionBuilder, Value),
+) {
+    let units = size / unit;
+    if units <= FOREIGN_AGGREGATE_UNROLLED_UNITS {
+        for index in 0..units {
+            let offset = builder.ins().iconst(pointer, i64::from(index * unit));
+            step(builder, offset);
+        }
+        return;
+    }
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(body, pointer);
+    let start = builder.ins().iconst(pointer, 0);
+    builder.ins().jump(body, &[BlockArg::Value(start)]);
+    builder.switch_to_block(body);
+    let offset = builder.block_params(body)[0];
+    step(builder, offset);
+    let next = builder.ins().iadd_imm_u(offset, i64::from(unit));
+    let more = builder
+        .ins()
+        .icmp_imm_u(IntCC::UnsignedLessThan, next, i64::from(size));
+    builder
+        .ins()
+        .brif(more, body, &[BlockArg::Value(next)], done, &[]);
+    builder.switch_to_block(done);
+}
+
+/// Copies the bytes of a foreign struct or union of type `ty` from
+/// `source` to `destination`.
+fn copy_foreign_aggregate(
+    builder: &mut FunctionBuilder,
+    destination: Value,
+    source: Value,
+    ty: mir::ForeignAggregateType,
+    access: AggregateAccess,
+    pointer: ClifType,
+) {
+    copy_foreign_bytes(
+        builder,
+        destination,
+        source,
+        ty.size,
+        ty.align,
+        access,
+        pointer,
+    );
+}
+
+/// Copies Doria storage of a foreign struct or union of type `ty`, or of
+/// its `?Name` form when `nullable`, from `source` to `destination`.
+fn copy_foreign_storage(
+    builder: &mut FunctionBuilder,
+    destination: Value,
+    source: Value,
+    ty: mir::ForeignAggregateType,
+    nullable: bool,
+    pointer: ClifType,
+) {
+    copy_foreign_bytes(
+        builder,
+        destination,
+        source,
+        ty.storage_size(nullable),
+        ty.align,
+        AggregateAccess::Storage,
+        pointer,
+    );
+}
+
+/// Copies `size` bytes of storage aligned to `align`, a multiple of its
+/// copy unit, from `source` to `destination`.
+fn copy_foreign_bytes(
+    builder: &mut FunctionBuilder,
+    destination: Value,
+    source: Value,
+    size: u32,
+    align: u32,
+    access: AggregateAccess,
+    pointer: ClifType,
+) {
+    let (clif, unit, flags) = foreign_aggregate_unit(align, access);
+    for_each_foreign_aggregate_unit(builder, size, unit, pointer, |builder, offset| {
+        let from = builder.ins().iadd(source, offset);
+        let to = builder.ins().iadd(destination, offset);
+        let value = builder.ins().load(clif, flags, from, 0);
+        builder.ins().store(flags, value, to, 0);
+    });
+}
+
+/// Sets every byte of the foreign struct or union at `address` to zero.
+fn zero_foreign_aggregate(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    ty: mir::ForeignAggregateType,
+    nullable: bool,
+    pointer: ClifType,
+) {
+    let (clif, unit, flags) = foreign_aggregate_unit(ty.align, AggregateAccess::Storage);
+    let zero = builder.ins().iconst(clif, 0);
+    let size = ty.storage_size(nullable);
+    for_each_foreign_aggregate_unit(builder, size, unit, pointer, |builder, offset| {
+        let to = builder.ins().iadd(address, offset);
+        builder.ins().store(flags, zero, to, 0);
+    });
+}
+
+/// The address of a foreign struct or union value: fresh storage for a
+/// construction or call result, or the slot of the local a copy reads,
+/// which the consumer copies from (Decision 0148 section 6).
+fn lower_foreign_aggregate_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::ForeignAggregateExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::ForeignAggregateExpression::Construct { ty, fields, span } => {
+            let address =
+                create_call_storage(builder, mir::Type::ForeignAggregate(*ty), resources)?;
+            zero_foreign_aggregate(builder, address, *ty, false, pointer);
+            for field in fields {
+                let value = lower_rvalue(builder, &field.value, resources)?;
+                let field_address = builder.ins().iadd_imm_u(address, field.offset as i64);
+                store_field_value(
+                    builder,
+                    field_address,
+                    &field.value,
+                    value,
+                    field.copied_elements,
+                    *span,
+                    resources,
+                )?;
+            }
+            Ok(address)
+        }
+        mir::ForeignAggregateExpression::Local { local, .. } => {
+            inline_local_address(builder, *local, resources)
+        }
+        mir::ForeignAggregateExpression::Property {
+            object, property, ..
+        } => lower_property_address(builder, *object, *property, resources),
+        mir::ForeignAggregateExpression::Static { id, .. } => {
+            lower_static_address(builder, *id, resources)
+        }
+        mir::ForeignAggregateExpression::Call {
+            function,
+            args,
+            span,
+            ..
+        } => lower_function_call_at(builder, *function, args, *span, resources)?
+            .ok_or_else(|| malformed_mir("a foreign aggregate call returned void"))?
+            .single(),
+        // Checking proved the `?Name` local present; its value is its
+        // payload, which the consumer copies.
+        mir::ForeignAggregateExpression::NullableLocalAssumeNonNull { ty, local } => {
+            let address = inline_local_address(builder, *local, resources)?;
+            Ok(builder
+                .ins()
+                .iadd_imm_u(address, i64::from(ty.nullable_payload_offset)))
+        }
+        mir::ForeignAggregateExpression::CollectionIndex {
+            ty,
+            collection,
+            index,
+            index_span,
+            positional,
+            remove,
+        } => lower_inline_collection_element_copy(
+            builder,
+            *collection,
+            index,
+            *index_span,
+            *positional,
+            *remove,
+            mir::Type::ForeignAggregate(*ty),
+            resources,
+        ),
+        // The element is copied out at once, so a later change to the
+        // viewed storage cannot reach the value.
+        mir::ForeignAggregateExpression::RegionIndex {
+            ty,
+            region,
+            index,
+            index_span,
+        } => {
+            let index = lower_rvalue(builder, index, resources)?.single()?;
+            let (_, address) =
+                typed_region_element(builder, *region, index, *index_span, resources)?
+                    .ok_or_else(|| malformed_mir("a typed array region has elements"))?;
+            let destination =
+                create_call_storage(builder, mir::Type::ForeignAggregate(*ty), resources)?;
+            copy_foreign_storage(builder, destination, address, *ty, false, pointer);
+            Ok(destination)
+        }
+        // The payload is copied out of the box, which a later replacement
+        // of the `mixed` local releases.
+        mir::ForeignAggregateExpression::MixedPayload { ty, mixed } => {
+            let slot = local_slot(resources.local_slots, *mixed)?;
+            let mixed = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::Mixed,
+                slot,
+                pointer,
+            )
+            .single()?;
+            let word = runtime_call(
+                builder,
+                MIXED_PAYLOAD,
+                &[pointer],
+                Some(types::I64),
+                &[mixed],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("mixed payload read produced no result"))?;
+            let address = if pointer == types::I64 {
+                word
+            } else {
+                builder.ins().ireduce(pointer, word)
+            };
+            let destination =
+                create_call_storage(builder, mir::Type::ForeignAggregate(*ty), resources)?;
+            copy_foreign_storage(builder, destination, address, *ty, false, pointer);
+            Ok(destination)
+        }
+    }
+}
+
+/// The collection local `collection`, and the position or key `index`
+/// names in it as a collection word with its type: the key of a Dictionary
+/// family unless `positional`, otherwise an `int` position.
+fn collection_element_key(
+    builder: &mut FunctionBuilder,
+    collection: mir::LocalId,
+    index: Value,
+    positional: bool,
+    index_span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(Value, mir::Type, Value), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let mir::Type::Collection(collection_type) =
+        local_definition(resources.program, resources.function_id, collection)?.ty
+    else {
+        return Err(malformed_mir(
+            "an inline collection element names a non-collection local",
+        ));
+    };
+    let key = collection_definition(resources.program, collection_type)?.key;
+    let collection = lower_collection_pointer(builder, collection, resources)?;
+    set_active_panic_site(builder, index_span, resources);
+    let index_type = match (positional, key) {
+        (false, Some(key)) => key,
+        _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+    };
+    let index_word = value_to_collection_word(builder, index, index_type, pointer)?;
+    Ok((collection, index_type, index_word))
+}
+
+/// The address of a copy of the element of type `stored` that the
+/// collection local `collection` holds inline at `index`, removing it from
+/// the collection when `remove`. A missing element panics as indexing
+/// does.
+#[allow(clippy::too_many_arguments)]
+fn lower_inline_collection_element_copy(
+    builder: &mut FunctionBuilder,
+    collection: mir::LocalId,
+    index: &mir::Rvalue,
+    index_span: crate::source::Span,
+    positional: bool,
+    remove: bool,
+    stored: mir::Type,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let storage = mir::InlineElementStorage::of(stored)
+        .ok_or_else(|| malformed_mir("an inline collection element has inline storage"))?;
+    let index_value = lower_rvalue(builder, index, resources)?.single()?;
+    let (collection, index_type, index_word) = collection_element_key(
+        builder,
+        collection,
+        index_value,
+        positional,
+        index_span,
+        resources,
+    )?;
+    let destination = create_inline_storage(builder, storage.size, storage.align, resources);
+    if remove {
+        let index = if pointer == types::I64 {
+            index_word
+        } else {
+            builder.ins().ireduce(pointer, index_word)
+        };
+        let _ = runtime_call(
+            builder,
+            COLLECTION_AGGREGATE_REMOVE_AT_INTO,
+            &[pointer, pointer, pointer, pointer],
+            None,
+            &[resources.current_frame, collection, index, destination],
+            resources,
+        )?;
+        return Ok(destination);
+    }
+    let address = lower_collection_borrow_slot(
+        builder,
+        collection,
+        index_word,
+        index_type,
+        mir::NullableCollectionAccess::Index,
+        positional,
+        resources,
+    )?;
+    if index_type == mir::Type::String {
+        release_string(builder, index_value, resources)?;
+    }
+    copy_inline_bytes(builder, destination, address, storage.size, pointer);
+    Ok(destination)
+}
+
+/// The address of a `?Name` value in the nullable inline layout of its
+/// type: fresh storage for `null` and for a present value, or the storage a
+/// copy reads, which the consumer copies from.
+fn lower_nullable_foreign_aggregate_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullableForeignAggregateExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let ty = expression.ty();
+    match expression {
+        mir::NullableForeignAggregateExpression::Null(_) => {
+            let storage = mir::Type::NullableForeignAggregate(ty);
+            let address = create_call_storage(builder, storage, resources)?;
+            zero_foreign_aggregate(builder, address, ty, true, pointer);
+            Ok(address)
+        }
+        mir::NullableForeignAggregateExpression::Present(value) => {
+            let payload = lower_foreign_aggregate_expression(builder, value, resources)?;
+            let storage = mir::Type::NullableForeignAggregate(ty);
+            let address = create_call_storage(builder, storage, resources)?;
+            zero_foreign_aggregate(builder, address, ty, true, pointer);
+            let present = builder.ins().iconst(types::I8, 1);
+            builder
+                .ins()
+                .store(MemFlagsData::trusted(), present, address, 0);
+            let destination = builder
+                .ins()
+                .iadd_imm_u(address, i64::from(ty.nullable_payload_offset));
+            copy_foreign_storage(builder, destination, payload, ty, false, pointer);
+            Ok(address)
+        }
+        mir::NullableForeignAggregateExpression::Local { local, .. } => {
+            inline_local_address(builder, *local, resources)
+        }
+        mir::NullableForeignAggregateExpression::Property {
+            object, property, ..
+        } => lower_property_address(builder, *object, *property, resources),
+        mir::NullableForeignAggregateExpression::Static { id, .. } => {
+            lower_static_address(builder, *id, resources)
+        }
+        mir::NullableForeignAggregateExpression::Call {
+            function,
+            args,
+            span,
+            ..
+        } => lower_function_call_at(builder, *function, args, *span, resources)?
+            .ok_or_else(|| malformed_mir("a nullable foreign aggregate call returned void"))?
+            .single(),
+        mir::NullableForeignAggregateExpression::CollectionIndex {
+            collection,
+            index,
+            index_span,
+            positional,
+            remove,
+            ..
+        } => lower_inline_collection_element_copy(
+            builder,
+            *collection,
+            index,
+            *index_span,
+            *positional,
+            *remove,
+            mir::Type::NullableForeignAggregate(ty),
+            resources,
+        ),
+        mir::NullableForeignAggregateExpression::CollectionGet {
+            collection,
+            key,
+            access,
+            stored_nullable,
+            index_span,
+            ..
+        } => lower_nullable_inline_collection_get(
+            builder,
+            *index_span,
+            stored_inline_element(mir::Type::ForeignAggregate(ty), *stored_nullable)?,
+            *collection,
+            key,
+            *access,
+            mir::PayloadEnumUseMode::Copy,
+            resources,
+        ),
+    }
+}
+
+/// Stores a construction's or a write's field value at its address. A
+/// fixed-length array field copies a region of exactly its element count
+/// (section 6, amended 2026-11-16 and 2026-11-17), and another length
+/// panics with P1704 at `span`.
+fn store_field_value(
+    builder: &mut FunctionBuilder,
+    field_address: Value,
+    source: &mir::Rvalue,
+    value: LoweredValue,
+    copied_elements: Option<u64>,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let Some(count) = copied_elements else {
+        return store_foreign_field(builder, source.ty(), field_address, value, resources);
+    };
+    let pointer = resources.module.target_config().pointer_type();
+    let mir::Type::Region(region) = source.ty() else {
+        return Err(malformed_mir("a copied field is supplied from a region"));
+    };
+    let (_, stride) = crate::native_abi::array_region_element(resources.program, region)
+        .ok_or_else(|| malformed_mir("a copied field views built elements"))?;
+    let (data, length) = value.byte_region()?;
+    let mismatch = builder
+        .ins()
+        .icmp_imm_u(IntCC::NotEqual, length, count as i64);
+    lower_panic_if_code(
+        builder,
+        mismatch,
+        crate::foreign::ARRAY_FIELD_LENGTH_PANIC_CODE,
+        span,
+        resources,
+    )?;
+    let stride = builder.ins().iconst(pointer, stride as i64);
+    runtime_call(
+        builder,
+        crate::native_abi::ARRAY_REGION_COPY,
+        &[pointer, pointer, pointer, pointer, pointer],
+        Some(pointer),
+        &[field_address, length, data, length, stride],
+        resources,
+    )?;
+    Ok(())
+}
+
+/// Stores a field value at its address inside a foreign struct or union.
+/// `bool` is the C `_Bool` byte, 0 or 1, as every Doria `bool` is stored.
+fn store_foreign_field(
+    builder: &mut FunctionBuilder,
+    ty: mir::Type,
+    address: Value,
+    value: LoweredValue,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    store_lowered_to_address(builder, resources.program, ty, address, value, pointer)
+}
+
+/// The payload of the `?T` value of type `ty` stored at `address`, which
+/// checking or a null-safe test found present.
+fn narrowed_payload_address(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    ty: mir::Type,
+    pointer: cranelift_codegen::ir::Type,
+) -> Result<Value, BackendError> {
+    let payload = native_closure_abi::nullable_payload_offset(ty, pointer.bytes())
+        .ok_or_else(|| malformed_mir("a narrowed place holds no nullable inline value"))?;
+    Ok(builder.ins().iadd_imm_u(address, i64::from(payload)))
+}
+
+/// The address of the storage `place` names: a writable home's place for a
+/// local that borrows one, and the slot, property, static or element
+/// otherwise. Field access and `Pointer::to` share it.
+fn inline_place_address(
+    builder: &mut FunctionBuilder,
+    place: mir::InlinePlace,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    Ok(match place {
+        mir::InlinePlace::Local(local) => inline_local_address(builder, local, resources)?,
+        // Checking proved the `?Name` or `?T` local present; the value is
+        // its payload.
+        mir::InlinePlace::NullableLocalAssumeNonNull(local) => {
+            let address = inline_local_address(builder, local, resources)?;
+            let ty = local_definition(resources.program, resources.function_id, local)?.ty;
+            narrowed_payload_address(builder, address, ty, pointer)?
+        }
+        mir::InlinePlace::NullablePropertyAssumeNonNull { object, property } => {
+            let ty = property_definition(resources.program, property)?.ty;
+            let address = lower_property_address(builder, object, property, resources)?;
+            narrowed_payload_address(builder, address, ty, pointer)?
+        }
+        mir::InlinePlace::NullableStaticAssumeNonNull(id) => {
+            let ty = static_definition(resources.program, id)?.ty;
+            let address = lower_static_address(builder, id, resources)?;
+            narrowed_payload_address(builder, address, ty, pointer)?
+        }
+        mir::InlinePlace::Property { object, property } => {
+            lower_property_address(builder, object, property, resources)?
+        }
+        mir::InlinePlace::Static(id) => lower_static_address(builder, id, resources)?,
+        // The element's slot in the collection's storage, which a field
+        // write changes in place; a `?Name` element the enclosing null-safe
+        // access found present is its payload.
+        mir::InlinePlace::CollectionElement {
+            collection,
+            index,
+            positional,
+            index_span,
+        }
+        | mir::InlinePlace::NullableCollectionElementAssumeNonNull {
+            collection,
+            index,
+            positional,
+            index_span,
+        } => {
+            let collection_type =
+                local_definition(resources.program, resources.function_id, collection)?.ty;
+            let index_type = local_definition(resources.program, resources.function_id, index)?.ty;
+            let index_slot = local_slot(resources.local_slots, index)?;
+            let index = load_lowered_from_stack(
+                builder,
+                resources.program,
+                index_type,
+                index_slot,
+                pointer,
+            )
+            .single()?;
+            let (collection, index_type, index_word) = collection_element_key(
+                builder, collection, index, positional, index_span, resources,
+            )?;
+            let slot = lower_collection_borrow_slot(
+                builder,
+                collection,
+                index_word,
+                index_type,
+                mir::NullableCollectionAccess::Index,
+                positional,
+                resources,
+            )?;
+            if place.nullable_holder().is_some() {
+                let mir::Type::Collection(id) = collection_type else {
+                    return Err(malformed_mir("an element place names no collection"));
+                };
+                let element = collection_definition(resources.program, id)?.value;
+                narrowed_payload_address(builder, slot, element, pointer)?
+            } else {
+                slot
+            }
+        }
+        mir::InlinePlace::RegionElement {
+            region,
+            index,
+            index_span,
+        } => {
+            let index_slot = local_slot(resources.local_slots, index)?;
+            let index = builder.ins().stack_load(pointer, types::I64, index_slot, 0);
+            typed_region_element(builder, region, index, index_span, resources)?
+                .ok_or_else(|| malformed_mir("a typed array region has elements"))?
+                .1
+        }
+    })
+}
+
+/// One field read or write of the foreign struct or union in `aggregate`'s
+/// slot, `offset` bytes from its start.
+fn lower_foreign_field(
+    builder: &mut FunctionBuilder,
+    aggregate: mir::InlinePlace,
+    offset: u64,
+    access: &mir::ForeignFieldAccess,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let base = inline_place_address(builder, aggregate, resources)?;
+    let address = builder.ins().iadd_imm_u(base, offset as i64);
+    match access {
+        mir::ForeignFieldAccess::Read { target } => {
+            let ty = local_definition(resources.program, resources.function_id, *target)?.ty;
+            let value = load_lowered_from_address(builder, resources.program, ty, address, pointer);
+            let value = normalize_foreign_bool(builder, ty, value)?;
+            let target_slot = local_slot(resources.local_slots, *target)?;
+            store_lowered_to_stack(builder, resources.program, ty, target_slot, value, pointer)
+        }
+        mir::ForeignFieldAccess::Write {
+            value,
+            copied_elements,
+        } => {
+            let lowered = lower_rvalue(builder, value, resources)?;
+            store_field_value(
+                builder,
+                address,
+                value,
+                lowered,
+                *copied_elements,
+                span,
+                resources,
+            )
+        }
+        mir::ForeignFieldAccess::Region { target, length } => {
+            let ty = local_definition(resources.program, resources.function_id, *target)?.ty;
+            let length = builder.ins().iconst(pointer, *length as i64);
+            let target_slot = local_slot(resources.local_slots, *target)?;
+            store_lowered_to_stack(
+                builder,
+                resources.program,
+                ty,
+                target_slot,
+                LoweredValue::ByteRegion {
+                    data: address,
+                    length,
+                },
+                pointer,
+            )
+        }
+    }
+}
+
+/// A `_Bool` read from C memory is true for any nonzero byte (an
+/// assumption on record for pointer reads, applied to fields alike).
+fn normalize_foreign_bool(
+    builder: &mut FunctionBuilder,
+    ty: mir::Type,
+    value: LoweredValue,
+) -> Result<LoweredValue, BackendError> {
+    if ty != mir::Type::Scalar(mir::ScalarType::Bool) {
+        return Ok(value);
+    }
+    let byte = value.single()?;
+    let truth = builder.ins().icmp_imm_u(IntCC::NotEqual, byte, 0);
+    Ok(LoweredValue::Single(truth))
 }
 
 fn zero_inline_bytes(builder: &mut FunctionBuilder, address: Value, size: u32, pointer: ClifType) {
@@ -10753,7 +11951,7 @@ fn lower_nullable_aggregate_collection_get(
         && (definition.value.has_move_ownership()
             || matches!(
                 definition.value,
-                mir::Type::ByteRegion(_) | mir::Type::NullableByteRegion(_)
+                mir::Type::Region(_) | mir::Type::NullableRegion(_)
             ))
     {
         let address = lower_collection_borrow_slot(
@@ -10767,7 +11965,7 @@ fn lower_nullable_aggregate_collection_get(
             address,
             definition.value,
             match definition.value {
-                mir::Type::ByteRegion(kind) => mir::Type::NullableByteRegion(kind),
+                mir::Type::Region(kind) => mir::Type::NullableRegion(kind),
                 ty => ty,
             },
             resources,
@@ -10836,7 +12034,7 @@ fn lower_nullable_aggregate_collection_get(
         }
     }
     let result_type = match definition.value {
-        mir::Type::ByteRegion(_) => {
+        mir::Type::Region(_) => {
             let (data, length) = load_lowered_from_address(
                 builder,
                 resources.program,
@@ -10852,7 +12050,7 @@ fn lower_nullable_aggregate_collection_get(
                 length,
             });
         }
-        ty @ mir::Type::NullableByteRegion(_) => ty,
+        ty @ mir::Type::NullableRegion(_) => ty,
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {
             let payload = match definition.value {
                 mir::Type::Scalar(_) => load_lowered_from_address(
@@ -11093,14 +12291,13 @@ fn lower_nullable_payload_enum_expression(
             stored_nullable,
             mode,
             ..
-        } => lower_nullable_payload_enum_collection_get(
+        } => lower_nullable_inline_collection_get(
             builder,
             *index_span,
-            ty,
+            stored_inline_element(mir::Type::PayloadEnum(ty), *stored_nullable)?,
             *collection,
             key,
             *access,
-            *stored_nullable,
             *mode,
             resources,
         ),
@@ -11165,15 +12362,48 @@ fn lower_nullable_payload_enum_expression(
     }
 }
 
+/// The inline storage of the collection elements of type `value`, stored
+/// as `?value` when `stored_nullable`.
+fn stored_inline_element(
+    value: mir::Type,
+    stored_nullable: bool,
+) -> Result<mir::InlineElementStorage, BackendError> {
+    mir::InlineElementStorage::of(value)
+        .map(|storage| storage.with_nullable(stored_nullable))
+        .ok_or_else(|| malformed_mir("an inline collection element has inline storage"))
+}
+
+/// Fresh stack storage of `size` bytes aligned to `align`.
+fn create_inline_storage(
+    builder: &mut FunctionBuilder,
+    size: u32,
+    align: u32,
+    resources: &LoweringResources<'_, '_>,
+) -> Value {
+    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        size,
+        align.trailing_zeros() as u8,
+    ));
+    builder
+        .ins()
+        .stack_addr(resources.module.target_config().pointer_type(), slot, 0)
+}
+
+/// An element of the collection `collection` that may be absent, as the
+/// address of its value in the nullable inline layout: `get`, `pop` and the
+/// Deque and Dictionary accessors `access` names. `storage` is how the
+/// collection stores its elements. A payload enum element is borrowed or
+/// copied as `mode` says; a foreign struct or union is always copied
+/// (`Copy`), and has no managed fields to retain.
 #[allow(clippy::too_many_arguments)]
-fn lower_nullable_payload_enum_collection_get(
+fn lower_nullable_inline_collection_get(
     builder: &mut FunctionBuilder,
     index_span: crate::source::Span,
-    ty: mir::PayloadEnumType,
+    storage: mir::InlineElementStorage,
     collection: mir::LocalId,
     key: &mir::Rvalue,
     access: mir::NullableCollectionAccess,
-    stored_nullable: bool,
     mode: mir::PayloadEnumUseMode,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
@@ -11181,7 +12411,7 @@ fn lower_nullable_payload_enum_collection_get(
     let local = local_definition(resources.program, resources.function_id, collection)?;
     let mir::Type::Collection(collection_type) = local.ty else {
         return Err(malformed_mir(
-            "payload enum nullable access uses a non-collection local",
+            "an inline element nullable access uses a non-collection local",
         ));
     };
     let definition = collection_definition(resources.program, collection_type)?.clone();
@@ -11192,7 +12422,9 @@ fn lower_nullable_payload_enum_collection_get(
     let key_value = lower_rvalue(builder, key, resources)?.single()?;
     set_active_panic_site(builder, index_span, resources);
     let key_word = value_to_collection_word(builder, key_value, key_type, pointer)?;
-    if !access.removes_element() && matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+    if let (Some(ty), false, mir::PayloadEnumUseMode::Borrow) =
+        (storage.payload_enum, access.removes_element(), mode)
+    {
         let address = lower_collection_borrow_slot(
             builder, collection, key_word, key_type, access, false, resources,
         )?;
@@ -11208,8 +12440,8 @@ fn lower_nullable_payload_enum_collection_get(
         )?
         .single();
     }
-    let raw = create_payload_storage(builder, ty, stored_nullable, resources);
-    zero_inline_bytes(builder, raw, ty.storage_size(stored_nullable), pointer);
+    let raw = create_inline_storage(builder, storage.size, storage.align, resources);
+    zero_inline_bytes(builder, raw, storage.size, pointer);
     let found_slot =
         builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
     let found_pointer = builder.ins().stack_addr(pointer, found_slot, 0);
@@ -11225,7 +12457,7 @@ fn lower_nullable_payload_enum_collection_get(
             malformed_mir("aggregate nullable index must use the direct index path")
         })?),
     );
-    let stored_nullable_value = builder.ins().iconst(types::I8, i64::from(stored_nullable));
+    let stored_nullable_value = builder.ins().iconst(types::I8, i64::from(storage.nullable));
     let _ = runtime_call(
         builder,
         COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO,
@@ -11263,10 +12495,10 @@ fn lower_nullable_payload_enum_collection_get(
             release_string(builder, removed_key, resources)?;
         }
     }
-    let result = create_payload_storage(builder, ty, true, resources);
-    zero_inline_bytes(builder, result, ty.nullable_size, pointer);
-    if stored_nullable {
-        copy_inline_bytes(builder, result, raw, ty.nullable_size, pointer);
+    let result = create_inline_storage(builder, storage.nullable_size, storage.align, resources);
+    zero_inline_bytes(builder, result, storage.nullable_size, pointer);
+    if storage.nullable {
+        copy_inline_bytes(builder, result, raw, storage.nullable_size, pointer);
     } else {
         let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
         builder.ins().store(
@@ -11277,12 +12509,11 @@ fn lower_nullable_payload_enum_collection_get(
         );
         let destination = builder
             .ins()
-            .iadd_imm_u(result, i64::from(ty.nullable_payload_offset));
-        copy_inline_bytes(builder, destination, raw, ty.size, pointer);
+            .iadd_imm_u(result, i64::from(storage.nullable_payload_offset));
+        copy_inline_bytes(builder, destination, raw, storage.value_size, pointer);
     }
-    let mutating = access.removes_element();
-    if !mutating && matches!(mode, mir::PayloadEnumUseMode::Copy) {
-        retain_payload_enum_at(builder, result, ty, true, resources)?;
+    if !access.removes_element() && matches!(mode, mir::PayloadEnumUseMode::Copy) {
+        retain_inline_element_at(builder, result, storage.with_nullable(true), resources)?;
     }
     Ok(result)
 }
@@ -11379,6 +12610,13 @@ fn lower_payload_enum_place(
             resources,
         )?;
         return Ok(destination);
+    }
+    // A writable home's slot is its working copy; a call that received the
+    // same home may have changed it, so the copy is reloaded before use.
+    if let mir::PayloadEnumPlace::Local(local)
+    | mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) = place
+    {
+        refresh_borrowed_local(builder, *local, resources)?;
     }
     let (source, narrowed_nullable_source) = match place {
         mir::PayloadEnumPlace::Local(local) => (
@@ -11581,6 +12819,34 @@ fn retain_payload_enum_at(
             _ => Ok(()),
         },
     )
+}
+
+/// Drops the collection element at `address` stored as `storage`: a
+/// payload enum runs its drop glue, and a foreign struct or union has none.
+fn lower_drop_inline_element_at(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    storage: mir::InlineElementStorage,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    match storage.payload_enum {
+        Some(ty) => lower_drop_payload_enum_at(builder, address, ty, storage.nullable, resources),
+        None => Ok(()),
+    }
+}
+
+/// Retains the managed fields of the copied collection element at
+/// `address` stored as `storage`; a foreign struct or union has none.
+fn retain_inline_element_at(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    storage: mir::InlineElementStorage,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    match storage.payload_enum {
+        Some(ty) => retain_payload_enum_at(builder, address, ty, storage.nullable, resources),
+        None => Ok(()),
+    }
 }
 
 fn lower_drop_payload_enum_at(
@@ -12131,7 +13397,11 @@ fn lower_drop_value_at_address(
             let done = builder.create_block();
             builder.ins().brif(present, some, &[], done, &[]);
             builder.switch_to_block(some);
-            let offset = native_closure_abi::type_layout(ty, pointer.bytes()).align;
+            let offset = native_closure_abi::nullable_scalar_form(
+                mir::ScalarType::Inline(inline),
+                pointer.bytes(),
+            )
+            .payload_offset();
             let value = builder
                 .ins()
                 .load(types::I64, flags, address, offset as i32);
@@ -12142,8 +13412,10 @@ fn lower_drop_value_at_address(
         }
         mir::Type::Scalar(_)
         | mir::Type::NullableScalar(_)
-        | mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_) => Ok(()),
+        | mir::Type::Region(_)
+        | mir::Type::NullableRegion(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => Ok(()),
         mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
             "closure environment pointer reached ordinary value cleanup",
         )),
@@ -12307,10 +13579,12 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         )),
         mir::Type::Function(_)
         | mir::Type::NullableFunction(_)
-        | mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_)
+        | mir::Type::Region(_)
+        | mir::Type::NullableRegion(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
-            "function, region, and closure-environment values do not support collection comparison",
+            "function, region, foreign aggregate and closure-environment values do not support collection comparison",
         )),
     }
 }
@@ -12380,8 +13654,10 @@ fn value_to_collection_word(
         | mir::Type::NullablePayloadEnum(_)
         | mir::Type::Function(_)
         | mir::Type::NullableFunction(_)
-        | mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_)
+        | mir::Type::Region(_)
+        | mir::Type::NullableRegion(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "aggregate values cannot use scalar collection word transport",
@@ -12454,8 +13730,10 @@ fn collection_word_to_value(
         | mir::Type::NullablePayloadEnum(_)
         | mir::Type::Function(_)
         | mir::Type::NullableFunction(_)
-        | mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_)
+        | mir::Type::Region(_)
+        | mir::Type::NullableRegion(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_)
         | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "aggregate values cannot use scalar collection word transport",
@@ -12464,12 +13742,12 @@ fn collection_word_to_value(
     })
 }
 
-const fn payload_enum_storage(ty: mir::Type) -> Option<(mir::PayloadEnumType, bool)> {
-    match ty {
-        mir::Type::PayloadEnum(ty) => Some((ty, false)),
-        mir::Type::NullablePayloadEnum(ty) => Some((ty, true)),
-        _ => None,
-    }
+/// The payload enum, and its stored nullability, of collection elements
+/// of type `ty`. Search compares elements, so only a payload enum, which
+/// has generated equality, reaches it; a foreign struct or union has none.
+fn searched_payload_enum(ty: mir::Type) -> Option<(mir::PayloadEnumType, bool)> {
+    let storage = mir::InlineElementStorage::of(ty)?;
+    Some((storage.payload_enum?, storage.nullable))
 }
 
 fn payload_enum_rvalue_is_owned(value: &mir::Rvalue) -> bool {
@@ -12565,12 +13843,11 @@ fn lower_payload_enum_collection_search(
     Ok((builder.block_params(done)[0], builder.block_params(done)[1]))
 }
 
-fn lower_payload_enum_collection_literal(
+fn lower_inline_collection_literal(
     builder: &mut FunctionBuilder,
     definition: &mir::CollectionType,
     entries: &[mir::CollectionEntry],
-    ty: mir::PayloadEnumType,
-    nullable: bool,
+    storage: mir::InlineElementStorage,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
@@ -12580,10 +13857,8 @@ fn lower_payload_enum_collection_literal(
         .ins()
         .iconst(types::I8, i64::from(definition.key.is_some()));
     let fixed_value = builder.ins().iconst(types::I8, i64::from(fixed));
-    let value_size = builder
-        .ins()
-        .iconst(pointer, i64::from(ty.storage_size(nullable)));
-    let value_alignment = builder.ins().iconst(pointer, i64::from(ty.align));
+    let value_size = builder.ins().iconst(pointer, i64::from(storage.size));
+    let value_alignment = builder.ins().iconst(pointer, i64::from(storage.align));
     let kind = builder.ins().iconst(
         types::I8,
         i64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
@@ -12628,9 +13903,7 @@ fn lower_payload_enum_collection_literal(
         let source = lower_rvalue(builder, &entry.value, resources)?.single()?;
         let destination = if let (Some(key_ty), Some(key)) = (definition.key, &entry.key) {
             let key = lower_rvalue(builder, key, resources)?.single()?;
-            lower_aggregate_dictionary_write_slot(
-                builder, result, key, key_ty, ty, nullable, resources,
-            )?
+            lower_aggregate_dictionary_write_slot(builder, result, key, key_ty, storage, resources)?
         } else if fixed {
             let index = builder.ins().iconst(types::I64, index as i64);
             let positional = builder.ins().iconst(types::I8, 1);
@@ -12657,13 +13930,7 @@ fn lower_payload_enum_collection_literal(
             )?
             .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
         };
-        copy_inline_bytes(
-            builder,
-            destination,
-            source,
-            ty.storage_size(nullable),
-            pointer,
-        );
+        copy_inline_bytes(builder, destination, source, storage.size, pointer);
     }
     if stage26_collection_kind(definition.kind).is_some() {
         let _ = runtime_call(
@@ -12841,8 +14108,7 @@ fn lower_aggregate_dictionary_write_slot(
     collection: Value,
     key: Value,
     key_type: mir::Type,
-    value_type: mir::PayloadEnumType,
-    nullable_value: bool,
+    storage: mir::InlineElementStorage,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
@@ -12871,7 +14137,7 @@ fn lower_aggregate_dictionary_write_slot(
     let done = builder.create_block();
     builder.ins().brif(has_old, drop_block, &[], done, &[]);
     builder.switch_to_block(drop_block);
-    lower_drop_payload_enum_at(builder, destination, value_type, nullable_value, resources)?;
+    lower_drop_inline_element_at(builder, destination, storage, resources)?;
     lower_drop_stored_value(builder, key, key_type, resources)?;
     builder.ins().jump(done, &[]);
     builder.switch_to_block(done);
@@ -12939,13 +14205,12 @@ fn lower_collection_expression(
                     resources,
                 );
             }
-            if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
-                return lower_payload_enum_collection_literal(
+            if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
+                return lower_inline_collection_literal(
                     builder,
                     &definition,
                     entries,
-                    ty,
-                    nullable,
+                    storage,
                     resources,
                 );
             }
@@ -13275,7 +14540,7 @@ fn lower_collection_expression(
             let fixed = builder.ins().iconst(types::I8, i64::from(fixed));
             let aggregate =
                 type_uses_aggregate_collection_storage(resources.program, definition.value)
-                    || payload_enum_storage(definition.value).is_some();
+                    || mir::InlineElementStorage::of(definition.value).is_some();
             let nullable = matches!(definition.value, mir::Type::NullableScalar(_));
             if aggregate || nullable {
                 let layout = native_closure_abi::value_layout(
@@ -13469,6 +14734,11 @@ fn lower_collection_expression(
             release_string(builder, path, resources)?;
             Ok(result)
         }
+        mir::CollectionExpression::ForeignString {
+            collection,
+            text,
+            span,
+        } => lower_foreign_string_construction(builder, *collection, text, *span, false, resources),
         mir::CollectionExpression::ReadStdinBytes { .. } => runtime_call(
             builder,
             READ_STDIN_BYTES,
@@ -13489,6 +14759,43 @@ fn lower_collection_expression(
     }
 }
 
+/// `CString::from`, `Utf16String::from` and their `tryFrom` forms
+/// (Decision 0148 section 9): the runtime copies the text into a new
+/// NUL-terminated buffer, the value. `from` panics at `span` for text with
+/// NUL; `tryFrom` (`fallible`) gives null instead.
+fn lower_foreign_string_construction(
+    builder: &mut FunctionBuilder,
+    collection: mir::CollectionTypeId,
+    text: &mir::StringExpression,
+    span: crate::source::Span,
+    fallible: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let mir::CollectionKind::ForeignString(encoding) =
+        collection_definition(resources.program, collection)?.kind
+    else {
+        return Err(malformed_mir(
+            "a foreign string construction builds a CString or Utf16String",
+        ));
+    };
+    let text = lower_string_expression(builder, text, resources)?;
+    if !fallible {
+        set_active_panic_site(builder, span, resources);
+    }
+    let result = runtime_call(
+        builder,
+        crate::native_abi::foreign_string_constructor(encoding, fallible),
+        &[pointer, pointer],
+        Some(pointer),
+        &[resources.current_frame, text],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("a foreign string construction produced no result"))?;
+    release_string(builder, text, resources)?;
+    Ok(result)
+}
+
 fn lower_nullable_collection_expression(
     builder: &mut FunctionBuilder,
     expression: &mir::NullableCollectionExpression,
@@ -13497,6 +14804,16 @@ fn lower_nullable_collection_expression(
     let pointer = resources.module.target_config().pointer_type();
     match expression {
         mir::NullableCollectionExpression::Null(_) => Ok(builder.ins().iconst(pointer, 0)),
+        mir::NullableCollectionExpression::TryForeignString { collection, text } => {
+            lower_foreign_string_construction(
+                builder,
+                *collection,
+                text,
+                crate::source::Span::default(),
+                true,
+                resources,
+            )
+        }
         mir::NullableCollectionExpression::Collection(value) => {
             lower_collection_expression(builder, value, resources)
         }
@@ -14167,10 +15484,10 @@ fn lower_collection_add(
         )?;
         return Ok(());
     }
-    if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
+    if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
         if op == mir::CollectionMutationOp::Remove {
             return Err(malformed_mir(
-                "payload enum remove-by-value requires generated enum equality",
+                "inline element remove-by-value requires generated equality",
             ));
         }
         let source = lower_rvalue(builder, value, resources)?.single()?;
@@ -14210,13 +15527,7 @@ fn lower_collection_add(
             )?
             .ok_or_else(|| backend_failure("aggregate insertion produced no slot"))?
         };
-        copy_inline_bytes(
-            builder,
-            destination,
-            source,
-            ty.storage_size(nullable),
-            pointer,
-        );
+        copy_inline_bytes(builder, destination, source, storage.size, pointer);
         return Ok(());
     }
     if nullable_payload_type(definition.value).is_some()
@@ -14750,7 +16061,7 @@ fn lower_collection_set(
         )?;
         return Ok(());
     }
-    if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
+    if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
         let replacement = lower_rvalue(builder, value, resources)?.single()?;
         set_active_panic_site(builder, index_span, resources);
         let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
@@ -14759,8 +16070,7 @@ fn lower_collection_set(
                 collection_value,
                 index,
                 key_type,
-                ty,
-                nullable,
+                storage,
                 resources,
             )?
         } else {
@@ -14788,16 +16098,10 @@ fn lower_collection_set(
                 resources,
             )?
             .ok_or_else(|| backend_failure("aggregate collection write produced no slot"))?;
-            lower_drop_payload_enum_at(builder, destination, ty, nullable, resources)?;
+            lower_drop_inline_element_at(builder, destination, storage, resources)?;
             destination
         };
-        copy_inline_bytes(
-            builder,
-            destination,
-            replacement,
-            ty.storage_size(nullable),
-            pointer,
-        );
+        copy_inline_bytes(builder, destination, replacement, storage.size, pointer);
         return Ok(());
     }
     if let Some(payload_ty) = nullable_payload_type(definition.value) {
@@ -14994,8 +16298,14 @@ fn retain_copied_collection_claims(
     // Word-copy runtime operations retain strings themselves; inline claims
     // use the same typed lifetime glue as ordinary owning assignments.
     let value_claim = definition.value.managed_inline_carrier();
-    let payload_claim =
-        payload_enum_storage(definition.value).filter(|(ty, _)| ty.capabilities.needs_drop);
+    // Only a payload enum element has managed fields; a foreign struct or
+    // union element is bytes.
+    let payload_claim = mir::InlineElementStorage::of(definition.value).and_then(|storage| {
+        storage
+            .payload_enum
+            .filter(|ty| ty.capabilities.needs_drop)
+            .map(|ty| (ty, storage.nullable))
+    });
     let key_claim = definition.key.and_then(mir::Type::managed_inline_carrier);
     if key_claim.is_some_and(|(_, nullable)| nullable) {
         return Err(malformed_mir(
@@ -15121,13 +16431,12 @@ fn lower_set_from(
         retain_copied_collection_claims(builder, result, &target_definition, resources)?;
         return Ok(result);
     }
-    if let Some((ty, nullable)) = payload_enum_storage(target_definition.value) {
-        return lower_payload_enum_collection_from(
+    if let Some(storage) = mir::InlineElementStorage::of(target_definition.value) {
+        return lower_inline_collection_from(
             builder,
             &target_definition,
             source_value,
-            ty,
-            nullable,
+            storage,
             resources,
         );
     }
@@ -15298,12 +16607,11 @@ fn lower_set_from(
     Ok(target_value)
 }
 
-fn lower_payload_enum_collection_from(
+fn lower_inline_collection_from(
     builder: &mut FunctionBuilder,
     target: &mir::CollectionType,
     source: Value,
-    ty: mir::PayloadEnumType,
-    nullable: bool,
+    storage: mir::InlineElementStorage,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
@@ -15322,10 +16630,8 @@ fn lower_payload_enum_collection_from(
         .ins()
         .iconst(types::I8, i64::from(target.key.is_some()));
     let fixed = builder.ins().iconst(types::I8, 0);
-    let value_size = builder
-        .ins()
-        .iconst(pointer, i64::from(ty.storage_size(nullable)));
-    let value_alignment = builder.ins().iconst(pointer, i64::from(ty.align));
+    let value_size = builder.ins().iconst(pointer, i64::from(storage.size));
+    let value_alignment = builder.ins().iconst(pointer, i64::from(storage.align));
     let kind_value = builder.ins().iconst(types::I8, i64::from(kind));
     let comparator = builder.ins().iconst(
         types::I8,
@@ -15412,9 +16718,7 @@ fn lower_payload_enum_collection_from(
         if key_ty == mir::Type::String {
             key = retain_string(builder, key, resources)?;
         }
-        lower_aggregate_dictionary_write_slot(
-            builder, result, key, key_ty, ty, nullable, resources,
-        )?
+        lower_aggregate_dictionary_write_slot(builder, result, key, key_ty, storage, resources)?
     } else {
         runtime_call(
             builder,
@@ -15426,14 +16730,8 @@ fn lower_payload_enum_collection_from(
         )?
         .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
     };
-    copy_inline_bytes(
-        builder,
-        destination,
-        source_slot,
-        ty.storage_size(nullable),
-        pointer,
-    );
-    retain_payload_enum_at(builder, destination, ty, nullable, resources)?;
+    copy_inline_bytes(builder, destination, source_slot, storage.size, pointer);
+    retain_inline_element_at(builder, destination, storage, resources)?;
     let one = builder.ins().iconst(pointer, 1);
     let next = builder.ins().iadd(index, one);
     builder.ins().jump(header, &[BlockArg::Value(next)]);
@@ -15548,8 +16846,10 @@ fn lower_drop_stored_value(
         }
         mir::Type::Scalar(_)
         | mir::Type::NullableScalar(_)
-        | mir::Type::ByteRegion(_)
-        | mir::Type::NullableByteRegion(_) => Ok(()),
+        | mir::Type::Region(_)
+        | mir::Type::NullableRegion(_)
+        | mir::Type::ForeignAggregate(_)
+        | mir::Type::NullableForeignAggregate(_) => Ok(()),
         mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
             "closure environment pointer reached stored-value cleanup",
         )),
@@ -15607,15 +16907,19 @@ fn lower_finish_collection_value(
     let done = builder.create_block();
     builder.ins().brif(present, drop_block, &[], done, &[]);
     builder.switch_to_block(drop_block);
-    if definition.kind == mir::CollectionKind::Bytes {
+    if let mir::CollectionKind::Bytes | mir::CollectionKind::ForeignString(_) = definition.kind {
         if action != CollectionStorageAction::Free {
             return Err(malformed_mir(
-                "Bytes cannot be cleared as a named collection",
+                "Bytes and foreign strings cannot be cleared as a named collection",
             ));
         }
         let _ = runtime_call(
             builder,
-            BYTES_FREE,
+            if definition.kind == mir::CollectionKind::Bytes {
+                BYTES_FREE
+            } else {
+                crate::native_abi::FOREIGN_STRING_FREE
+            },
             &[pointer],
             None,
             &[collection],
@@ -15630,8 +16934,10 @@ fn lower_finish_collection_value(
             definition.value,
             mir::Type::Scalar(_)
                 | mir::Type::NullableScalar(_)
-                | mir::Type::ByteRegion(_)
-                | mir::Type::NullableByteRegion(_)
+                | mir::Type::Region(_)
+                | mir::Type::NullableRegion(_)
+                | mir::Type::ForeignAggregate(_)
+                | mir::Type::NullableForeignAggregate(_)
         );
     let scalar_keys = definition.key.is_none_or(|key| {
         matches!(key, mir::Type::Scalar(_)) && !native_closure_abi::needs_drop(key)
@@ -15715,7 +17021,7 @@ fn lower_finish_collection_value(
         )?
         .ok_or_else(|| backend_failure("aggregate collection value read produced no slot"))?;
         lower_drop_value_at_address(builder, definition.value, value, resources)?;
-    } else if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
+    } else if let Some(storage) = mir::InlineElementStorage::of(definition.value) {
         let index_word = if pointer == types::I64 {
             index
         } else {
@@ -15740,7 +17046,7 @@ fn lower_finish_collection_value(
             resources,
         )?
         .ok_or_else(|| backend_failure("aggregate collection value read produced no slot"))?;
-        lower_drop_payload_enum_at(builder, value, ty, nullable, resources)?;
+        lower_drop_inline_element_at(builder, value, storage, resources)?;
     } else {
         let value_word = runtime_call(
             builder,
@@ -17857,11 +19163,9 @@ fn retain_inline_value_at(
         let done = builder.create_block();
         builder.ins().brif(present, some, &[], done, &[]);
         builder.switch_to_block(some);
-        let offset = native_closure_abi::type_layout(
-            mir::Type::NullableScalar(mir::ScalarType::Inline(ty)),
-            pointer.bytes(),
-        )
-        .align;
+        let offset =
+            native_closure_abi::nullable_scalar_form(mir::ScalarType::Inline(ty), pointer.bytes())
+                .payload_offset();
         let payload = builder.ins().iadd_imm_u(address, i64::from(offset));
         retain_inline_value_at(builder, payload, ty, false, resources)?;
         builder.ins().jump(done, &[]);
@@ -18246,6 +19550,9 @@ fn mixed_tag_value(tag: mir::MixedTag) -> (u8, u32) {
         mir::MixedTag::Inline(ty) => (MIXED_TAG_INLINE, ty.type_id()),
         mir::MixedTag::PayloadEnum(ty) => (MIXED_TAG_PAYLOAD_ENUM, ty.id.0 as u32),
         mir::MixedTag::Function(ty) => (MIXED_TAG_FUNCTION, ty.0 as u32),
+        mir::MixedTag::Pointer(ty) => (MIXED_TAG_POINTER, ty.0 as u32),
+        mir::MixedTag::Boundary(boundary) => (MIXED_TAG_BOUNDARY, boundary as u32),
+        mir::MixedTag::ForeignAggregate(ty) => (MIXED_TAG_FOREIGN_AGGREGATE, ty.id.0 as u32),
     }
 }
 
@@ -18343,16 +19650,28 @@ fn lower_mixed_expression(
         } => lower_function_call_at(builder, *function, args, *span, resources)
             .and_then(|value| value.ok_or_else(|| malformed_mir("mixed call produced no result")))
             .and_then(LoweredValue::single),
-        mir::MixedExpression::BoxValue(value) => {
-            let tag = match value.ty() {
-                mir::ScalarType::Bool => mir::MixedTag::Bool,
-                mir::ScalarType::Integer(ty) => mir::MixedTag::Integer(ty),
-                mir::ScalarType::Float(ty) => mir::MixedTag::Float(ty),
-                mir::ScalarType::Enum(enum_id) => mir::MixedTag::Enum(enum_id),
-                mir::ScalarType::Inline(ty) => mir::MixedTag::Inline(ty),
-            };
+        mir::MixedExpression::BoxValue { value, tag } => {
             let payload = lower_value_expression(builder, value, resources)?;
-            lower_mixed_box(builder, tag, payload, false, resources)
+            lower_mixed_box(builder, *tag, payload, false, resources)
+        }
+        // The box copies the C layout from the value's address.
+        mir::MixedExpression::BoxForeignAggregate(value) => {
+            let ty = value.ty();
+            let source = lower_foreign_aggregate_expression(builder, value, resources)?;
+            let (tag, type_id) = mixed_tag_value(mir::MixedTag::ForeignAggregate(ty));
+            let tag = builder.ins().iconst(types::I8, i64::from(tag));
+            let type_id = builder.ins().iconst(types::I32, i64::from(type_id));
+            let size = builder.ins().iconst(pointer, i64::from(ty.size));
+            let align = builder.ins().iconst(pointer, i64::from(ty.align));
+            runtime_call(
+                builder,
+                MIXED_NEW_AGGREGATE_BORROWED,
+                &[types::I8, types::I32, pointer, pointer, pointer],
+                Some(pointer),
+                &[tag, type_id, source, size, align],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("mixed foreign aggregate allocation produced no result"))
         }
         mir::MixedExpression::BoxString {
             value,
@@ -19698,13 +21017,26 @@ fn lower_nullable_scalar_expression(
             )?;
             Ok(LoweredValue::Nullable { present, payload })
         }
+        mir::NullableScalarExpression::RegionIndex {
+            region,
+            index,
+            index_span,
+            ..
+        } => lower_typed_region_element_value(
+            builder,
+            *region,
+            index,
+            *index_span,
+            mir::Type::NullableScalar(ty),
+            resources,
+        ),
         mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
             let local = local_definition(resources.program, resources.function_id, *collection)?;
             let mir::Type::Collection(collection_type) = local.ty else {
                 return Err(malformed_mir("List::indexOf uses a non-collection local"));
             };
             let definition = collection_definition(resources.program, collection_type)?.clone();
-            if let Some((payload, nullable)) = payload_enum_storage(definition.value) {
+            if let Some((payload, nullable)) = searched_payload_enum(definition.value) {
                 let owned = payload_enum_rvalue_is_owned(value);
                 let needle = lower_rvalue(builder, value, resources)?.single()?;
                 let collection = lower_collection_pointer(builder, *collection, resources)?;
@@ -19759,6 +21091,15 @@ fn lower_nullable_scalar_expression(
                 present,
                 payload: position,
             })
+        }
+        mir::NullableScalarExpression::TryConvert {
+            ty: target, value, ..
+        } => {
+            let source = value.ty();
+            let value = lower_integer_expression(builder, value, resources)?;
+            Ok(lower_integer_try_conversion(
+                builder, source, *target, value, pointer,
+            ))
         }
         mir::NullableScalarExpression::Parse { value, .. } => {
             let text = lower_string_expression(builder, value, resources)?;
@@ -20168,6 +21509,15 @@ fn lower_integer_expression(
         mir::IntegerExpression::InlineWord(value) => {
             lower_inline_expression(builder, value, resources)
         }
+        mir::IntegerExpression::LastSystemCode => runtime_call(
+            builder,
+            crate::native_abi::LAST_SYSTEM_CODE,
+            &[],
+            Some(types::I64),
+            &[],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("the last system code read produced no value")),
         mir::IntegerExpression::Use { ty, operand } => {
             lower_integer_operand(builder, *ty, operand, resources)
         }
@@ -20204,11 +21554,23 @@ fn lower_integer_expression(
             ty,
             value,
             value_span,
+            boundary,
             ..
         } => {
             let source_type = value.ty();
             let value = lower_integer_expression(builder, value, resources)?;
-            lower_integer_conversion(builder, source_type, *ty, value, *value_span, resources)
+            let code = boundary.map_or(IntegerPanic::ConversionOutOfRange.code(), |_| {
+                crate::foreign::BOUNDARY_CONVERSION_PANIC_CODE
+            });
+            lower_integer_conversion(
+                builder,
+                source_type,
+                *ty,
+                value,
+                code,
+                *value_span,
+                resources,
+            )
         }
         mir::IntegerExpression::FloatToInt {
             value, value_span, ..
@@ -20235,7 +21597,7 @@ fn lower_integer_expression(
                 |builder, resources| lower_integer_expression(builder, right, resources),
             )
         }
-        mir::IntegerExpression::CopyByteRegion {
+        mir::IntegerExpression::CopyRegion {
             destination,
             source,
             ..
@@ -20245,19 +21607,47 @@ fn lower_integer_expression(
                 lower_rvalue(builder, destination, resources)?.byte_region()?;
             let (source_data, source_length) =
                 lower_rvalue(builder, source, resources)?.byte_region()?;
-            let count = runtime_call(
-                builder,
-                BYTE_REGION_COPY,
-                &[pointer, pointer, pointer, pointer],
-                Some(pointer),
-                &[
-                    destination_data,
-                    destination_length,
-                    source_data,
-                    source_length,
-                ],
-                resources,
-            )?
+            let typed = match destination.ty() {
+                mir::Type::Region(region) if region.array.is_some() => Some(
+                    crate::native_abi::array_region_element(resources.program, region)
+                        .ok_or_else(|| {
+                            malformed_mir("a typed array region views elements the targets build")
+                        })?
+                        .1,
+                ),
+                _ => None,
+            };
+            let count = if let Some(stride) = typed {
+                let stride = builder.ins().iconst(pointer, stride as i64);
+                runtime_call(
+                    builder,
+                    crate::native_abi::ARRAY_REGION_COPY,
+                    &[pointer, pointer, pointer, pointer, pointer],
+                    Some(pointer),
+                    &[
+                        destination_data,
+                        destination_length,
+                        source_data,
+                        source_length,
+                        stride,
+                    ],
+                    resources,
+                )?
+            } else {
+                runtime_call(
+                    builder,
+                    BYTE_REGION_COPY,
+                    &[pointer, pointer, pointer, pointer],
+                    Some(pointer),
+                    &[
+                        destination_data,
+                        destination_length,
+                        source_data,
+                        source_length,
+                    ],
+                    resources,
+                )?
+            }
             .ok_or_else(|| backend_failure("region copy produced no count"))?;
             Ok(if pointer == types::I64 {
                 count
@@ -20357,6 +21747,930 @@ fn lower_integer_binary(
         mir::IntegerBinaryOp::BitwiseXor => Ok(builder.ins().bxor(left, right)),
         mir::IntegerBinaryOp::BitwiseOr => Ok(builder.ins().bor(left, right)),
     }
+}
+
+/// One pointer operation (Decision 0148 section 4). Memory is accessed
+/// with the pointee's size; an aligned access tests the address first.
+fn lower_pointer_operation(
+    builder: &mut FunctionBuilder,
+    target: Option<mir::LocalId>,
+    operation: &mir::PointerOperation,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let address_of = |builder: &mut FunctionBuilder,
+                      local: mir::LocalId,
+                      resources: &mut LoweringResources<'_, '_>| {
+        load_lowered_from_stack(
+            builder,
+            resources.program,
+            local_definition(resources.program, resources.function_id, local)?.ty,
+            local_slot(resources.local_slots, local)?,
+            pointer,
+        )
+        .single()
+    };
+    // A pointee is a scalar with a C layout, or a nullable pointer stored
+    // as its word.
+    let accessed = |ty: mir::Type| match ty {
+        mir::Type::Scalar(scalar) => crate::native_abi::pointee_scalar_size(scalar)
+            .map(|size| (scalar, size))
+            .ok_or_else(|| malformed_mir("a pointer accesses a scalar with a C layout")),
+        mir::Type::NullableScalar(scalar)
+            if native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            crate::native_abi::pointee_scalar_size(scalar)
+                .map(|size| (scalar, size))
+                .ok_or_else(|| malformed_mir("a pointer accesses a scalar with a C layout"))
+        }
+        _ => Err(malformed_mir("a pointer accesses a scalar with a C layout")),
+    };
+    let result = match operation {
+        // A foreign struct or union moves by its bytes, checked against
+        // its layout's alignment.
+        mir::PointerOperation::Read {
+            pointer: local,
+            ty: mir::Type::ForeignAggregate(aggregate),
+            aligned,
+        } => {
+            let address = address_of(builder, *local, resources)?;
+            if *aligned {
+                lower_pointer_alignment_check(
+                    builder,
+                    address,
+                    u64::from(aggregate.align),
+                    span,
+                    resources,
+                )?;
+            }
+            let target = target.ok_or_else(|| malformed_mir("a pointer read has a target"))?;
+            let slot = local_slot(resources.local_slots, target)?;
+            let destination = builder.ins().stack_addr(pointer, slot, 0);
+            copy_foreign_aggregate(
+                builder,
+                destination,
+                address,
+                *aggregate,
+                AggregateAccess::Pointer { aligned: *aligned },
+                pointer,
+            );
+            return Ok(());
+        }
+        mir::PointerOperation::Write {
+            pointer: local,
+            value,
+            aligned,
+        } if matches!(value.ty(), mir::Type::ForeignAggregate(_)) => {
+            let mir::Type::ForeignAggregate(aggregate) = value.ty() else {
+                unreachable!("matched above");
+            };
+            let source = lower_rvalue(builder, value, resources)?.single()?;
+            let address = address_of(builder, *local, resources)?;
+            if *aligned {
+                lower_pointer_alignment_check(
+                    builder,
+                    address,
+                    u64::from(aggregate.align),
+                    span,
+                    resources,
+                )?;
+            }
+            copy_foreign_aggregate(
+                builder,
+                address,
+                source,
+                aggregate,
+                AggregateAccess::Pointer { aligned: *aligned },
+                pointer,
+            );
+            None
+        }
+        mir::PointerOperation::Read {
+            pointer: local,
+            ty,
+            aligned,
+        } => {
+            let (scalar, size) = accessed(*ty)?;
+            let address = address_of(builder, *local, resources)?;
+            if *aligned {
+                lower_pointer_alignment_check(builder, address, size, span, resources)?;
+            }
+            if let mir::Type::NullableScalar(_) = ty {
+                Some(load_nullable_scalar(
+                    builder,
+                    scalar,
+                    address,
+                    MemFlagsData::new(),
+                    pointer,
+                ))
+            } else {
+                let value =
+                    builder
+                        .ins()
+                        .load(clif_scalar_type(scalar), MemFlagsData::new(), address, 0);
+                // C `_Bool` is 0 or 1; any other byte still reads as `true`.
+                let value = if scalar == mir::ScalarType::Bool {
+                    builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0)
+                } else {
+                    value
+                };
+                Some(LoweredValue::Single(value))
+            }
+        }
+        mir::PointerOperation::Write {
+            pointer: local,
+            value,
+            aligned,
+        } => {
+            let (scalar, size) = accessed(value.ty())?;
+            let nullable = matches!(value.ty(), mir::Type::NullableScalar(_));
+            let value = lower_rvalue(builder, value, resources)?;
+            let address = address_of(builder, *local, resources)?;
+            if *aligned {
+                lower_pointer_alignment_check(builder, address, size, span, resources)?;
+            }
+            if nullable {
+                store_nullable_scalar(
+                    builder,
+                    scalar,
+                    address,
+                    value,
+                    MemFlagsData::new(),
+                    pointer,
+                )?;
+            } else {
+                builder
+                    .ins()
+                    .store(MemFlagsData::new(), value.single()?, address, 0);
+            }
+            None
+        }
+        mir::PointerOperation::Offset {
+            pointer: local,
+            count,
+            scale,
+        } => {
+            let count = lower_integer_expression(builder, count, resources)?;
+            let address = address_of(builder, *local, resources)?;
+            let scale = builder.ins().iconst(types::I64, *scale as i64);
+            let (bytes, scaled_overflow) = builder.ins().smul_overflow(count, scale);
+            let moved = builder.ins().iadd(address, bytes);
+            // A negative offset must move down and any other up; wrapping
+            // past either end of the address space, or reaching zero,
+            // leaves every address a `Pointer<T>` can hold.
+            let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, bytes, 0);
+            let wrapped_down = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, moved, address);
+            let wrapped_up = builder.ins().icmp(IntCC::UnsignedLessThan, moved, address);
+            let wrapped = builder.ins().select(negative, wrapped_down, wrapped_up);
+            let null = builder.ins().icmp_imm_u(IntCC::Equal, moved, 0);
+            let leaves = builder.ins().bor(scaled_overflow, wrapped);
+            let leaves = builder.ins().bor(leaves, null);
+            lower_panic_if_code(
+                builder,
+                leaves,
+                crate::foreign::POINTER_ADDRESS_PANIC_CODE,
+                span,
+                resources,
+            )?;
+            Some(LoweredValue::Single(moved))
+        }
+        mir::PointerOperation::Address { pointer: local } => Some(LoweredValue::Single(
+            address_of(builder, *local, resources)?,
+        )),
+        mir::PointerOperation::AddressOf { place, offset } => {
+            let place = inline_place_address(builder, *place, resources)?;
+            Some(LoweredValue::Single(if *offset == 0 {
+                place
+            } else {
+                builder.ins().iadd_imm_u(place, *offset as i64)
+            }))
+        }
+        mir::PointerOperation::RegionData { region, align } => {
+            let (data, _) =
+                lower_byte_region_local(builder, *region, false, resources)?.byte_region()?;
+            let empty = builder.ins().icmp_imm_u(IntCC::Equal, data, 0);
+            let aligned = builder.ins().iconst(pointer, *align as i64);
+            Some(LoweredValue::Single(
+                builder.ins().select(empty, aligned, data),
+            ))
+        }
+        // An owned foreign string is the address of its buffer.
+        mir::PointerOperation::ForeignStringData { string } => Some(LoweredValue::Single(
+            lower_collection_pointer(builder, *string, resources)?,
+        )),
+        mir::PointerOperation::CEntryAddress { function } => Some(LoweredValue::Single(
+            c_entry::address(builder, *function, resources)?,
+        )),
+        mir::PointerOperation::ReadForeignString {
+            pointer: local,
+            encoding,
+        } => {
+            let address = address_of(builder, *local, resources)?;
+            set_active_panic_site(builder, span, resources);
+            let payload = runtime_call(
+                builder,
+                crate::native_abi::foreign_string_reader(*encoding),
+                &[pointer, pointer],
+                Some(pointer),
+                &[resources.current_frame, address],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("a foreign string read produced no result"))?;
+            let present = presence_word(builder, payload, pointer);
+            Some(LoweredValue::Nullable { present, payload })
+        }
+        // A one-word value is its own handle; a two-word carrier is a
+        // runtime box of its two words (`mir::Program::handle_carrier`,
+        // Decision 0148 section 11).
+        mir::PointerOperation::CreateHandle { value } => {
+            let carrier = resources.program.handle_carrier(value.ty());
+            let lowered = lower_rvalue(builder, value, resources)?;
+            Some(LoweredValue::Single(match carrier {
+                Some(mir::HandleCarrier::Boxed) => {
+                    let (first, second) = lowered.two_words()?;
+                    set_active_panic_site(builder, span, resources);
+                    runtime_call(
+                        builder,
+                        crate::native_abi::HANDLE_BOX_CREATE,
+                        &[pointer, pointer, pointer],
+                        Some(pointer),
+                        &[resources.current_frame, first, second],
+                        resources,
+                    )?
+                    .ok_or_else(|| backend_failure("a handle box produced no address"))?
+                }
+                _ => lowered.single()?,
+            }))
+        }
+        mir::PointerOperation::FromHandle {
+            handle,
+            ty,
+            reclaim,
+        } => {
+            let address = address_of(builder, *handle, resources)?;
+            Some(match resources.program.handle_carrier(*ty) {
+                Some(mir::HandleCarrier::Boxed) => {
+                    let first = builder
+                        .ins()
+                        .load(pointer, MemFlagsData::trusted(), address, 0);
+                    let second = builder.ins().load(
+                        pointer,
+                        MemFlagsData::trusted(),
+                        address,
+                        pointer.bytes() as i32,
+                    );
+                    if *reclaim {
+                        runtime_call(
+                            builder,
+                            crate::native_abi::HANDLE_BOX_FREE,
+                            &[pointer],
+                            None,
+                            &[address],
+                            resources,
+                        )?;
+                    }
+                    LoweredValue::from_two_words(*ty, first, second)
+                }
+                _ => LoweredValue::Single(address),
+            })
+        }
+        mir::PointerOperation::ForeignRange {
+            pointer: local,
+            length,
+            stride,
+            align,
+        } => {
+            let address = address_of(builder, *local, resources)?;
+            let length = lower_integer_expression(builder, length, resources)?;
+            lower_pointer_alignment_check(builder, address, *align, span, resources)?;
+            // The range is `length` elements from the address: a negative
+            // length, or an end past the address space, is no range.
+            let scale = builder.ins().iconst(types::I64, *stride as i64);
+            let (bytes, scaled_overflow) = builder.ins().smul_overflow(length, scale);
+            let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, length, 0);
+            let (_, wrapped) = builder.ins().uadd_overflow(address, bytes);
+            let leaves = builder.ins().bor(scaled_overflow, negative);
+            let leaves = builder.ins().bor(leaves, wrapped);
+            lower_panic_if_code(
+                builder,
+                leaves,
+                crate::foreign::POINTER_ADDRESS_PANIC_CODE,
+                span,
+                resources,
+            )?;
+            Some(LoweredValue::Single(address))
+        }
+        mir::PointerOperation::FromAddress { address } => {
+            let address = lower_integer_expression(builder, address, resources)?;
+            let present = builder.ins().icmp_imm_u(IntCC::NotEqual, address, 0);
+            Some(LoweredValue::Nullable {
+                present: builder.ins().uextend(pointer, present),
+                payload: address,
+            })
+        }
+    };
+    if let (Some(target), Some(value)) = (target, result) {
+        let ty = local_definition(resources.program, resources.function_id, target)?.ty;
+        let slot = local_slot(resources.local_slots, target)?;
+        store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)?;
+    }
+    Ok(())
+}
+
+/// Calls the C function an extern declaration binds (Decision 0148 sections
+/// 14 and 15) under the target's C convention, as the shared
+/// classification (`native_abi::c_abi`) places each value. Each symbol is
+/// imported once, with the signature of its first call; a binding of the
+/// same symbol with another signature (`#[LinkName]`) calls the imported
+/// address through its own signature.
+fn lower_foreign_call(
+    builder: &mut FunctionBuilder,
+    foreign: &mir::ForeignFunction,
+    args: &[mir::LocalId],
+    target: Option<mir::LocalId>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    use crate::native_abi::c_abi::{self, PartClass, PartType, PhysicalParameter};
+    let pointer = resources.module.target_config().pointer_type();
+    let platform = crate::c_layout::CTarget::host();
+    let (parameters, return_type) = foreign
+        .c_signature(&resources.program.foreign_aggregates, platform)
+        .ok_or_else(|| malformed_mir("a foreign call passes only values with a C form"))?;
+    let classification = c_abi::classify(
+        platform,
+        &parameters,
+        return_type.as_ref(),
+        foreign.fixed_parameters,
+    );
+    let physical = c_abi::physical_signature(platform, &parameters, &classification);
+    let part_clif = |ty: PartType| match ty {
+        PartType::Integer64 => types::I64,
+        PartType::Float32 => types::F32,
+        PartType::Float64 => types::F64,
+    };
+    let target_type = match target {
+        Some(target) => {
+            Some(local_definition(resources.program, resources.function_id, target)?.ty)
+        }
+        None => None,
+    };
+    let signature = c_entry::c_signature(resources.module, &physical);
+    let mut images = HashMap::new();
+    let mut values = Vec::with_capacity(physical.parameters.len());
+    for parameter in &physical.parameters {
+        match parameter {
+            PhysicalParameter::ResultAddress => {
+                let target =
+                    target.ok_or_else(|| malformed_mir("an indirect result has a target"))?;
+                let slot = local_slot(resources.local_slots, target)?;
+                values.push(builder.ins().stack_addr(pointer, slot, 0));
+            }
+            PhysicalParameter::Scalar { argument, .. } => {
+                let local = foreign_argument_local(args, *argument)?;
+                let ty = local_definition(resources.program, resources.function_id, local)?.ty;
+                let slot = local_slot(resources.local_slots, local)?;
+                // A C scalar is passed as the value it is stored as; a null
+                // `?Pointer<T>` is stored as address zero.
+                let scalar = c_scalar_storage(ty)?;
+                values.push(
+                    builder
+                        .ins()
+                        .stack_load(pointer, clif_scalar_type(scalar), slot, 0),
+                );
+            }
+            PhysicalParameter::Part {
+                argument,
+                offset,
+                ty,
+            } => {
+                let image =
+                    foreign_argument_image(builder, args, *argument, &mut images, resources)?;
+                values.push(builder.ins().load(
+                    part_clif(*ty),
+                    MemFlagsData::trusted(),
+                    image,
+                    *offset as i32,
+                ));
+            }
+            PhysicalParameter::Padding(class) => values.push(match class {
+                PartClass::Integer => builder.ins().iconst(types::I64, 0),
+                PartClass::Float => builder.ins().f64const(Ieee64::with_bits(0)),
+            }),
+            PhysicalParameter::StackImage { argument, .. } => {
+                values.push(foreign_argument_image(
+                    builder,
+                    args,
+                    *argument,
+                    &mut images,
+                    resources,
+                )?);
+            }
+            PhysicalParameter::CopyAddress { argument } => {
+                let (aggregate, source) =
+                    foreign_aggregate_argument(builder, args, *argument, resources)?;
+                let copy = create_call_storage(
+                    builder,
+                    mir::Type::ForeignAggregate(aggregate),
+                    resources,
+                )?;
+                copy_foreign_aggregate(
+                    builder,
+                    copy,
+                    source,
+                    aggregate,
+                    AggregateAccess::Storage,
+                    pointer,
+                );
+                values.push(copy);
+            }
+        }
+    }
+    // The Call Path record of this call (Decision 0148 section 13): the
+    // calling frame for its length, and the enclosing call's afterwards.
+    let record = c_entry::foreign_call_record(builder, resources.module, resources.runtime_data)?;
+    let enclosing = builder
+        .ins()
+        .load(pointer, MemFlagsData::trusted(), record, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), resources.current_frame, record, 0);
+    let outbound = OutboundRecord { record, enclosing };
+    let symbol = match &foreign.callee {
+        mir::ForeignCallee::Symbol { symbol, .. } => symbol,
+        // A C function pointer value (Decision 0148 section 12) is called
+        // through its address with the same classified signature.
+        mir::ForeignCallee::Pointer(local) => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let address = builder.ins().stack_load(pointer, pointer, slot, 0);
+            let reference = builder.import_signature(signature);
+            let call = builder.ins().call_indirect(reference, address, &values);
+            let results = builder.inst_results(call).to_vec();
+            return finish_foreign_call(
+                builder,
+                &results,
+                &physical,
+                foreign.system_code,
+                outbound,
+                target,
+                target_type,
+                resources,
+            );
+        }
+    };
+    // The fast profile calls a variadic function through the runtime
+    // trampoline (section 14, amendment of 2026-11-17).
+    if physical.fixed_parameters.is_some() {
+        let results =
+            lower_variadic_call(builder, symbol, &signature, &physical, &values, resources)?;
+        return finish_foreign_call(
+            builder,
+            &results,
+            &physical,
+            foreign.system_code,
+            outbound,
+            target,
+            target_type,
+            resources,
+        );
+    }
+    let call = match resources.module.get_name(symbol) {
+        Some(cranelift_module::FuncOrDataId::Func(id))
+            if resources
+                .module
+                .declarations()
+                .get_function_decl(id)
+                .signature
+                != signature =>
+        {
+            let address = resources.module.declare_func_in_func(id, builder.func);
+            let address = builder.ins().func_addr(pointer, address);
+            let reference = builder.import_signature(signature);
+            builder.ins().call_indirect(reference, address, &values)
+        }
+        Some(cranelift_module::FuncOrDataId::Func(id)) => {
+            let reference = resources.module.declare_func_in_func(id, builder.func);
+            builder.ins().call(reference, &values)
+        }
+        Some(cranelift_module::FuncOrDataId::Data(_)) => {
+            return Err(malformed_mir(format!(
+                "the foreign symbol {symbol} names data of this object"
+            )))
+        }
+        None => {
+            let id = resources
+                .module
+                .declare_function(symbol, Linkage::Import, &signature)
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let reference = resources.module.declare_func_in_func(id, builder.func);
+            builder.ins().call(reference, &values)
+        }
+    };
+    let results = builder.inst_results(call).to_vec();
+    finish_foreign_call(
+        builder,
+        &results,
+        &physical,
+        foreign.system_code,
+        outbound,
+        target,
+        target_type,
+        resources,
+    )
+}
+
+/// Calls the variadic C function `symbol` through the runtime's variadic
+/// call trampoline (Decision 0148 section 14, amendment of 2026-11-17).
+/// `values` are the physical parameters of the call in order; each is
+/// stored where the shared layout (`c_abi::variadic_call_layout`) places
+/// it. Returns the result registers `physical`'s return reads, in order.
+fn lower_variadic_call(
+    builder: &mut FunctionBuilder,
+    symbol: &str,
+    signature: &cranelift_codegen::ir::Signature,
+    physical: &crate::native_abi::c_abi::PhysicalSignature,
+    values: &[Value],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Vec<Value>, BackendError> {
+    use crate::c_layout::CScalar;
+    use crate::native_abi::c_abi::{
+        self, PartType, PhysicalParameter, PhysicalReturn, VariadicSlot,
+    };
+    use crate::native_abi::{
+        VARIADIC_CALL, VARIADIC_CALL_FLOAT, VARIADIC_CALL_INDIRECT_RESULT, VARIADIC_CALL_INTEGER,
+        VARIADIC_CALL_RETURN_FLOAT, VARIADIC_CALL_RETURN_INTEGER, VARIADIC_CALL_SIZE,
+        VARIADIC_CALL_STACK, VARIADIC_CALL_STACK_BYTES, VARIADIC_CALL_VECTOR_REGISTERS,
+    };
+    let pointer = resources.module.target_config().pointer_type();
+    let flags = MemFlagsData::trusted();
+    let layout = c_abi::variadic_call_layout(crate::c_layout::CTarget::host(), physical);
+    if layout.placements.len() != values.len() {
+        return Err(malformed_mir("a variadic call places every value"));
+    }
+    let call = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        VARIADIC_CALL_SIZE,
+        3,
+    ));
+    let call = builder.ins().stack_addr(pointer, call, 0);
+    let stack_bytes = u32::try_from(layout.stack_bytes)
+        .map_err(|_| malformed_mir("a variadic call's stack area fits a stack slot"))?;
+    let stack = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        stack_bytes.max(16),
+        4,
+    ));
+    let stack = builder.ins().stack_addr(pointer, stack, 0);
+    // One argument register's 64-bit image of `value`: an integer widened
+    // by its signedness, a float's bits.
+    let word = |builder: &mut FunctionBuilder, value: Value, signed: bool| match builder
+        .func
+        .dfg
+        .value_type(value)
+    {
+        types::I64 => value,
+        types::F64 => builder
+            .ins()
+            .bitcast(types::I64, MemFlagsData::new(), value),
+        types::F32 => {
+            let bits = builder
+                .ins()
+                .bitcast(types::I32, MemFlagsData::new(), value);
+            builder.ins().uextend(types::I64, bits)
+        }
+        _ if signed => builder.ins().sextend(types::I64, value),
+        _ => builder.ins().uextend(types::I64, value),
+    };
+    for ((parameter, slots), value) in physical
+        .parameters
+        .iter()
+        .zip(&layout.placements)
+        .zip(values.iter().copied())
+    {
+        let signed = matches!(
+            parameter,
+            PhysicalParameter::Scalar {
+                scalar: CScalar::Integer { signed: true, .. },
+                ..
+            }
+        );
+        for slot in slots {
+            match *slot {
+                VariadicSlot::Integer(index) => {
+                    let image = word(builder, value, signed);
+                    let offset = VARIADIC_CALL_INTEGER + 8 * index as i32;
+                    builder.ins().store(flags, image, call, offset);
+                }
+                VariadicSlot::Float(index) => {
+                    let offset = VARIADIC_CALL_FLOAT + 8 * index as i32;
+                    builder.ins().store(flags, value, call, offset);
+                }
+                VariadicSlot::IndirectResult => {
+                    builder
+                        .ins()
+                        .store(flags, value, call, VARIADIC_CALL_INDIRECT_RESULT);
+                }
+                // A System V memory-class aggregate copies its image, which
+                // is whole 8-byte words long.
+                VariadicSlot::Stack { offset, size }
+                    if matches!(parameter, PhysicalParameter::StackImage { .. }) =>
+                {
+                    for chunk in (0..size).step_by(8) {
+                        let part = builder.ins().load(types::I64, flags, value, chunk as i32);
+                        builder
+                            .ins()
+                            .store(flags, part, stack, (offset + chunk) as i32);
+                    }
+                }
+                VariadicSlot::Stack { offset, size: 8 } => {
+                    let image = word(builder, value, signed);
+                    builder.ins().store(flags, image, stack, offset as i32);
+                }
+                // A fixed Apple arm64 stack argument at its natural size.
+                VariadicSlot::Stack { offset, .. } => {
+                    builder.ins().store(flags, value, stack, offset as i32);
+                }
+            }
+        }
+    }
+    let vector_registers = builder
+        .ins()
+        .iconst(types::I64, layout.vector_registers as i64);
+    builder.ins().store(
+        flags,
+        vector_registers,
+        call,
+        VARIADIC_CALL_VECTOR_REGISTERS,
+    );
+    let stack_size = builder.ins().iconst(types::I64, i64::from(stack_bytes));
+    builder
+        .ins()
+        .store(flags, stack_size, call, VARIADIC_CALL_STACK_BYTES);
+    builder.ins().store(flags, stack, call, VARIADIC_CALL_STACK);
+    let function = match resources.module.get_name(symbol) {
+        Some(cranelift_module::FuncOrDataId::Func(id)) => id,
+        Some(cranelift_module::FuncOrDataId::Data(_)) => {
+            return Err(malformed_mir(format!(
+                "the foreign symbol {symbol} names data of this object"
+            )))
+        }
+        None => resources
+            .module
+            .declare_function(symbol, Linkage::Import, signature)
+            .map_err(|error| backend_failure(error.to_string()))?,
+    };
+    let function = resources
+        .module
+        .declare_func_in_func(function, builder.func);
+    let function = builder.ins().func_addr(pointer, function);
+    runtime_call(
+        builder,
+        VARIADIC_CALL,
+        &[pointer, pointer],
+        None,
+        &[function, call],
+        resources,
+    )?;
+    // Integer parts take the integer result registers in order and float
+    // parts the float ones, as every convention returns them.
+    let mut integers = 0;
+    let mut floats = 0;
+    let mut read = |builder: &mut FunctionBuilder, ty: ClifType, float: bool| {
+        let offset = if float {
+            floats += 1;
+            VARIADIC_CALL_RETURN_FLOAT + 8 * (floats - 1)
+        } else {
+            integers += 1;
+            VARIADIC_CALL_RETURN_INTEGER + 8 * (integers - 1)
+        };
+        builder.ins().load(ty, flags, call, offset)
+    };
+    Ok(match &physical.return_value {
+        PhysicalReturn::Void | PhysicalReturn::Indirect => Vec::new(),
+        PhysicalReturn::Scalar(scalar) => vec![read(
+            builder,
+            c_entry::clif_scalar(*scalar, pointer),
+            scalar.is_float(),
+        )],
+        PhysicalReturn::Parts(parts) => parts
+            .iter()
+            .map(|(_, ty)| match ty {
+                PartType::Integer64 => read(builder, types::I64, false),
+                PartType::Float32 => read(builder, types::F32, true),
+                PartType::Float64 => read(builder, types::F64, true),
+            })
+            .collect(),
+    })
+}
+
+/// The runtime's record of the outbound foreign call in progress, and the
+/// value it held before this call began.
+#[derive(Clone, Copy)]
+struct OutboundRecord {
+    record: Value,
+    enclosing: Value,
+}
+
+/// Captures the system code the foreign call `call` left, when its
+/// declaration asks for it (Decision 0148 section 16), before any other
+/// code runs; restores the enclosing call's Call Path record (section 13);
+/// then stores the call's result into `target` as its classified return
+/// value arrives.
+#[allow(clippy::too_many_arguments)]
+fn finish_foreign_call(
+    builder: &mut FunctionBuilder,
+    results: &[Value],
+    physical: &crate::native_abi::c_abi::PhysicalSignature,
+    system_code: Option<crate::foreign::SystemCodeSource>,
+    outbound: OutboundRecord,
+    target: Option<mir::LocalId>,
+    target_type: Option<mir::Type>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    if let Some(source) = system_code {
+        let source = builder.ins().iconst(
+            types::I32,
+            i64::from(crate::native_abi::system_code_source(source)),
+        );
+        runtime_call(
+            builder,
+            crate::native_abi::CAPTURE_SYSTEM_CODE,
+            &[types::I32],
+            None,
+            &[source],
+            resources,
+        )?;
+    }
+    builder.ins().store(
+        MemFlagsData::trusted(),
+        outbound.enclosing,
+        outbound.record,
+        0,
+    );
+    use crate::c_layout::CScalar;
+    use crate::native_abi::c_abi::{self, PhysicalReturn};
+    let pointer = resources.module.target_config().pointer_type();
+    let (Some(target), Some(ty)) = (target, target_type) else {
+        return Ok(());
+    };
+    let scalar = match &physical.return_value {
+        PhysicalReturn::Scalar(scalar) => *scalar,
+        PhysicalReturn::Parts(parts) => {
+            let mir::Type::ForeignAggregate(aggregate) = ty else {
+                return Err(malformed_mir("register parts return a foreign aggregate"));
+            };
+            let size = c_abi::padded_image_size(u64::from(aggregate.size)) as u32;
+            let image = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                size,
+                3,
+            ));
+            let image = builder.ins().stack_addr(pointer, image, 0);
+            for ((offset, _), value) in parts.iter().zip(results.iter().copied()) {
+                builder
+                    .ins()
+                    .store(MemFlagsData::trusted(), value, image, *offset as i32);
+            }
+            let slot = local_slot(resources.local_slots, target)?;
+            let destination = builder.ins().stack_addr(pointer, slot, 0);
+            copy_foreign_aggregate(
+                builder,
+                destination,
+                image,
+                aggregate,
+                AggregateAccess::Storage,
+                pointer,
+            );
+            return Ok(());
+        }
+        // The callee wrote the result into the target's slot.
+        PhysicalReturn::Indirect => return Ok(()),
+        PhysicalReturn::Void => return Err(malformed_mir("a void foreign call assigns no result")),
+    };
+    let value = *results
+        .first()
+        .ok_or_else(|| malformed_mir("a foreign call with a result produced none"))?;
+    // C `_Bool` is 0 or 1; any other byte still reads as `true`.
+    let value = if scalar == CScalar::Bool {
+        builder.ins().icmp_imm_u(IntCC::NotEqual, value, 0)
+    } else {
+        value
+    };
+    // The result is stored as C returned it; a null `?Pointer<T>` is stored as
+    // address zero.
+    c_scalar_storage(ty)?;
+    let slot = local_slot(resources.local_slots, target)?;
+    builder.ins().stack_store(pointer, value, slot, 0);
+    Ok(())
+}
+
+/// The scalar a C scalar argument or result of type `ty` is stored as. A
+/// nullable C scalar is a nullable pointer, stored as its word
+/// (`NullableScalarForm::ZeroIsNull`), so the stored form is the C form.
+fn c_scalar_storage(ty: mir::Type) -> Result<mir::ScalarType, BackendError> {
+    match ty {
+        mir::Type::Scalar(scalar) => Ok(scalar),
+        mir::Type::NullableScalar(scalar)
+            if native_closure_abi::nullable_scalar_is_zero_is_null(scalar) =>
+        {
+            Ok(scalar)
+        }
+        _ => Err(malformed_mir(
+            "a foreign call passes C scalars stored in their C form",
+        )),
+    }
+}
+
+fn foreign_argument_local(
+    args: &[mir::LocalId],
+    argument: usize,
+) -> Result<mir::LocalId, BackendError> {
+    args.get(argument)
+        .copied()
+        .ok_or_else(|| malformed_mir("a foreign call passes every argument"))
+}
+
+/// The foreign aggregate type and slot address of a foreign call's
+/// argument.
+fn foreign_aggregate_argument(
+    builder: &mut FunctionBuilder,
+    args: &[mir::LocalId],
+    argument: usize,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<(mir::ForeignAggregateType, Value), BackendError> {
+    let local = foreign_argument_local(args, argument)?;
+    let mir::Type::ForeignAggregate(aggregate) =
+        local_definition(resources.program, resources.function_id, local)?.ty
+    else {
+        return Err(malformed_mir(
+            "a foreign call moves only a foreign aggregate by its image",
+        ));
+    };
+    let slot = local_slot(resources.local_slots, local)?;
+    let pointer = resources.module.target_config().pointer_type();
+    Ok((aggregate, builder.ins().stack_addr(pointer, slot, 0)))
+}
+
+/// A zero-padded copy of an aggregate argument's memory image, whole
+/// 8-byte registers long (`c_abi::padded_image_size`), made once per call.
+fn foreign_argument_image(
+    builder: &mut FunctionBuilder,
+    args: &[mir::LocalId],
+    argument: usize,
+    images: &mut HashMap<usize, Value>,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    if let Some(image) = images.get(&argument) {
+        return Ok(*image);
+    }
+    let pointer = resources.module.target_config().pointer_type();
+    let (aggregate, source) = foreign_aggregate_argument(builder, args, argument, resources)?;
+    let size = crate::native_abi::c_abi::padded_image_size(u64::from(aggregate.size)) as u32;
+    let slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+    let image = builder.ins().stack_addr(pointer, slot, 0);
+    let zero = builder.ins().iconst(types::I64, 0);
+    for offset in (0..size).step_by(8) {
+        builder
+            .ins()
+            .store(MemFlagsData::trusted(), zero, image, offset as i32);
+    }
+    copy_foreign_aggregate(
+        builder,
+        image,
+        source,
+        aggregate,
+        AggregateAccess::Storage,
+        pointer,
+    );
+    images.insert(argument, image);
+    Ok(image)
+}
+
+/// Panics with P1702 unless `address` is a multiple of `align`, the
+/// pointee's alignment: a scalar's size, or a foreign aggregate's layout
+/// alignment.
+fn lower_pointer_alignment_check(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    align: u64,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    if align <= 1 {
+        return Ok(());
+    }
+    let misaligned = builder.ins().band_imm_u(address, (align - 1) as i64);
+    let misaligned = builder.ins().icmp_imm_u(IntCC::NotEqual, misaligned, 0);
+    lower_panic_if_code(
+        builder,
+        misaligned,
+        crate::foreign::POINTER_ALIGNMENT_PANIC_CODE,
+        span,
+        resources,
+    )
 }
 
 fn lower_checked_arithmetic(
@@ -20526,27 +22840,52 @@ fn lower_integer_conversion(
     source: IntegerType,
     target: IntegerType,
     value: Value,
+    code: &'static str,
     span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     if let Some(out_of_range) = conversion_out_of_range(builder, source, target, value) {
-        lower_panic_if(
-            builder,
-            out_of_range,
-            IntegerPanic::ConversionOutOfRange,
-            span,
-            resources,
-        )?;
+        lower_panic_if_code(builder, out_of_range, code, span, resources)?;
     }
+    Ok(integer_conversion_bits(builder, source, target, value))
+}
 
-    Ok(match target.bit_width().cmp(&source.bit_width()) {
+/// `CLong::tryFrom`: present when the value is in the target's range.
+fn lower_integer_try_conversion(
+    builder: &mut FunctionBuilder,
+    source: IntegerType,
+    target: IntegerType,
+    value: Value,
+    pointer: types::Type,
+) -> LoweredValue {
+    let present = match conversion_out_of_range(builder, source, target, value) {
+        Some(out_of_range) => {
+            let fits = builder.ins().icmp_imm_u(IntCC::Equal, out_of_range, 0);
+            builder.ins().uextend(pointer, fits)
+        }
+        None => builder.ins().iconst(pointer, 1),
+    };
+    LoweredValue::Nullable {
+        present,
+        payload: integer_conversion_bits(builder, source, target, value),
+    }
+}
+
+/// The bits of an in-range `value` as `target`.
+fn integer_conversion_bits(
+    builder: &mut FunctionBuilder,
+    source: IntegerType,
+    target: IntegerType,
+    value: Value,
+) -> Value {
+    match target.bit_width().cmp(&source.bit_width()) {
         std::cmp::Ordering::Equal => value,
         std::cmp::Ordering::Less => builder.ins().ireduce(clif_integer_type(target), value),
         std::cmp::Ordering::Greater if source.is_signed() => {
             builder.ins().sextend(clif_integer_type(target), value)
         }
         std::cmp::Ordering::Greater => builder.ins().uextend(clif_integer_type(target), value),
-    })
+    }
 }
 
 fn conversion_out_of_range(
@@ -20777,7 +23116,7 @@ fn lower_integer_operand(
 ) -> Result<Value, BackendError> {
     refresh_borrowed_operand(builder, operand, resources)?;
     match operand {
-        mir::Operand::ByteRegionLength(region) if ty == IntegerType::Int64 => {
+        mir::Operand::RegionLength(region) if ty == IntegerType::Int64 => {
             let (_, length) =
                 lower_byte_region_local(builder, *region, false, resources)?.byte_region()?;
             Ok(if builder.func.dfg.value_type(length) == types::I64 {
@@ -20786,7 +23125,25 @@ fn lower_integer_operand(
                 builder.ins().uextend(types::I64, length)
             })
         }
-        mir::Operand::ByteRegionIndex {
+        mir::Operand::RegionIndex {
+            region,
+            index,
+            index_span,
+        } if matches!(
+            local_definition(resources.program, resources.function_id, *region)?.ty,
+            mir::Type::Region(mir::RegionType { array: Some(_), .. })
+        ) =>
+        {
+            lower_typed_region_read(
+                builder,
+                *region,
+                index,
+                *index_span,
+                mir::ScalarType::Integer(ty),
+                resources,
+            )
+        }
+        mir::Operand::RegionIndex {
             region,
             index,
             index_span,
@@ -20820,9 +23177,9 @@ fn lower_integer_operand(
             );
             Ok(value)
         }
-        mir::Operand::ByteRegionLength(_) | mir::Operand::ByteRegionIndex { .. } => Err(
-            malformed_mir("byte region operand has the wrong integer type"),
-        ),
+        mir::Operand::RegionLength(_) | mir::Operand::RegionIndex { .. } => Err(malformed_mir(
+            "byte region operand has the wrong integer type",
+        )),
         mir::Operand::CollectionIteratorPosition { receiver, .. } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *receiver)?;
@@ -21056,6 +23413,18 @@ fn lower_float_expression(
                 *collection,
                 offset,
                 mir::Type::Scalar(mir::ScalarType::Float(*ty)),
+                resources,
+            ),
+            mir::Operand::RegionIndex {
+                region,
+                index,
+                index_span,
+            } => lower_typed_region_read(
+                builder,
+                *region,
+                index,
+                *index_span,
+                mir::ScalarType::Float(*ty),
                 resources,
             ),
             mir::Operand::MixedPayload { mixed, tag } => {
@@ -21322,11 +23691,11 @@ fn lower_string_intrinsic_call(
             &[argument(0)?],
             resources,
         )?),
-        Kind::GraphemeLength | Kind::ByteLength => {
-            let name = if call.kind == Kind::GraphemeLength {
-                STRING_GRAPHEME_LENGTH
-            } else {
-                STRING_BYTE_LENGTH
+        Kind::GraphemeLength | Kind::DisplayWidth | Kind::ByteLength => {
+            let name = match call.kind {
+                Kind::GraphemeLength => STRING_GRAPHEME_LENGTH,
+                Kind::DisplayWidth => STRING_DISPLAY_WIDTH,
+                _ => STRING_BYTE_LENGTH,
             };
             let value = call_runtime(
                 builder,
@@ -21600,6 +23969,30 @@ fn lower_string_intrinsic_call(
                     argument(1)?,
                     length,
                     has_length,
+                ],
+                resources,
+            )?)
+        }
+        Kind::GraphemeBoundaryAfter => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_GRAPHEME_BOUNDARY_AFTER,
+            &[pointer, types::I64],
+            types::I64,
+            &[argument(0)?, argument(1)?],
+            resources,
+        )?),
+        Kind::TextBetween => {
+            set_active_panic_site(builder, call.span, resources);
+            LoweredValue::Single(call_runtime(
+                builder,
+                STRING_TEXT_BETWEEN,
+                &[pointer, pointer, types::I64, types::I64],
+                pointer,
+                &[
+                    resources.current_frame,
+                    argument(0)?,
+                    argument(1)?,
+                    argument(2)?,
                 ],
                 resources,
             )?)
@@ -22334,9 +24727,10 @@ fn declared_function(
     resources: &mut LoweringResources<'_, '_>,
     function: mir::FunctionId,
 ) -> Result<cranelift_codegen::ir::FuncRef, BackendError> {
-    let function_id = *resources
+    let function_id = resources
         .function_ids
         .get(function.0)
+        .and_then(|id| *id)
         .ok_or_else(|| malformed_mir(format!("function{} does not exist", function.0)))?;
     Ok(resources
         .module
@@ -22534,6 +24928,20 @@ fn lower_condition_to_branch(
                 _ => return Err(malformed_mir("ordered nullable comparison is invalid")),
             };
             builder.ins().brif(value, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::NullableForeignAggregateIsPresent(value) => {
+            let address = lower_nullable_foreign_aggregate_expression(builder, value, resources)?;
+            let present = builder.ins().load(
+                types::I8,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            );
+            let zero = builder.ins().iconst(types::I8, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+            builder
+                .ins()
+                .brif(present, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             let owned = value.owned_temporary();
@@ -22926,7 +25334,7 @@ fn lower_condition_to_branch(
             } else {
                 definition.value
             };
-            if let Some((payload, nullable)) = payload_enum_storage(stored_needle_type) {
+            if let Some((payload, nullable)) = searched_payload_enum(stored_needle_type) {
                 if *op == mir::CollectionMembershipOp::Add {
                     return Err(malformed_mir(
                         "payload enum elements cannot use set insertion",
@@ -23314,6 +25722,18 @@ fn lower_bool_operand(
             mir::Type::Scalar(mir::ScalarType::Bool),
             resources,
         ),
+        mir::Operand::RegionIndex {
+            region,
+            index,
+            index_span,
+        } => lower_typed_region_read(
+            builder,
+            *region,
+            index,
+            *index_span,
+            mir::ScalarType::Bool,
+            resources,
+        ),
         mir::Operand::MixedPayload { mixed, tag } => {
             lower_mixed_payload(builder, *mixed, *tag, resources)
         }
@@ -23333,6 +25753,18 @@ fn lower_inline_operand(
     match operand {
         mir::Operand::Scalar(mir::ScalarValue::Inline(value)) if value.ty == ty => Ok(
             cranelift_scalar_constant(builder, mir::ScalarValue::Inline(*value)),
+        ),
+        mir::Operand::RegionIndex {
+            region,
+            index,
+            index_span,
+        } => lower_typed_region_read(
+            builder,
+            *region,
+            index,
+            *index_span,
+            mir::ScalarType::Inline(ty),
+            resources,
         ),
         mir::Operand::Local(local) => {
             if local_definition(resources.program, resources.function_id, *local)?.ty != expected {
@@ -23441,7 +25873,10 @@ fn lower_inline_operand(
                 resources,
             )
         }
-        mir::Operand::MixedPayload { mixed, tag } if *tag == mir::MixedTag::Inline(ty) => {
+        // A pointer's tag names its checked type; its payload is the inline word.
+        mir::Operand::MixedPayload { mixed, tag }
+            if tag.ty() == mir::Type::Scalar(mir::ScalarType::Inline(ty)) =>
+        {
             lower_mixed_payload(builder, *mixed, *tag, resources)
         }
         _ => Err(malformed_mir(
@@ -23535,6 +25970,18 @@ fn lower_enum_operand(
             *collection,
             offset,
             expected,
+            resources,
+        ),
+        mir::Operand::RegionIndex {
+            region,
+            index,
+            index_span,
+        } => lower_typed_region_read(
+            builder,
+            *region,
+            index,
+            *index_span,
+            mir::ScalarType::Enum(enum_id),
             resources,
         ),
         mir::Operand::MixedPayload { mixed, tag } => {

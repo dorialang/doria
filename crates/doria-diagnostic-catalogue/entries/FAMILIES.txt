@@ -1,0 +1,24 @@
+# The families of diagnostic codes, in the order the catalogue presents
+# them: most common first (Decision 0145). One family per line:
+#   id | Title | One-sentence summary
+# Every entry names one of these ids on its `Family:` line.
+names | Names And Declarations | A name that is not declared, is declared twice, is reserved, or is spelled in a way Doria does not accept.
+types | Types And Conversions | A value whose type does not fit where it is used, including arguments, returns, operators, literals and conversions.
+nullability | Nullability And Mixed Values | A value that may be `null` or is `mixed` and is used before the program has dealt with that.
+collections | Collections | Lists, typed arrays, dictionaries, sets, queues and deques: their members, indexing, iteration and construction.
+ownership | Ownership And Mutation | Readonly and writable access, `take`, borrowed values, and shared ownership.
+classes | Classes And Constructors | Properties, constructors, inheritance, overrides, constants and static members.
+interfaces | Interfaces, Traits And Property Hooks | What a class promises through an interface or composes from a trait, and how accessors satisfy it.
+enums | Enums And Match | Enum declarations and cases, `match` and its patterns.
+control-flow | Control Flow | Conditions, loops, `given`, `when`, `finally` and where each may appear.
+functions | Functions And Closures | Parameters, named and default arguments, closures and callable values.
+generics | Generics | Type parameters, their constraints, and the type arguments the compiler infers or requires.
+errors | Checked Errors | `throw`, `throws`, `try` and `catch`, and the Error contract.
+strings | Strings, Display And Formatting | String operations, interpolation, format strings and what can be displayed.
+projects | Projects, Namespaces And Attributes | Imports, includes, packages, the build plan and attributes.
+testing | Testing | `describe`, `it`, `expect` and where tests may be written.
+io | Streams, Transfers And The Terminal | The standard I/O interfaces, pending transfers and the terminal layer.
+unsafe | Unsafe Code And Foreign Functions | `unsafe` contexts, pointers, `extern "C"` declarations, foreign layouts and linking foreign libraries.
+syntax | Syntax | Text the lexer or parser cannot read as Doria.
+runtime | Runtime Panics And Outcomes | A program that compiled and then stopped while running.
+compiler | Compiler And Backend Failures | A failure inside the compiler, a backend or an external tool; the program is not at fault.

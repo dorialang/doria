@@ -69,6 +69,9 @@ pub struct GraphSource {
     pub content_fingerprint: String,
     pub source: SourceFile,
     pub authored: Program,
+    /// The unsafe policy of the package the source belongs to (Decision 0148
+    /// section 25).
+    pub unsafe_policy: crate::build_plan::UnsafePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,6 +471,10 @@ fn load_compilation_graph_inner(
                 &mut diagnostics,
             );
         }
+        let unsafe_policy = package_specs
+            .get(pending_source.package.display_name())
+            .and_then(|package| package.unsafe_policy)
+            .unwrap_or(crate::build_plan::UnsafePolicy::Allow);
         sources.insert(
             identity,
             GraphSource {
@@ -484,6 +491,7 @@ fn load_compilation_graph_inner(
                 content_fingerprint: pending_source.provided.content_fingerprint,
                 source: source_file,
                 authored,
+                unsafe_policy,
             },
         );
     }
@@ -564,21 +572,56 @@ fn stable_source_ids<'a>(
     result
 }
 
+/// The link facts of a graph (Decision 0148 section 18): each package's
+/// native libraries, their paths resolved against its canonical root, and
+/// the selected target's Windows subsystem. A source finds the libraries
+/// of the package that owns it.
+pub fn native_linking(graph: &CompilationGraph) -> crate::native_link::NativeLinking {
+    let source_packages = graph
+        .sources
+        .values()
+        .filter_map(|source| match &source.package {
+            PackageIdentity::Named(package) => Some((source.id, package.clone())),
+            _ => None,
+        })
+        .collect();
+    crate::native_link::NativeLinking::for_packages(
+        graph.build_plan.packages.iter().filter_map(|package| {
+            graph.packages.get(&package.identity).map(|node| {
+                (
+                    package.identity.as_str(),
+                    node.canonical_root.as_path(),
+                    package.native_libraries.as_slice(),
+                )
+            })
+        }),
+        source_packages,
+        graph
+            .build_plan
+            .selected_target
+            .windows_subsystem
+            .unwrap_or_default(),
+    )
+}
+
 pub fn compilation_context(source: &GraphSource) -> CompilationContext {
     CompilationContext {
         edition: Edition::Doria2026,
         package: source.package.clone(),
         source: source.identity.clone(),
+        unsafe_policy: source.unsafe_policy,
     }
 }
 
 fn empty_program() -> Program {
     Program {
+        directives: Vec::new(),
         namespace: None,
         imports: Vec::new(),
         includes: Vec::new(),
         qualified_names: Vec::new(),
         attributes: Vec::new(),
+        call_candidates: Vec::new(),
         items: Vec::new(),
     }
 }
@@ -691,6 +734,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
     // test callables, then close the final graph index including those generated
     // package functions before resolving dispatcher references.
     let mut preliminary_sources = BTreeMap::new();
+    let mut classified_sources = BTreeMap::new();
     let mut preliminary_combined = empty_program();
     for (identity, source) in &graph.sources {
         let context = compilation_context(source);
@@ -703,12 +747,23 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             complete: graph.completeness == GraphCompleteness::Complete,
             includes_resolved: true,
         };
-        let resolved = crate::names::resolve_program_in_graph_for_ide(
-            &source.authored,
+        // Name resolution reads each `callee<A, B>(...)` once; every later
+        // pass, elaboration included, starts from the authored tree read
+        // that way (Decision 0105, Amendment: Type Arguments At The Call).
+        let classified = crate::read_call_candidates(
+            &source.source,
+            source.authored.clone(),
             &context,
-            &environment,
+            Some(&environment),
         )
-        .resolved;
+        .unwrap_or_else(|source_diagnostics| {
+            diagnostics.extend(source_diagnostics);
+            source.authored.clone()
+        });
+        let resolution =
+            crate::names::resolve_program_in_graph_for_ide(&classified, &context, &environment);
+        classified_sources.insert(identity.clone(), classified);
+        let resolved = resolution.resolved;
         append_program(&mut preliminary_combined, &resolved.program);
         preliminary_sources.insert(identity.clone(), resolved);
     }
@@ -728,8 +783,11 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         let preliminary = preliminary_sources
             .get(identity)
             .expect("every graph source has preliminary resolution");
+        let classified = classified_sources
+            .get(identity)
+            .expect("every graph source has a classified program");
         let elaboration = crate::testing::elaborate_source(
-            &source.authored,
+            classified,
             &preliminary.facts,
             &context,
             &preliminary_evaluation,
@@ -830,7 +888,12 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
                 facts.compiler_known.push(known);
             }
         }
-        authored_sources.insert(identity.clone(), source.authored.clone());
+        authored_sources.insert(
+            identity.clone(),
+            classified_sources
+                .remove(identity)
+                .expect("every graph source has a classified program"),
+        );
     }
     facts.namespace = selected_namespace;
     facts.namespace_declaration = selected_namespace_declaration;
@@ -850,26 +913,12 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         }
     }
 
-    if uses_compiler_known_io
-        || crate::compiler_known_io::resolved_program_uses_canonical_io(&facts, &combined)
-    {
-        combined = crate::compiler_known_io::augment_program(&combined);
-    }
-    if crate::compiler_known_stream::resolved_facts_use_streams(&facts) {
-        combined = crate::compiler_known_stream::augment_program_for(&combined, &facts);
-    }
-    if crate::compiler_known_time::resolved_facts_use_time(&facts) {
-        combined = crate::compiler_known_time::augment_program(&combined);
-    }
-    if crate::compiler_known_concurrency::resolved_facts_use_concurrency(&facts) {
-        combined = crate::compiler_known_concurrency::augment_program(&combined);
-    }
-    if crate::compiler_known_term::resolved_facts_use_term(&facts) {
-        combined = crate::compiler_known_term::augment_program(&combined);
-    }
-    if crate::compiler_known_test::resolved_facts_use_assertion_surface(&facts) {
-        combined = crate::compiler_known_test::augment_program(&combined);
-    }
+    let reads_graphemes = graph
+        .sources
+        .values()
+        .any(|source| crate::compiler_known_text::source_uses_graphemes(&source.source));
+    combined =
+        crate::augment_compiler_known(&combined, &facts, uses_compiler_known_io, reads_graphemes);
 
     let source_texts = graph
         .sources
@@ -899,6 +948,14 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             crate::compiler_known_term::SOURCE_ID,
             crate::compiler_known_term::SOURCE_TEXT,
         )))
+        .chain(std::iter::once((
+            crate::compiler_known_text::SOURCE_ID,
+            crate::compiler_known_text::SOURCE_TEXT,
+        )))
+        .chain(std::iter::once((
+            crate::compiler_known_ffi::SOURCE_ID,
+            crate::compiler_known_ffi::source_text(),
+        )))
         .collect::<HashMap<_, _>>();
     let compiler_known_context = selected_context(graph);
     contexts.insert(
@@ -907,6 +964,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_contracts::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -915,6 +973,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_io::SYNTHETIC_SOURCE_IDENTITY.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -923,6 +982,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_time::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -931,6 +991,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_stream::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -939,6 +1000,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_concurrency::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     contexts.insert(
@@ -947,6 +1009,25 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             edition: compiler_known_context.edition,
             package: PackageIdentity::CompilerKnown,
             source: SourceIdentity(crate::compiler_known_term::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
+        },
+    );
+    contexts.insert(
+        crate::compiler_known_ffi::SOURCE_ID,
+        CompilationContext {
+            edition: compiler_known_context.edition,
+            package: PackageIdentity::CompilerKnown,
+            source: SourceIdentity(crate::compiler_known_ffi::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
+        },
+    );
+    contexts.insert(
+        crate::compiler_known_text::SOURCE_ID,
+        CompilationContext {
+            edition: compiler_known_context.edition,
+            package: PackageIdentity::CompilerKnown,
+            source: SourceIdentity(crate::compiler_known_text::SOURCE_NAME.to_string()),
+            unsafe_policy: crate::build_plan::UnsafePolicy::Allow,
         },
     );
     let mut semantic = crate::semantics::analyze_program_for_ide_with_graph_and_test_context(
@@ -1013,12 +1094,17 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
 }
 
 pub fn check_compilation_graph(graph: &CompilationGraph) -> DiagnosticResult<Program> {
+    check_compilation_graph_with_warnings(graph).map(|(program, _)| program)
+}
+
+/// Checks a graph. A graph with warnings and no errors checks; its warnings
+/// come back beside the program.
+pub fn check_compilation_graph_with_warnings(
+    graph: &CompilationGraph,
+) -> DiagnosticResult<(Program, Vec<crate::diagnostics::Diagnostic>)> {
     let analysis = analyze_compilation_graph_for_ide(graph);
-    if analysis.diagnostics.is_empty() {
-        Ok(analysis.resolved_program)
-    } else {
-        Err(analysis.diagnostics)
-    }
+    let warnings = crate::diagnostics::separate_errors(analysis.diagnostics)?;
+    Ok((analysis.resolved_program, warnings))
 }
 
 fn selected_context(graph: &CompilationGraph) -> CompilationContext {
@@ -1031,17 +1117,29 @@ fn selected_context(graph: &CompilationGraph) -> CompilationContext {
         .unwrap_or_default()
 }
 
-fn visible_packages(graph: &CompilationGraph, source: &GraphSource) -> BTreeSet<String> {
-    let package_name = source.package.display_name();
-    let mut visible = BTreeSet::from([package_name.to_string()]);
-    let Some(package) = graph.packages.get(package_name) else {
-        return visible;
-    };
-    visible.extend(package.normal_dependencies.iter().cloned());
+/// Packages whose declarations `source` may name: its own package and the
+/// package's direct dependencies, including development dependencies for
+/// development sources.
+pub fn visible_packages(graph: &CompilationGraph, source: &GraphSource) -> BTreeSet<String> {
     let development = source.scope == SourceScope::Development
         || source.generated_for == Some(GeneratedFor::Development);
+    package_visible_packages(graph, source.package.display_name(), development)
+}
+
+/// Packages whose declarations a source of `package` may name, for a source
+/// that is not in the graph yet, such as a file an editor is about to create.
+pub fn package_visible_packages(
+    graph: &CompilationGraph,
+    package: &str,
+    development: bool,
+) -> BTreeSet<String> {
+    let mut visible = BTreeSet::from([package.to_string()]);
+    let Some(node) = graph.packages.get(package) else {
+        return visible;
+    };
+    visible.extend(node.normal_dependencies.iter().cloned());
     if development {
-        visible.extend(package.development_dependencies.iter().cloned());
+        visible.extend(node.development_dependencies.iter().cloned());
     }
     visible
 }
@@ -1562,6 +1660,7 @@ fn retarget_diagnostics(mut diagnostics: Vec<Diagnostic>, path: &str) -> Vec<Dia
 fn statement_span(statement: &crate::ast::Stmt) -> Span {
     match statement {
         crate::ast::Stmt::Block(value) => value.span,
+        crate::ast::Stmt::Unsafe(value) => value.span,
         crate::ast::Stmt::VarDecl(value) => value.span,
         crate::ast::Stmt::Assignment(value) => value.span,
         crate::ast::Stmt::Echo { span, .. }

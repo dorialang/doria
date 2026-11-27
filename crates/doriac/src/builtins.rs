@@ -145,6 +145,12 @@ pub const FOREIGN_STRING_SPELLINGS: &[ForeignStringSpelling] = &[
     padding("str_pad"),
     padding("mb_str_pad"),
     ForeignStringSpelling {
+        foreign: "mb_strwidth",
+        target: StringSpellingTarget::Property("displayWidth"),
+        same_argument_order: false,
+        alternative: None,
+    },
+    ForeignStringSpelling {
         foreign: "strlen",
         target: StringSpellingTarget::Property("byteLength"),
         same_argument_order: false,

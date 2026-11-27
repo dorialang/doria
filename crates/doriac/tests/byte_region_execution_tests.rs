@@ -177,8 +177,8 @@ fn executes(body: &str, stdout: &str) {
 fn region_carriers_are_inline_and_nullable_presence_is_separate() {
     for kind in [ByteRegionKind::Readonly, ByteRegionKind::Writable] {
         for width in [4, 8] {
-            let ty = Type::ByteRegion(kind);
-            let nullable = Type::NullableByteRegion(kind);
+            let ty = Type::Region(doriac::mir::RegionType::bytes(kind));
+            let nullable = Type::NullableRegion(doriac::mir::RegionType::bytes(kind));
             assert_eq!(
                 doriac::native_abi::collection_value_width(ty, width),
                 Some(width * 2)
@@ -199,7 +199,7 @@ fn region_carriers_are_inline_and_nullable_presence_is_separate() {
             assert!(!doriac::native_closure_abi::needs_drop(nullable));
         }
         assert_eq!(
-            Type::ByteRegion(kind).has_move_ownership(),
+            Type::Region(doriac::mir::RegionType::bytes(kind)).has_move_ownership(),
             kind.is_writable()
         );
     }
@@ -252,6 +252,73 @@ function main(): void {{
             "53379",
         );
     }
+}
+
+#[test]
+fn foreach_walks_byte_regions_in_index_order() {
+    // Decision 0148 Amendment: Iterating Regions (2026-11-20), which covers
+    // Decision 0110's byte regions: `uint8` elements in index order, the
+    // `int` index, and in-place writes through a writable region.
+    executes(
+        r#"
+function main(): void {
+    writable Bytes $bytes = Bytes::allocate(4);
+    $bytes[0] = 1;
+    $bytes[1] = 2;
+    $bytes[2] = 3;
+    foreach ($bytes->getRegion(0, 3) as uint8 $byte) {
+        echo $byte;
+    }
+    foreach ($bytes->getRegion(1, 2) as int $index => uint8 $byte) {
+        echo " {$index}:{$byte}";
+    }
+    {
+        let writable $view = $bytes->getWritableRegion(0, 4);
+        foreach ($view as writable uint8 $byte) {
+            $byte += 5;
+        }
+    }
+    echo "\n{$bytes[0]},{$bytes[1]},{$bytes[2]},{$bytes[3]}\n";
+}
+"#,
+        "123 0:2 1:3\n6,7,8,5\n",
+    );
+}
+
+#[test]
+fn a_writable_byte_region_foreach_keeps_the_last_change_on_break_and_return() {
+    // Decision 0148 section 8: the store back into the region is owed on
+    // every exit from the body, including `break` and `return`.
+    executes(
+        r#"
+function markFirstAbove(writable WritableByteRegion $view, uint8 $limit): int {
+    foreach ($view as int $index => writable uint8 $byte) {
+        $byte += 10;
+        if ($byte > $limit) {
+            return $index;
+        }
+    }
+    return -1;
+}
+function main(): void {
+    writable Bytes $bytes = Bytes::allocate(3);
+    $bytes[1] = 5;
+    {
+        let writable $view = $bytes->getWritableRegion(0, 3);
+        foreach ($view as writable uint8 $byte) {
+            $byte = 9;
+            break;
+        }
+    }
+    {
+        let writable $view = $bytes->getWritableRegion(0, 3);
+        echo markFirstAbove($view, 18);
+    }
+    echo " {$bytes[0]},{$bytes[1]},{$bytes[2]}\n";
+}
+"#,
+        "0 19,5,0\n",
+    );
 }
 
 #[test]

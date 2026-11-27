@@ -815,14 +815,8 @@ impl Checker<'_> {
         member: &str,
         span: Span,
     ) -> Option<Selection> {
-        if matches!(
-            receiver,
-            ResolvedType::Integer(_)
-                | ResolvedType::Float(_)
-                | ResolvedType::Bool
-                | ResolvedType::String
-        ) {
-            // Primitive core operations are intrinsics with no checked Error.
+        if receiver.uses_compiler_known_core_operations() {
+            // Compiler-known core operations are intrinsics with no checked Error.
             return Some(Selection::default());
         }
         if resolved_type_is_symbolic(&receiver) {

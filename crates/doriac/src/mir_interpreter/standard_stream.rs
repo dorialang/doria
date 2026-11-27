@@ -146,39 +146,17 @@ impl Interpreter<'_> {
         };
         let count = transferred.unwrap_or(0);
         if count != 0 {
-            let base = region
-                .source
-                .ok_or_else(|| InterpreterError::new("standard region has no source"))?;
-            let (entries, _) = self.collection_element_storage(base)?;
             if reading {
-                let mut entries = entries.borrow_mut();
-                for index in 0..count {
-                    entries[base.index + index].1 = LocalValue::Scalar(mir::ScalarValue::Integer(
-                        IntegerValue::from_i128(
-                            IntegerType::UInt8,
-                            i128::from(self.stdin[self.stdin_cursor + index]),
-                        )
-                        .expect("byte fits uint8"),
-                    ));
-                }
+                let read = self.stdin[self.stdin_cursor..self.stdin_cursor + count].to_vec();
+                self.write_region_bytes(region, &read)?;
                 self.stdin_cursor += count;
                 self.stdin_buffered_end = self.stdin_buffered_end.max(self.stdin_cursor);
             } else {
-                let entries = entries.borrow();
-                let output = if stream == mir::StandardIoStream::Error {
-                    &mut self.stderr
+                let written = self.region_bytes(region, count)?;
+                if stream == mir::StandardIoStream::Error {
+                    self.stderr.extend(written);
                 } else {
-                    &mut self.stdout
-                };
-                for index in 0..count {
-                    let LocalValue::Scalar(mir::ScalarValue::Integer(value)) =
-                        &entries[base.index + index].1
-                    else {
-                        return Err(InterpreterError::new(
-                            "standard region has a nonbyte element",
-                        ));
-                    };
-                    output.push(value.unsigned_value() as u8);
+                    self.stdout.extend(written);
                 }
             }
         }

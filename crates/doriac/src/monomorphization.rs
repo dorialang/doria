@@ -103,6 +103,7 @@ pub(crate) fn synthetic_constructors(program: &hir::Program) -> Vec<(String, hir
                         span,
                     },
                     intrinsic: None,
+                    foreign: false,
                     modifier_prefix_span: span,
                     span,
                 },
@@ -255,6 +256,10 @@ fn enqueue_checked_calls(
     interface_calls: &mut Vec<InterfaceGenericCall>,
 ) -> DiagnosticResult<()> {
     for call in calls {
+        // A call in a branch constant false for the target is never made.
+        if !semantic_info.reachable.is_live(call.site) {
+            continue;
+        }
         if let Some(interface) = &call.interface {
             if !interface_calls.contains(interface) {
                 interface_calls.push(interface.clone());
@@ -305,6 +310,12 @@ pub(crate) fn collect_callable_instances(
             if !callable_available(*callable, &[], semantic_info, callable.function.span)? {
                 continue;
             }
+            // Decision 0148 section 17 (amendment of 2026-11-21): only code
+            // reachable from the program's roots is emitted, so an extern
+            // declaration nothing reachable calls links no library.
+            if !emitted(*callable, semantic_info) {
+                continue;
+            }
             let instance = CallableInstance {
                 declaration,
                 arguments: Vec::new(),
@@ -327,7 +338,9 @@ pub(crate) fn collect_callable_instances(
         let hir::Item::Class(class) = item else {
             continue;
         };
-        if !class.members.iter().any(|member| matches!(member, hir::ClassMember::Property(property) if property.initializer.is_some())) {
+        if !class.members.iter().any(|member| matches!(member, hir::ClassMember::Property(property) if property.initializer.is_some()))
+            || !semantic_info.reachable.constructs(&class.name)
+        {
             continue;
         }
         for class_info in semantic_info
@@ -377,6 +390,19 @@ pub(crate) fn collect_callable_instances(
         )?;
     }
     Ok((instances, interface_calls))
+}
+
+/// Whether reachability emits a non-generic callable: a synthetic
+/// constructor with its class's construction, any other by declaration.
+fn emitted(callable: CallableDecl<'_>, semantic_info: &SemanticInfo) -> bool {
+    match callable.origin {
+        CallableOrigin::SyntheticConstructor => callable.class.is_some_and(|class| {
+            semantic_info
+                .reachable
+                .constructs(&semantic_info.classes[class.0].declaration_name)
+        }),
+        CallableOrigin::Source => semantic_info.reachable.reaches(callable.function.span),
+    }
 }
 
 fn validate_witness_admissions(

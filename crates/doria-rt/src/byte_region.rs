@@ -3,7 +3,7 @@ use doria_diagnostic_catalogue::{
 };
 
 use crate::{
-    bytes, dr_v2_panic_code_with_facts, dr_v2_panic_index_out_of_bounds, DrBytesV1,
+    bytes, collection, dr_v2_panic_code_with_facts, dr_v2_panic_index_out_of_bounds, DrBytesV1,
     DrRuntimeFactV2, DrStackFrameV2, RUNTIME_FACT_SIGNED, RUNTIME_FACT_UNSIGNED,
 };
 
@@ -110,7 +110,7 @@ pub unsafe extern "C" fn dr_v2_byte_region_subregion(
     length: i64,
 ) -> *mut u8 {
     let Some(offset) = checked_offset(source_length, offset, length) else {
-        region_panic(frame, source_length, offset, length);
+        region_panic(frame, b"P1304", source_length, offset, length);
     };
     // Null is permitted only for empty storage. Avoid even zero-offset pointer
     // arithmetic on it; nonempty sources may also form an empty end region.
@@ -193,10 +193,10 @@ pub unsafe extern "C" fn dr_v1_byte_region_copy_within(
     destination: i64,
 ) {
     let Some(from) = checked_offset(region_length, offset, length) else {
-        region_panic(frame, region_length, offset, length);
+        region_panic(frame, b"P1304", region_length, offset, length);
     };
     let Some(to) = checked_offset(region_length, destination, length) else {
-        region_panic(frame, region_length, destination, length);
+        region_panic(frame, b"P1304", region_length, destination, length);
     };
     let count = length as usize;
     if count != 0 {
@@ -206,6 +206,7 @@ pub unsafe extern "C" fn dr_v1_byte_region_copy_within(
 
 unsafe fn region_panic(
     frame: *const DrStackFrameV2,
+    code: &[u8; 5],
     source_length: usize,
     offset: i64,
     length: i64,
@@ -235,13 +236,106 @@ unsafe fn region_panic(
     ];
     dr_v2_panic_code_with_facts(
         frame,
-        b"P1304".as_ptr(),
+        code.as_ptr(),
         5,
         core::ptr::null(),
         0,
         facts.as_ptr(),
         facts.len(),
     );
+}
+
+/// A typed array region over `length` elements of `collection` from
+/// `offset` (Decision 0148 section 8): the address of its first element.
+/// Bounds count elements; failure is P1305. An empty array may have no
+/// storage, so its region's address may be null.
+///
+/// # Safety
+///
+/// `collection` is a live typed array and `frame` the caller's frame.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_array_region(
+    frame: *const DrStackFrameV2,
+    collection: *const collection::DrCollectionV1,
+    offset: i64,
+    length: i64,
+) -> *mut u8 {
+    let (data, stride) = collection::element_storage(collection);
+    dr_v2_array_region_subregion(
+        frame,
+        data,
+        collection::length(collection),
+        offset,
+        length,
+        stride,
+    )
+}
+
+/// A subregion of a typed array region of `source_length` elements of
+/// `stride` bytes at `data`.
+///
+/// # Safety
+///
+/// `data` addresses `source_length` elements of `stride` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_array_region_subregion(
+    frame: *const DrStackFrameV2,
+    data: *mut u8,
+    source_length: usize,
+    offset: i64,
+    length: i64,
+    stride: usize,
+) -> *mut u8 {
+    let Some(offset) = checked_offset(source_length, offset, length) else {
+        region_panic(frame, b"P1305", source_length, offset, length);
+    };
+    if offset == 0 {
+        data
+    } else {
+        data.add(offset * stride)
+    }
+}
+
+/// The address of element `index` of a typed array region, which panics
+/// as `T[]` indexing does (P1310) when the region has no such element.
+///
+/// # Safety
+///
+/// `data` addresses `length` elements of `stride` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_array_region_element(
+    frame: *const DrStackFrameV2,
+    data: *mut u8,
+    length: usize,
+    index: i64,
+    stride: usize,
+) -> *mut u8 {
+    let Some(index) = checked_offset(length, index, 1) else {
+        dr_v2_panic_index_out_of_bounds(frame, b"P1310".as_ptr(), 5, index, length);
+    };
+    data.add(index * stride)
+}
+
+/// `copyFrom` between typed array regions of trivially copied elements:
+/// copies the leading elements and returns their count, the smaller of the
+/// two lengths.
+///
+/// # Safety
+///
+/// Each pointer addresses its length in elements of `stride` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_array_region_copy(
+    destination: *mut u8,
+    destination_length: usize,
+    source: *const u8,
+    source_length: usize,
+    stride: usize,
+) -> usize {
+    let count = destination_length.min(source_length);
+    if count != 0 {
+        core::ptr::copy(source, destination, count * stride);
+    }
+    count
 }
 
 #[cfg(test)]

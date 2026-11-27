@@ -570,6 +570,7 @@ fn rejects_mixed_width_float_binary_operands() {
             ))),
         }],
         entry_block: BlockId(0),
+        unsafe_regions: Vec::new(),
         closure: None,
     });
 
@@ -612,6 +613,10 @@ fn void_program() -> Program {
         function_types: Vec::new(),
         closure_descriptors: Vec::new(),
         closure_environment_layouts: Vec::new(),
+        foreign_aggregates: Vec::new(),
+        pointer_types: Vec::new(),
+        c_entries: Vec::new(),
+        companion: Default::default(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -635,6 +640,7 @@ fn void_program() -> Program {
                 terminator: Terminator::ReturnVoid,
             }],
             entry_block: BlockId(0),
+            unsafe_regions: Vec::new(),
             closure: None,
         }],
         selected_entry: Some(FunctionId(0)),

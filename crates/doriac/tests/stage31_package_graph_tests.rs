@@ -8,10 +8,11 @@ use doriac::build_plan::{
 };
 use doriac::compilation_graph::{
     analyze_compilation_graph_for_ide, load_compilation_graph, load_compilation_graph_detailed,
-    load_compilation_graph_with_completeness, GraphCompleteness, GraphLoadOptions,
-    ProjectStructureAuthority,
+    load_compilation_graph_with_completeness, package_visible_packages, visible_packages,
+    GraphCompleteness, GraphLoadOptions, ProjectStructureAuthority,
 };
 use doriac::source_provider::InMemorySourceProvider;
+use std::collections::BTreeSet;
 use std::process::Command;
 
 #[path = "common/execution_directory.rs"]
@@ -58,6 +59,8 @@ fn package(identity: &str, sources: Vec<Source>, dependencies: Vec<Dependency>) 
         }],
         sources,
         dependencies,
+        native_libraries: Vec::new(),
+        unsafe_policy: None,
     }
 }
 
@@ -76,6 +79,7 @@ fn plan(packages: Vec<Package>, entry: &str) -> BuildPlanDocument {
                 kind: TargetKind::Binary,
                 entry_source: Some(entry.to_string()),
                 active_scopes: vec![SourceScope::Main],
+                windows_subsystem: None,
             },
             packages,
             compiler: CompilerOptions {
@@ -532,6 +536,8 @@ fn top_level_internal_declarations_preserve_modifier_spans() {
             doriac::ast::Item::Trait(value) => value.access_span,
             doriac::ast::Item::Function(value) => value.access_span,
             doriac::ast::Item::Constant(value) => value.access_span,
+            doriac::ast::Item::ExternBlock(value) => value.access_span,
+            doriac::ast::Item::ForeignAggregate(value) => value.access_span,
             doriac::ast::Item::Statement(_) => panic!("expected declarations"),
         };
         let span = span.expect("internal span");
@@ -626,6 +632,8 @@ fn multi_source_graph_preserves_writable_nullable_property_receivers() {
             ),
         ],
         dependencies: Vec::new(),
+        native_libraries: Vec::new(),
+        unsafe_policy: None,
     };
     let document = plan(vec![application], entry);
     let mut provider = InMemorySourceProvider::new();
@@ -804,6 +812,20 @@ fn transitive_dependency_is_not_visible() {
     assert!(analysis.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "E0682" && diagnostic.message.contains("not a direct dependency")
     }));
+    // Tools ask the same rule the resolver applies, so an editor never offers
+    // a transitive package's declarations.
+    assert_eq!(
+        visible_packages(&graph, &graph.sources[entry]),
+        names(&["acme/application", "acme/support"])
+    );
+    assert_eq!(
+        package_visible_packages(&graph, "acme/support", false),
+        names(&["acme/support", "acme/transitive"])
+    );
+}
+
+fn names(packages: &[&str]) -> BTreeSet<String> {
+    packages.iter().map(|package| package.to_string()).collect()
 }
 
 #[test]
@@ -885,6 +907,22 @@ fn development_dependency_visibility_follows_the_source_scope() {
     assert!(visibility_diagnostics[0]
         .message
         .contains("development dependency"));
+    assert_eq!(
+        visible_packages(&graph, &graph.sources[entry]),
+        names(&["acme/application"])
+    );
+    assert_eq!(
+        visible_packages(&graph, &graph.sources["acme/application:development.doria"]),
+        names(&["acme/application", "acme/testing"])
+    );
+    assert_eq!(
+        package_visible_packages(&graph, "acme/application", false),
+        names(&["acme/application"])
+    );
+    assert_eq!(
+        package_visible_packages(&graph, "acme/application", true),
+        names(&["acme/application", "acme/testing"])
+    );
 }
 
 #[test]

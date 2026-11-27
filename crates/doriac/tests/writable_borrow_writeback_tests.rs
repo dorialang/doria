@@ -51,6 +51,14 @@ fn fixture_mir(name: &str, source: &str) -> doriac::mir::Program {
     })
 }
 
+/// A fixture without `main` lowers as a library, so every helper it declares
+/// is emitted for the test to inspect (Decision 0148 section 17).
+fn library_fixture_mir(name: &str, source: &str) -> doriac::mir::Program {
+    doriac::lower_library_source_to_mir(name, source).unwrap_or_else(|diagnostics| {
+        panic!("MIR lowering failed for {name}:\n{source}\n{diagnostics:#?}")
+    })
+}
+
 fn validate_fixture(program: &doriac::mir::Program, source: &str) {
     doriac::mir_validation::validate_program(program).unwrap_or_else(|error| {
         panic!("Unmodified fixture validation failed:\n{source}\n{error:#?}")
@@ -166,7 +174,7 @@ function main(): void {
     echo $copy;
 }
 "#,
-        "drop1;2;drop2;3;drop3;7",
+        "drop1;2;drop2;3;drop3;99",
     );
 }
 
@@ -298,15 +306,15 @@ class Item {
 function clearGeneric<T>(writable ?T $target): void { $target = null; }
 function forwardGeneric<T>(writable ?T $target): void { clearGeneric($target); }
 function main(): void {
-    let writable $copy = 7;
+    writable ?int $copy = 7;
     forwardGeneric($copy);
-    echo "{$copy};";
+    echo "{$copy ?? 0};";
     writable ?Item $owner = new Item(1);
     forwardGeneric($owner);
     echo $owner == null;
 }
 "#,
-        "7;drop1;true",
+        "0;drop1;true",
     );
 }
 
@@ -327,6 +335,7 @@ function forwardGeneric<T>(writable ?T $target): void {{ clearGeneric($target); 
         "let writable $owner = new Child(); replace($owner);",
         "let writable $owner = new Counter(); replaceInterface($owner);",
         "let writable $owner = new Counter(); forwardGeneric($owner);",
+        "let writable $copy = 7; forwardGeneric($copy);",
     ] {
         let source = format!("{declarations} function main(): void {{ {body} }}");
         let diagnostics = doriac::check_source("named-writeback-types.doria", &source)
@@ -811,9 +820,8 @@ function probe(writable TransferGroup $group, ReadTransferKey $key, Wait $wait):
     $group->resubmitRead($key, 0, 0);
     return $copy;
 }
-function main(): void {}
 "#;
-    let program = fixture_mir("completion-copy-loans.doria", source);
+    let program = library_fixture_mir("completion-copy-loans.doria", source);
     validate_fixture(&program, source);
     for name in ["fetch", "probe"] {
         let function = program
@@ -886,7 +894,6 @@ function probe(writable TransferGroup $group, {key_type} $key, Wait $wait): Tran
     }};
     {body}
 }}
-function main(): void {{}}
 "#,
             ));
         }
@@ -897,7 +904,7 @@ function main(): void {{}}
 #[test]
 fn completion_writeback_preserves_nested_inline_copy_homes() {
     for source in completion_writeback_fixtures() {
-        let program = fixture_mir("completion-writeback.doria", &source);
+        let program = library_fixture_mir("completion-writeback.doria", &source);
         validate_fixture(&program, &source);
     }
     let nullable = r#"
@@ -909,9 +916,8 @@ function probe(writable TransferGroup $group, Wait $wait): ?TransferWaitResult t
     $group->getNextCompletion($wait);
     return $result;
 }
-function main(): void {}
 "#;
-    let program = fixture_mir("nullable-completion-writeback.doria", nullable);
+    let program = library_fixture_mir("nullable-completion-writeback.doria", nullable);
     validate_fixture(&program, nullable);
 }
 
@@ -920,7 +926,7 @@ fn shared_mir_validation_rejects_null_completion_writeback_into_nonnullable_home
     use doriac::mir::{NullablePayloadEnumExpression, Rvalue, Statement, Terminator, Type};
 
     for source in completion_writeback_fixtures() {
-        let mut program = fixture_mir("forged-completion-writeback.doria", &source);
+        let mut program = library_fixture_mir("forged-completion-writeback.doria", &source);
         validate_fixture(&program, &source);
         let function = program
             .functions
@@ -977,9 +983,8 @@ function probe(writable TransferGroup $group, ReadTransferKey $key, Wait $wait):
         let $completion = $group->getNextCompletion($wait);
     }
 }
-function main(): void {}
 "#;
-    let mut program = fixture_mir("completion-region-last-use.doria", source);
+    let mut program = library_fixture_mir("completion-region-last-use.doria", source);
     validate_fixture(&program, source);
     let conflicting = source.replace(
         "        echo $region->length;\n        let $completion = $group->getNextCompletion($wait);",
@@ -1031,7 +1036,7 @@ function main(): void {}
                         contents:
                             mir::IoContents::String(mir::StringExpression::Display(
                                 mir::ValueExpression::Integer(mir::IntegerExpression::Use {
-                                    operand: mir::Operand::ByteRegionLength(region),
+                                    operand: mir::Operand::RegionLength(region),
                                     ..
                                 }),
                             )),
@@ -1482,7 +1487,7 @@ function main(): void {{
 #[test]
 fn shared_mir_validation_rejects_null_written_through_nonnullable_region_collection_views() {
     use doriac::mir::{
-        ByteRegionKind, NullableByteRegionExpression, Rvalue, Statement, Terminator, Type,
+        ByteRegionKind, NullableRegionExpression, Rvalue, Statement, Terminator, Type,
     };
 
     for source in writable_region_collection_writeback_fixtures() {
@@ -1494,7 +1499,11 @@ fn shared_mir_validation_rejects_null_written_through_nonnullable_region_collect
             .find(|function| {
                 function.closure.is_some()
                     && function.locals.iter().any(|local| {
-                        local.ty == Type::NullableByteRegion(ByteRegionKind::Writable)
+                        local.ty
+                            == Type::NullableRegion(doriac::mir::RegionType {
+                                access: ByteRegionKind::Writable,
+                                array: None,
+                            })
                             && function.is_writable_borrowed_place(local.id)
                     })
             })
@@ -1503,7 +1512,11 @@ fn shared_mir_validation_rejects_null_written_through_nonnullable_region_collect
             .locals
             .iter()
             .find(|local| {
-                local.ty == Type::NullableByteRegion(ByteRegionKind::Writable)
+                local.ty
+                    == Type::NullableRegion(doriac::mir::RegionType {
+                        access: ByteRegionKind::Writable,
+                        array: None,
+                    })
                     && function.is_writable_borrowed_place(local.id)
             })
             .unwrap()
@@ -1516,8 +1529,8 @@ fn shared_mir_validation_rejects_null_written_through_nonnullable_region_collect
             .statements
             .push(Statement::AssignLocal {
                 target,
-                value: Rvalue::NullableByteRegion(NullableByteRegionExpression::Null {
-                    kind: ByteRegionKind::Writable,
+                value: Rvalue::NullableRegion(NullableRegionExpression::Null {
+                    kind: doriac::mir::RegionType::bytes(ByteRegionKind::Writable),
                 }),
             });
         let error = doriac::mir_validation::validate_program(&program).expect_err(&format!(
@@ -1655,7 +1668,9 @@ fn shared_mir_validation_rejects_forged_covariant_replacements() {
         ("function replacement(): Counted { return new Other(); }",
          "let writable $owner = new Counter(); let writable $view = lendInterface($owner); let $run = function(writable Counted $counter): void { $counter->bump(); }; $run($view);"),
     ] {
-        let source = format!("{DECLARATIONS} {declaration} function main(): void {{ {body} }}");
+        // `main` makes the replacement factory reachable without running it
+        // from the forged closure.
+        let source = format!("{DECLARATIONS} {declaration} function main(): void {{ let $made = replacement(); {body} }}");
         let mut program = fixture_mir("forged-covariant-writeback.doria", &source);
         validate_fixture(&program, &source);
         let replacement = program.functions.iter().find(|function| function.name == "replacement")
@@ -1699,10 +1714,9 @@ function unknown(function(writable ?Counter): void $callback, writable Counter $
     let $safe = function(writable ?Counter $counter): void {{ $counter?->bump(); }};
     $safe($owner);
 }}
-function main(): void {{}}
 "#
     );
-    let mut program = fixture_mir("forged-unknown-writeback.doria", &source);
+    let mut program = library_fixture_mir("forged-unknown-writeback.doria", &source);
     validate_fixture(&program, &source);
     let function = program
         .functions
@@ -1762,9 +1776,8 @@ function probe(function(writable ?int): void $callback, writable int $owner): vo
     };
     $replace($owner);
 }
-function main(): void {}
 "#;
-    let mut program = fixture_mir("forged-unknown-copy-effects.doria", source);
+    let mut program = library_fixture_mir("forged-unknown-copy-effects.doria", source);
     validate_fixture(&program, source);
     let function = program
         .functions
@@ -1840,4 +1853,187 @@ function main(): void {}
     let error = doriac::mir_validation::validate_program(&program)
         .expect_err(&format!("unknown callback may clear nullable storage before it is copied into the later environment:\n{source}"));
     assert!(error.message.contains("storage"), "{error:#?}");
+}
+
+/// A writable parameter of a Copy type lends the caller's storage in
+/// functions and methods as in closures, so every write reaches the caller,
+/// through forwarding, properties and collection elements. A promoted
+/// constructor parameter's `writable` makes the property writable and keeps
+/// its default (Andrew's ruling of 2026-11-21, "Writable always borrows
+/// (Recommended)").
+#[test]
+fn writable_copy_parameters_lend_the_callers_storage() {
+    assert_execution(
+        r#"
+class Box
+{
+    writable int $count = 1;
+
+    writable function bump(writable int $by): void
+    {
+        $by += 10;
+        $this->count += $by;
+    }
+}
+
+class Counter
+{
+    function __construct(writable int $count = 0) {}
+}
+
+function add(writable int $value, int $step): void
+{
+    $value += $step;
+}
+
+function forward(writable int $value): void
+{
+    add($value, 100);
+}
+
+function rename(writable string $name): void
+{
+    $name = $name . "!";
+}
+
+function flip(writable bool $flag, writable float $ratio): void
+{
+    $flag = !$flag;
+    $ratio = $ratio * 2.0;
+}
+
+function main(): void
+{
+    let writable $n = 1;
+    add($n, 2);
+    forward($n);
+    let writable $text = "hi";
+    rename($text);
+    rename($text);
+    let writable $box = new Box();
+    let writable $by = 5;
+    $box->bump($by);
+    add($box->count, 1000);
+    let writable $flag = false;
+    let writable $ratio = 1.5;
+    flip($flag, $ratio);
+    writable List<int> $numbers = [1, 2];
+    add($numbers[1], 40);
+    let writable $counter = new Counter();
+    echo "{$n} {$text} {$by} {$box->count} {$flag} {$ratio} {$numbers[1]} {$counter->count}";
+}
+"#,
+        "103 hi!! 15 1016 true 3.0 42 0",
+    );
+}
+
+/// A writable Copy argument must be a writable place, and a writable
+/// parameter has no default; a promoted constructor parameter keeps one.
+#[test]
+fn writable_copy_arguments_require_writable_places() {
+    let source = r#"
+class Counter
+{
+    function __construct(writable int $count = 0) {}
+}
+
+function add(writable int $value, int $step = 1): void
+{
+    $value += $step;
+}
+
+function zero(writable int $value = 0): void
+{
+    $value = 0;
+}
+
+function make(): int
+{
+    return 3;
+}
+
+function both(writable int $left, int $right): void
+{
+    $left += $right;
+}
+
+function main(): void
+{
+    let $counter = new Counter();
+    let writable $n = 1;
+    add(5);
+    add(make());
+    add($n + 1);
+    both($n, $n);
+    let $closure = function (writable int $value): void { $value += 1; };
+    $closure(4);
+}
+"#;
+    let diagnostics = doriac::check_source("writable-copy-places.doria", source)
+        .expect_err("writable Copy arguments need writable places");
+    // Each conflict is one finding: the argument's access is checked once.
+    let found = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.code,
+                &source[diagnostic.span.start..diagnostic.span.end],
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        found,
+        [
+            ("E0818", "0"),
+            ("E0204", "5"),
+            ("E0204", "make()"),
+            ("E0204", "$n + 1"),
+            ("E0651", "4"),
+            ("E0477", "$n"),
+        ],
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn lent_copy_parameters_read_their_own_and_nested_writes_on_every_backend() {
+    // A lent parameter's working copy follows its home after the callee
+    // assigns it and after a call it lends the same home to returns. LLVM
+    // once cleared the copy at assignment, so `$value != null` read false.
+    assert_execution(
+        r#"
+enum Packet { case Number(int $count); case Label(string $text); case Empty; }
+function replaceOptional(writable ?Packet $value): bool { $value = Packet::Number(7); return $value != null; }
+function relabel(writable Packet $value): bool { $value = Packet::Label("new"); return $value == Packet::Label("new"); }
+function forward(writable ?Packet $value): bool { let $changed = replaceOptional($value); return $changed && $value != null; }
+function append(writable string $text, string $suffix): void { $text = $text . $suffix; }
+function bumpBy(writable int $count, int $step): void { $count += $step; }
+function bumpTwice(writable int $count): int { bumpBy($count, 1); echo "mid {$count}\n"; bumpBy($count, 1); return $count; }
+class Builder {
+    function twice(writable string $text): string { append($text, "a"); append($text, "b"); return $text; }
+}
+function main(): void {
+    writable ?Packet $optional = null;
+    let $replaced = replaceOptional($optional);
+    echo "{$replaced} " . ($optional != null) . "\n";
+    let writable $packet = Packet::Empty;
+    let $relabeled = relabel($packet);
+    echo "{$relabeled} " . ($packet == Packet::Label("new")) . "\n";
+    $optional = null;
+    let $forwarded = forward($optional);
+    echo "{$forwarded} " . ($optional != null) . "\n";
+    let writable $count = 1;
+    let $result = bumpTwice($count);
+    echo "{$result} {$count}\n";
+    let writable $text = "x";
+    let $builder = new Builder();
+    let $built = $builder->twice($text);
+    echo "{$built} {$text}\n";
+    let $closure = function (writable int $value): int { bumpBy($value, 2); bumpBy($value, 3); return $value; };
+    let $total = $closure($count);
+    echo "{$total} {$count}\n";
+}
+"#,
+        "true true\ntrue true\ntrue true\nmid 2\n3 3\nxab xab\n8 8\n",
+    );
 }

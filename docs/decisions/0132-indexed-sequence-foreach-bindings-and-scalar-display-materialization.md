@@ -4,6 +4,11 @@
 > Dictionary keys exact while making user-defined Iterable conformance
 > value-only. It does not infer a generalized first-binding role.
 
+> **Stage 40 amendment (2026-11-20):** Decision 0148 (Amendment: Iterating
+> Regions) adds byte regions and typed array regions to the sequence-index
+> rows: each yields its elements in index order with a zero-based canonical
+> `int` first binding, as `T[]` does.
+
 - **Status:** Accepted
 - **Accepted:** 2026-09-02
 - **Implementation Status:** Implemented By The Post-Stage-34 Indexed Foreach And Scalar Display Corrective Beat

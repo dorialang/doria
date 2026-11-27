@@ -107,8 +107,8 @@ Website examples must follow the naming charter:
 Member examples should look like `Int::wrappingAdd()`, `$s->isEmpty()`, `$message->tenantId`, `$message->retryAfter(seconds: 30)`, and `$repository->findById($id)`.
 
 String examples follow Decision 0103's one-spelling rule. Use `$text->` only
-for intrinsic data and views such as `length`, `byteLength`, `isEmpty`, `bytes`,
-`graphemes`, and `codePoints`. Use `String::` for every string-specific
+for intrinsic data and views such as `length`, `displayWidth`, `byteLength`,
+`isEmpty`, `bytes`, `graphemes`, and `codePoints`. Use `String::` for every string-specific
 operation, including `String::trim()` and `String::startsWith()`. Do not publish
 canonical Doria examples using a `str_*` free function or a string-operation
 instance method. PHP migration examples may show PHP spellings when they are

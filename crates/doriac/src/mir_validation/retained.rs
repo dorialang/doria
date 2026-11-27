@@ -607,8 +607,10 @@ pub(super) fn possible_callees(
             .virtual_family
             .as_ref()
             .ok_or_else(|| malformed_mir("virtual callable has no canonical family"))?;
+        // Only a constructed class can be a receiver's dynamic class
+        // (Decision 0148 section 17); an unconstructed one emits no methods.
         for class in &program.classes {
-            if class.id == receiver || class.ancestors.contains(&receiver) {
+            if class.constructed && (class.id == receiver || class.ancestors.contains(&receiver)) {
                 let entry = class
                     .virtual_methods
                     .get(slot as usize)
@@ -1044,15 +1046,20 @@ pub(super) fn borrowed_sources(
 
 fn region_sources(
     program: &mir::Program,
-    value: &mir::ByteRegionExpression,
+    value: &mir::RegionExpression,
     roots: &[HashSet<Place>],
     loans: &[HashSet<Source>],
 ) -> Result<HashSet<Source>, BackendError> {
-    use mir::ByteRegionExpression as E;
+    use mir::RegionExpression as E;
     match value {
         E::CollectionIndex { collection, .. } => Ok(loans[collection.0].clone()),
         E::Local { local, .. } => Ok(loans[local.0].clone()),
-        E::Region { kind, source, .. } => borrowed_sources(
+        E::Region { kind, source, .. }
+        | E::Foreign {
+            kind,
+            owner: source,
+            ..
+        } => borrowed_sources(
             program,
             source,
             kind.is_writable(),
@@ -1074,11 +1081,11 @@ fn region_sources(
 
 fn nullable_region_sources(
     program: &mir::Program,
-    value: &mir::NullableByteRegionExpression,
+    value: &mir::NullableRegionExpression,
     roots: &[HashSet<Place>],
     loans: &[HashSet<Source>],
 ) -> Result<HashSet<Source>, BackendError> {
-    use mir::NullableByteRegionExpression as E;
+    use mir::NullableRegionExpression as E;
     match value {
         E::CollectionIndex { collection, .. } | E::CollectionGet { collection, .. } => {
             Ok(loans[collection.0].clone())
@@ -1116,8 +1123,8 @@ pub(super) fn collection_element_place(
         };
     }
     match value {
-        mir::Rvalue::ByteRegion(value) => region_collection_element_place(value),
-        mir::Rvalue::NullableByteRegion(value) => nullable_region_collection_element_place(value),
+        mir::Rvalue::Region(value) => region_collection_element_place(value),
+        mir::Rvalue::NullableRegion(value) => nullable_region_collection_element_place(value),
         mir::Rvalue::Function(mir::FunctionExpression::CollectionIndex {
             collection,
             index,
@@ -1177,13 +1184,13 @@ pub(super) fn collection_element_place(
 }
 
 fn region_collection_element_place(
-    value: &mir::ByteRegionExpression,
+    value: &mir::RegionExpression,
 ) -> Option<(mir::LocalId, &mir::Rvalue)> {
     match value {
-        mir::ByteRegionExpression::CollectionIndex {
+        mir::RegionExpression::CollectionIndex {
             collection, index, ..
         } => Some((*collection, index)),
-        mir::ByteRegionExpression::AssumePresent { value, .. } => {
+        mir::RegionExpression::AssumePresent { value, .. } => {
             nullable_region_collection_element_place(value)
         }
         _ => None,
@@ -1191,18 +1198,18 @@ fn region_collection_element_place(
 }
 
 fn nullable_region_collection_element_place(
-    value: &mir::NullableByteRegionExpression,
+    value: &mir::NullableRegionExpression,
 ) -> Option<(mir::LocalId, &mir::Rvalue)> {
     match value {
-        mir::NullableByteRegionExpression::CollectionIndex {
+        mir::NullableRegionExpression::CollectionIndex {
             collection, index, ..
         }
-        | mir::NullableByteRegionExpression::CollectionGet {
+        | mir::NullableRegionExpression::CollectionGet {
             collection,
             key: index,
             ..
         } => Some((*collection, index)),
-        mir::NullableByteRegionExpression::Present(value) => region_collection_element_place(value),
+        mir::NullableRegionExpression::Present(value) => region_collection_element_place(value),
         _ => None,
     }
 }
@@ -1266,10 +1273,8 @@ pub(super) fn value_sources(
         mir::Rvalue::Collection(mir::CollectionExpression::Fill { value, .. }) => {
             value_sources(program, value, roots, loans)
         }
-        mir::Rvalue::ByteRegion(value) => region_sources(program, value, roots, loans),
-        mir::Rvalue::NullableByteRegion(value) => {
-            nullable_region_sources(program, value, roots, loans)
-        }
+        mir::Rvalue::Region(value) => region_sources(program, value, roots, loans),
+        mir::Rvalue::NullableRegion(value) => nullable_region_sources(program, value, roots, loans),
         mir::Rvalue::Interface(mir::InterfaceExpression {
             value: mir::InterfaceValue::NewCollectionIterator { source, .. },
             ..

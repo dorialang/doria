@@ -687,6 +687,7 @@ fn build_collection_entry(
         writable: operation == Op::Advance,
         owned: false,
         synthetic: true,
+        binding: None,
     }];
     let mut statements = Vec::new();
     if operation != Op::Advance {
@@ -697,6 +698,7 @@ fn build_collection_entry(
             writable: false,
             owned: false,
             synthetic: true,
+            binding: None,
         });
         statements.push(mir::Statement::AssignLocal {
             target: source,
@@ -777,6 +779,7 @@ fn build_collection_entry(
                     writable: false,
                     owned: false,
                     synthetic: true,
+                    binding: None,
                 });
                 statements.push(mir::Statement::AssignLocal {
                     target: position,
@@ -790,6 +793,7 @@ fn build_collection_entry(
                     writable: false,
                     owned: false,
                     synthetic: true,
+                    binding: None,
                 });
                 statements.push(mir::Statement::CoreCollection {
                     collection: source,
@@ -825,6 +829,7 @@ fn build_collection_entry(
                         writable: false,
                         owned: false,
                         synthetic: true,
+                        binding: None,
                     });
                     statements.push(mir::Statement::AssignLocal { target, value });
                     read_local_as_rvalue(target, definition.value, true)
@@ -870,6 +875,7 @@ fn build_collection_entry(
             terminator,
         }],
         entry_block: mir::BlockId(0),
+        unsafe_regions: Vec::new(),
     })
 }
 
@@ -897,6 +903,7 @@ fn build_entry(
             owned: parameter.mode == mir::FunctionParameterMode::Take
                 && parameter.ty.requires_owned_cleanup(),
             synthetic: true,
+            binding: None,
         })
         .collect::<Vec<_>>();
     let params = locals.iter().map(|local| local.id).collect::<Vec<_>>();
@@ -970,6 +977,7 @@ fn build_entry(
             writable: locals[0].writable,
             owned: locals[0].owned,
             synthetic: true,
+            binding: None,
         });
         statements.push(mir::Statement::AssignLocal {
             target,
@@ -1001,6 +1009,7 @@ fn build_entry(
             writable: call_result_is_writable(owned, implementation.return_borrow),
             owned,
             synthetic: true,
+            binding: None,
         });
         Some((local, ty))
     } else {
@@ -1051,6 +1060,7 @@ fn build_entry(
             writable: true,
             owned: true,
             synthetic: true,
+            binding: None,
         });
         blocks.push(mir::BasicBlock {
             id: mir::BlockId(0),
@@ -1080,7 +1090,13 @@ fn build_entry(
         id,
         name: format!("{}::<interface-entry#{}>", implementation.name, table.id.0),
         source_span: span,
-        diagnostic_frame: mir::DiagnosticFrame::Forwarded(direct),
+        // A compiler-known implementation reports at its caller's site, and
+        // so does the entry that forwards to it.
+        diagnostic_frame: if span.source.is_compiler_owned() {
+            mir::DiagnosticFrame::Caller
+        } else {
+            mir::DiagnosticFrame::Forwarded(direct)
+        },
         method: None,
         virtual_slot: None,
         receiver_mode: None,
@@ -1100,6 +1116,7 @@ fn build_entry(
         locals,
         blocks,
         entry_block: mir::BlockId(0),
+        unsafe_regions: Vec::new(),
     })
 }
 
@@ -1910,11 +1927,26 @@ function values(): Dictionary<string, Value> { return ["a" => new Item(1), "b" =
 
     #[test]
     fn nested_operand_calls_invalidate_type_proofs_in_evaluation_order() {
-        for (ty, condition, message) in [
-            ("?int", "$value != null", "dominating presence proof"),
-            ("?Value", "$value != null", "dominating presence proof"),
-            ("mixed", "$value is int", "dominating exact `is` proof"),
-            ("Value", "$value is Item", "dominating hierarchy `is` proof"),
+        for (ty, initial, condition, message) in [
+            (
+                "?int",
+                "null",
+                "$value != null",
+                "dominating presence proof",
+            ),
+            (
+                "?Value",
+                "null",
+                "$value != null",
+                "dominating presence proof",
+            ),
+            ("mixed", "1", "$value is int", "dominating exact `is` proof"),
+            (
+                "Value",
+                "new Item()",
+                "$value is Item",
+                "dominating hierarchy `is` proof",
+            ),
         ] {
             let source = format!(
                 r#"
@@ -1924,7 +1956,14 @@ function read(Item $item): int {{ return 1; }}
 function readValue(Value $item): int {{ return 1; }}
 function touch(writable {ty} $value): int {{ return 0; }}
 function probe(writable {ty} $value): int {{ if ({condition}) {{ return 1; }} return 0; }}
-function main(): void {{}}
+function main(): void {{
+    let $item = new Item();
+    let $read = read($item);
+    let $readValue = readValue($item);
+    writable {ty} $value = {initial};
+    let $touched = touch($value);
+    let $probed = probe($value);
+}}
 "#
             );
             let original = lower_checked_source(&source);
@@ -2053,33 +2092,37 @@ function main(): void {{}}
 
     #[test]
     fn indirect_result_writes_invalidate_previous_type_proofs() {
-        for (ty, condition, value, expected) in [
-            ("?int", "$value != null", "$value", "presence proof"),
+        for (ty, initial, condition, value, expected) in [
+            ("?int", "null", "$value != null", "$value", "presence proof"),
             (
                 "?string",
+                "null",
                 "$value != null",
                 "$value->length",
                 "presence proof",
             ),
             (
                 "?Item",
+                "null",
                 "$value != null",
                 "$value->number()",
                 "presence proof",
             ),
             (
                 "?Value",
+                "null",
                 "$value != null",
                 "$value->number()",
                 "presence proof",
             ),
             (
                 "Value",
+                "new Item()",
                 "$value is Item",
                 "$value->number()",
                 "hierarchy `is` proof",
             ),
-            ("mixed", "$value is int", "$value", "exact `is` proof"),
+            ("mixed", "1", "$value is int", "$value", "exact `is` proof"),
         ] {
             let source = format!(
                 r#"
@@ -2090,7 +2133,10 @@ function probe(function(): {ty} $read): int {{
     if ({condition}) {{ $read(); return {value}; }}
     return 0;
 }}
-function main(): void {{}}
+function main(): void {{
+    let $item = new Item();
+    let $probed = probe(function(): {ty} {{ return {initial}; }});
+}}
 "#
             );
             let mut program = lower_checked_source(&source);
@@ -2449,6 +2495,7 @@ function main(): void { inspect(true); inspect(false); }
             id: alias,
             owned: false,
             synthetic: true,
+            binding: None,
             ..original.clone()
         });
         let mut inserted = false;

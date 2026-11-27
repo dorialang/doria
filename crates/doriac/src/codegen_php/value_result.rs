@@ -2660,7 +2660,7 @@ function hot(): int {
     }
     return $sum;
 }
-function main(): void {}
+function main(): void { let $reach0 = hot(); let $reach1 = make(0); }
 "#;
         let php = crate::compile_source_to_php("measured-field-results.doria", source).unwrap();
         let script = format!(
@@ -2724,7 +2724,7 @@ function hotEquality(int $iterations): void {
         $index++;
     }
 }
-function main(): void {}
+function main(): void { hotEquality(0); let $reach1 = sameFloat(0.0); }
 "#;
         let php = crate::compile_source_to_php("measured-field-equality.doria", source).unwrap();
         let script = format!(
@@ -2816,7 +2816,9 @@ echo "measured field arguments passed\n";
     fn nested_copy_payload_transport_constructs_no_outcome_objects_and_preserves_boxed_snapshots() {
         let source = format!(
             "{}\nenum Collision {{ case Value(int $__doriaFieldParameter0_1_tag, Deep $nested); }}\nfunction collision(): Collision {{ return Collision::Value(5, make(7)); }}",
-            include_str!("../../tests/fixtures/nested_copy_transport.doria"),
+            // The script calls `collision` directly, so main reaches it.
+            include_str!("../../tests/fixtures/nested_copy_transport.doria")
+                .replace("    controls();\n}", "    controls();\n    let $collision = collision();\n}"),
         );
         let php = crate::compile_source_to_php("nested-copy-transport.doria", &source).unwrap();
         let enums = format!(
@@ -3229,11 +3231,13 @@ function boundaries(): int {
 }
 function main(): void { echo boundaries(); }
 "#;
+        // `replace($borrowed)` lends the caller's value, so it reads 13
+        // (Andrew's ruling of 2026-11-21, "Writable always borrows").
         let mir = crate::lower_source_to_mir("copy-enum-boundaries.doria", source).unwrap();
         let expected = crate::mir_interpreter::interpret(&mir).unwrap();
-        assert_eq!(expected.stdout, b"69");
+        assert_eq!(expected.stdout, b"78");
         assert!(expected.runtime_diagnostic.is_none(), "{expected:?}");
-        execute(source, 69, "boundaries");
+        execute(source, 78, "boundaries");
     }
 
     #[test]
@@ -3312,7 +3316,7 @@ function cleanup(): int {
     } catch (Failure) {}
     return State::drops * 10 + $value;
 }
-function main(): void {}
+function main(): void { let $reach0 = cleanup(); let $reach1 = hot(0); }
 "#;
         let php = crate::compile_source_to_php("inline-guard-regions.doria", source).unwrap();
         let script = format!(
@@ -3421,7 +3425,7 @@ function conditionFailure(): int {
     } catch (Failure) {}
     return State::drops;
 }
-function main(): void {}
+function main(): void { let $reach0 = cleanup(); let $reach1 = conditionFailure(); let $reach2 = hot(0); let $reach3 = loopExits(); }
 "#;
         let php = crate::compile_source_to_php("prepared-control-values.doria", source).unwrap();
         let script = format!(
@@ -3543,7 +3547,7 @@ function ownership(): int {
     if ($second != 71 || Trace::ownedDrops != 2) { panic("failed replacement lost its owner"); }
     return 1;
 }
-function main(): void {}
+function main(): void { let $reach0 = failed(); let $reach1 = hot(0); let $reach2 = owners(); let $reach3 = ownership(); }
 "#;
         let php = crate::compile_source_to_php("for-increment-statements.doria", source).unwrap();
         let script = format!(
@@ -3655,7 +3659,7 @@ function cleanup(): int {
     if (Trace::calls != 0) { panic("callee ran before its arguments completed"); }
     return Trace::drops;
 }
-function main(): void {}
+function main(): void { let $reach0 = cleanup(); let $reach1 = hot(0); }
 "#;
         let php = crate::compile_source_to_php("conditional-call-values.doria", source).unwrap();
         let script = format!(
@@ -3764,7 +3768,7 @@ function cleanup(): int {
     if (Trace::calls != 2) { panic("abandoned conditional result was invoked"); }
     return Trace::drops;
 }
-function main(): void {}
+function main(): void { let $reach0 = cleanup(); let $reach1 = hot(0); }
 "#;
         let php = crate::compile_source_to_php("conditional-call-receivers.doria", source).unwrap();
         let script = format!(
@@ -3884,7 +3888,7 @@ function cleanup(): int {
     if (Trace::calls != 0) { panic("callee ran before its conditional arguments completed"); }
     return Trace::drops;
 }
-function main(): void {}
+function main(): void { let $reach0 = cleanup(); let $reach1 = drops(); let $reach2 = hot(0); let $reach3 = owned(0); }
 "#;
         let php = crate::compile_source_to_php("conditional-cell-arguments.doria", source).unwrap();
         assert!(php.contains("new __DoriaCell($__doria_statement_value"));
@@ -3987,7 +3991,7 @@ function cleanup(): int {
     return Trace::drops;
 }
 function drops(): int { return Trace::drops; }
-function main(): void {}
+function main(): void { let $reach0 = cleanup(); let $reach1 = conversions(); let $reach2 = drops(); let $reach3 = hot(false, 0); }
 "#;
         let php = crate::compile_source_to_php("conditional-borrowed-cells.doria", source).unwrap();
         let script = format!(
@@ -4083,7 +4087,7 @@ function hot(bool $left, int $iterations): int {
     return $sum;
 }
 function drops(): int { return Trace::drops; }
-function main(): void {}
+function main(): void { let $reach0 = drops(); let $reach1 = hot(false, 0); }
 "#;
         let php = crate::compile_source_to_php("forwarded-borrowed-cells.doria", source).unwrap();
         let script = format!(
@@ -4128,7 +4132,7 @@ function pickMatch(Token $value, bool $left): Token {
 function pickWhen(Token $value, bool $left): Token {
     return when ($left): Token { return $value; } else { return lend($value); };
 }
-function main(): void {}
+function main(): void { let $token = new Token(1); let $left = pick($token, true); let $matched = pickMatch($token, false); let $chosen = pickWhen($token, true); }
 "#;
         let php = crate::compile_source_to_php("conditional-returned-cell.doria", source).unwrap();
         let script = format!(
@@ -4277,7 +4281,7 @@ function cleanup(): int {
     if (Trace::calls != 0) { panic("named callee ran before its arguments completed"); }
     return Trace::drops;
 }
-function main(): void {}
+function main(): void { let $reach0 = cleanup(); let $reach1 = drops(); let $reach2 = hot(0); let $reach3 = owned(0); let $reach4 = temporary(0); }
 "#;
         let php = crate::compile_source_to_php("conditional-named-cells.doria", source).unwrap();
         assert!(php.contains("new __DoriaCell($__doria_statement_value"));
@@ -4389,7 +4393,7 @@ function cleanup(): int {
     if (Trace::calls != 2) { panic("abandoned conditional callee was invoked"); }
     return Trace::drops;
 }
-function main(): void {}
+function main(): void { let $reach0 = cleanup(); let $reach1 = hot(0); }
 "#;
         let php = crate::compile_source_to_php("conditional-call-callees.doria", source).unwrap();
         let script = format!(

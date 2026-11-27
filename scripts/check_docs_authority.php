@@ -42,6 +42,7 @@ require_once __DIR__ . '/check_stage30d_closure_execution.php';
 require_once __DIR__ . '/check_stage30e_native_closure_execution.php';
 require_once __DIR__ . '/check_stage30g_list_algorithms.php';
 require_once __DIR__ . '/check_stage30h_closure_completion.php';
+require_once __DIR__ . '/repository_paths.php';
 require_once __DIR__ . '/check_inferred_main_effects.php';
 require_once __DIR__ . '/check_constructor_owned_property_writes.php';
 require_once __DIR__ . '/check_stage31_slice1_namespaces.php';
@@ -93,21 +94,6 @@ function normalize_path(string $path): string
 function relative_path(string $root, string $path): string
 {
     return ltrim(substr(normalize_path($path), strlen(normalize_path($root))), '/');
-}
-
-function is_skipped_path(string $path): bool
-{
-    // `.claude/worktrees/` holds transient checkouts of this same repository, so
-    // every document in it is a duplicate of one already checked at the root.
-    // Without this the guard reports each finding once per live worktree, and a
-    // document fixed at the root keeps failing until every worktree is removed.
-    foreach (['.git/', 'target/', 'node_modules/', '.claude/worktrees/'] as $skip) {
-        if (str_contains($path, $skip)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 function is_historical_path(string $path): bool
@@ -574,7 +560,10 @@ foreach ($namingFiles as $path) {
         }
 
         // Section 9.1: namespace segments are PascalCase with acronyms folded.
-        if (preg_match('/\bDoria(?:\\\\[A-Za-z0-9_]+)*\\\\[A-Z]{2,}/', $line) === 1) {
+        // An acronym is two or more capitals not followed by a lowercase
+        // letter (IO, HTTP, XMLParser). A one-letter prefix on a PascalCase
+        // word is not one: Decision 0148's `Doria\Std\Ffi\CUnsignedLong`.
+        if (preg_match('/\bDoria(?:\\\\[A-Za-z0-9_]+)*\\\\[A-Z]{2,}(?![a-z])/', $line) === 1) {
             add_failure(
                 $failures,
                 $path,
@@ -843,7 +832,8 @@ if ($namingAuthority !== false) {
         || !str_contains($stdlib, 'executable intrinsic properties')
         || !str_contains($stdlib, 'containsIgnoreCase')
         || !str_contains($stdlib, 'countOccurrences')
-        || !str_contains($stdlib, 'await the public traversal protocol')
+        || !str_contains($stdlib, '`$s->graphemes`, an `Iterable<string>`')
+        || !str_contains($stdlib, 'The `$s->codePoints` view is part of Doria and not implemented by this compiler yet')
         || !str_contains($stdlib, 'There is no public `str_*` family')
     ) {
         $failures[] = "{$stdlibPath}: missing canonical executable and deferred String inventory";
