@@ -1,0 +1,127 @@
+// Every way out of unsafe code: `return`, `break` and `continue`, a
+// checked error raised by a Doria helper called inside it, and the end of
+// the block. Each edge keeps what the unsafe code wrote.
+
+extern "C"
+{
+    /** @safety Any value but the least `int32`. */
+    function abs(int32 $value): int32;
+}
+
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function check(int32 $value): int32 throws Failure
+{
+    if ($value > 2) {
+        throw new Failure("too large");
+    }
+    return $value;
+}
+
+function walk(int32 $limit): int32
+{
+    writable int32 $step = 0;
+    while ($step < 10) {
+        $step += 1;
+        unsafe {
+            if ($step == 2) {
+                continue;
+            }
+            if ($step == $limit) {
+                break;
+            }
+            if ($step == 7) {
+                return abs(-70);
+            }
+            echo abs($step);
+            echo " ";
+        }
+    }
+    return $step;
+}
+
+function guarded(int32 $value): int32 throws Failure
+{
+    unsafe {
+        echo abs($value);
+        echo " ";
+        echo check($value);
+    }
+    return unsafe(abs($value));
+}
+
+function measure<T>(T $value, int32 $count): int32
+{
+    return unsafe(abs($count));
+}
+
+// Leaves unsafe code by the edge `$how` names: 0 the end of the block,
+// 1 `break`, 2 `continue`, 3 `return` and 4 a checked error. `$trail`
+// records `$mark` before each pass, so it shows each write the unsafe
+// code made before it left.
+function leave(int32 $how): string
+{
+    writable string $trail = "";
+    writable int32 $mark = 0;
+    writable int32 $round = 0;
+    try {
+        while ($round < 2) {
+            $round += 1;
+            $trail = $trail . $mark . " ";
+            unsafe {
+                $mark = abs(-10) * $round + $how;
+                if ($how == 1) {
+                    break;
+                }
+                if ($how == 2) {
+                    continue;
+                }
+                if ($how == 3) {
+                    return $trail . "return " . $mark;
+                }
+                if ($how == 4) {
+                    $mark = check($mark);
+                }
+            }
+        }
+    } catch (Failure) {
+        return $trail . "error " . $mark;
+    }
+    return $trail . "end " . $mark;
+}
+
+function main(): void
+{
+    echo walk(4);
+    echo "\n";
+    echo walk(9);
+    echo "\n";
+    try {
+        echo guarded(1);
+    } catch (Failure) {
+        echo "caught";
+    }
+    echo "\n";
+    try {
+        echo guarded(5);
+    } catch (Failure) {
+        echo "caught";
+    }
+    echo "\n";
+    echo measure(1, -2);
+    echo measure("a", -3);
+    echo "\n";
+    echo leave(0) . "\n";
+    echo leave(1) . "\n";
+    echo leave(2) . "\n";
+    echo leave(3) . "\n";
+    echo leave(4) . "\n";
+    unsafe {
+        echo unsafe(abs(-1));
+    }
+}

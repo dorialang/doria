@@ -428,6 +428,8 @@ examples/native/main_graphemes_library_shape.doria
 examples/native/main_graphemes_without_io.doria
 examples/native/main_term_value_constructors.doria
 examples/native/main_enum_core_conformance.doria
+examples/native/main_unsafe_loop_edges.doria
+examples/native/main_unsafe_region_edges.doria
 # Foreign function interface example packages run through their entry
 # source, linking the native libraries their fixture's `link` file names.
 examples/ffi/zlib/src/main.doria

@@ -4246,85 +4246,9 @@ function main(): void
     assert_runs_everywhere(&source, "77 77 88 3\n");
 }
 
-const REGION_EDGES: &str = r#"
-class Failure implements Error
-{
-    function __construct(string $message)
-    {
-    }
-}
-
-function check(int32 $value): int32 throws Failure
-{
-    if ($value > 2) {
-        throw new Failure("too large");
-    }
-    return $value;
-}
-
-function walk(int32 $limit): int32
-{
-    writable int32 $step = 0;
-    while ($step < 10) {
-        $step += 1;
-        unsafe {
-            if ($step == 2) {
-                continue;
-            }
-            if ($step == $limit) {
-                break;
-            }
-            if ($step == 7) {
-                return abs(-70);
-            }
-            echo abs($step);
-            echo " ";
-        }
-    }
-    return $step;
-}
-
-function guarded(int32 $value): int32 throws Failure
-{
-    unsafe {
-        echo abs($value);
-        echo " ";
-        echo check($value);
-    }
-    return unsafe(abs($value));
-}
-
-function measure<T>(T $value, int32 $count): int32
-{
-    return unsafe(abs($count));
-}
-
-function main(): void
-{
-    echo walk(4);
-    echo "\n";
-    echo walk(9);
-    echo "\n";
-    try {
-        echo guarded(1);
-    } catch (Failure) {
-        echo "caught";
-    }
-    echo "\n";
-    try {
-        echo guarded(5);
-    } catch (Failure) {
-        echo "caught";
-    }
-    echo "\n";
-    echo measure(1, -2);
-    echo measure("a", -3);
-    echo "\n";
-    unsafe {
-        echo unsafe(abs(-1));
-    }
-}
-"#;
+/// Every edge out of unsafe code (Decision 0148 acceptance 7), also run by
+/// the durable parity manifest.
+const REGION_EDGES: &str = include_str!("../../../examples/native/main_unsafe_region_edges.doria");
 
 fn function_named<'mir>(
     mir: &'mir doriac::mir::Program,
@@ -4376,7 +4300,7 @@ fn assert_region_shape(function: &doriac::mir::Function, region: &doriac::mir::U
 fn unsafe_contexts_lower_to_regions_with_their_exits() {
     use doriac::foreign::UnsafeContextForm;
     use doriac::mir::UnsafeRegionExitKind;
-    let source = format!("{C_LIBRARY}{REGION_EDGES}");
+    let source = REGION_EDGES.to_string();
     let mir = program(&source);
 
     let walk = function_named(&mir, "walk");
@@ -4445,7 +4369,7 @@ fn unsafe_contexts_lower_to_regions_with_their_exits() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(measures.len(), 2, "{measures:?}");
 
-    assert_runs_everywhere(&source, "1 3 4\n1 3 4 5 6 70\n1 11\n5 caught\n23\n1");
+    assert_runs_everywhere(&source, "1 3 4\n1 3 4 5 6 70\n1 11\n5 caught\n23\n0 10 end 20\n0 end 11\n0 12 end 22\n0 return 13\n0 error 14\n1");
 }
 
 /// An unsafe context in a branch checking finds dead for the target is not
