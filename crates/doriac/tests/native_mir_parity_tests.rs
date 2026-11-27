@@ -728,10 +728,18 @@ fn read_linking(path: &Path, directory: &Path) -> NativeLinking {
     linking
 }
 
+/// A fixture's `php_output` file: `runs` or one diagnostic code, after any
+/// `#` comment lines.
 fn read_php_output(path: &Path) -> Option<PhpOutput> {
     let bytes = read_optional(path)?;
-    let text = std::str::from_utf8(&bytes).map(str::trim);
-    Some(match text {
+    let text = std::str::from_utf8(&bytes).map(|text| {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    Some(match text.as_deref() {
         Ok("runs") => PhpOutput::Runs,
         Ok(code)
             if code.len() == 5

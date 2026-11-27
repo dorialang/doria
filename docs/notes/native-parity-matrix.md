@@ -9,7 +9,7 @@ The manifest also runs the entry source of every package under
 gives each host's `--link-*` flags for the native libraries its source names,
 and the interpreter's companion library and both native profiles link with
 them. A fixture's `php_output` file states whether PHP output builds and runs
-the source as the interpreter does (`runs`) or the diagnostic code it reports,
+the source as the interpreter does (`runs`) or the first diagnostic code it reports,
 such as `E0784`.
 
 Stage 30e adds the focused closure manifest at
